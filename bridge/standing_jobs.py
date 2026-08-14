@@ -6,17 +6,27 @@
         await lt.wait_turn(kind)   # 前台忙就让路
         干一小步
         task.beat(进度人话)
+        await _notify_step(...)    # 通知交互引擎（干活汇报）
 这样任何一步都能被立刻打断，也不会和前台任务抢操作权。
 """
 
 import asyncio
+import logging
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from .longterm import StandingTask
+from ..polish.human_timing import HumanTiming
 
-# 跟随参数
-FOLLOW_NEAR = 4        # 这么近就不动了，免得贴脸抖
+logger = logging.getLogger(__name__)
+
+# 跟随参数 → 迟滞带跟随（hysteresis），参照 Lumi_Nox bridge.py
+# 防止在边界反复横跳：走到 STOP 以内才停，走远到 TRIGGER 才追
+FOLLOW_TRIGGER_DIST = 60   # 距离超过这个就追上去（大范围跟随）
+FOLLOW_STOP_DIST = 15      # 距离小于这个就停下（大范围跟随）
+# 贴身跟随（"跟在我身边"）：更近的阈值，始终黏在主人旁边
+STICK_TRIGGER_DIST = 8     # 离开 8 格就追
+STICK_STOP_DIST = 3        # 回到 3 格内才停
 FOLLOW_TICK = 0.6
 MINE_BATCH = 1         # 每轮只挖一点，保证能被及时打断
 
@@ -26,6 +36,23 @@ class StandingJobs:
 
     def __init__(self, agent) -> None:
         self.agent = agent
+        self._following: bool = False  # 迟滞带跟随状态：是否正在追主人
+        self.timing = HumanTiming()    # v2.1: 人类化延迟
+
+    # ── 交互引擎挂钩 ────────────────────────────
+
+    async def _notify_step(self, kind: str, desc: str, **kw) -> None:
+        """每完成一小步后通知交互引擎。
+
+        executor.notify("step_done") 会被 brain.py 的回调拦截，
+        转入 InteractionEngine.inject_event("step_done")，推高 speech_urge。
+        """
+        try:
+            exe = getattr(self.agent, "executor", None)
+            if exe:
+                await exe.notify("step_done", kind=kind, desc=desc, **kw)
+        except Exception:
+            pass
 
     @property
     def lt(self):
@@ -37,21 +64,91 @@ class StandingJobs:
         return st.get("tile_x", 0), st.get("tile_y", 0)
 
     def _owner(self) -> Optional[Tuple[int, int]]:
-        # 主人 = 附近玩家里的第一个（与自主大脑口径一致）
+        # 主人 = 最近的有效玩家（过滤自身/残留槽位/无效坐标）
         st = self.agent.get_state()
         players = st.get("nearby_players") or []
         if not players:
             return None
-        p = players[0]
-        return p.get("tile_x", 0), p.get("tile_y", 0)
+        me_x, me_y = self._me()
+        my_name = ""
+        try:
+            my_name = self.agent._character_name()
+        except Exception:
+            pass
+        best = None
+        best_d = 10 ** 9
+        for p in players:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("name", "")
+            if name and my_name and name == my_name:
+                continue  # 过滤自己
+            x = int(p.get("tile_x", 0) or 0)
+            y = int(p.get("tile_y", 0) or 0)
+            if x == 0 and y == 0:
+                continue  # 过滤无效坐标（下线残留槽位）
+            d = (x - me_x) ** 2 + (y - me_y) ** 2
+            if d < best_d:
+                best_d = d
+                best = (x, y)
+        return best
 
-    # ---------------- 跟着我 ----------------
+    def _spawn_inquiry_wait(self, inq_mgr, inq) -> None:
+        """后台等询问回答/超时，避免 pending 永久占位吞掉主人后续指令。"""
+        async def _wait():
+            try:
+                await inq_mgr.wait_answer(inq)
+            except Exception:
+                pass
+        try:
+            asyncio.ensure_future(_wait())
+        except Exception:
+            pass
+
+    # ---------------- 跟着我：迟滞带跟随（参照 Lumi_Nox bridge.py） ----------------
+    # 原理：
+    #   - 距离 > trigger_dist(默认60格) → 开始追
+    #   - 距离 < stop_dist(默认15格)    → 停下
+    #   - 在中间保持当前状态不变
+    # 避免在边界反复"追→停→追"的横跳。
     async def follow_loop(self, task: StandingTask) -> None:
-        """一直跟着主人，直到被叫停。近了就待着，远了就追。"""
+        """一直跟着主人，直到被叫停。迟滞带跟随，避免边界抖。
+
+        距离阈值从 agent.cfg 读取（可在 plugin.toml 配置）：
+        - follow_trigger_dist: 距离超过此值才追（默认60）
+        - follow_stop_dist: 距离小于此值停止（默认15）
+        """
+        logger.info(f"🚶 follow_loop 开始执行，task.name={task.name}, kind={task.kind}")
         lt = self.lt
+        self._following = False  # 重置跟随状态
+        self._nav_fails = 0      # 导航连续失败计数（直走兜底用）
         lost = 0
+        # 贴身模式（"跟在我身边"）：target=="stick" → 用贴身阈值
+        stick = task.target == "stick"
+        if stick:
+            trigger = self.agent.cfg.get("follow_stick_trigger_dist", STICK_TRIGGER_DIST)
+            stop_at = self.agent.cfg.get("follow_stick_stop_dist", STICK_STOP_DIST)
+        else:
+            # v0.7: 依恋调制——黏人指数高 → 更近才追、贴得更近（Heart）
+            base_trigger = self.agent.cfg.get("follow_trigger_dist", FOLLOW_TRIGGER_DIST)
+            base_stop = self.agent.cfg.get("follow_stop_dist", FOLLOW_STOP_DIST)
+            try:
+                heart = getattr(getattr(self.agent, "brain", None), "heart", None)
+                stickiness = heart.stickiness() if heart else 0.5
+            except Exception:
+                stickiness = 0.5
+            trigger = max(10, int(base_trigger * (1.6 - stickiness)))
+            stop_at = max(3, int(base_stop * (1.3 - 0.3 * stickiness)))
+        mode = "贴身" if stick else "大范围"
+        logger.info(f"📏 跟随参数({mode}): trigger={trigger}, stop_at={stop_at}")
+
+        loop_count = 0
         while not lt.should_stop(task.kind):
+            loop_count += 1
+            logger.info(f"🔄 follow_loop 第 {loop_count} 次循环")
+
             if not await lt.wait_turn(task.kind):
+                logger.info(f"⚠️ wait_turn 返回 False，退出循环")
                 break
 
             owner = self._owner()
@@ -59,7 +156,9 @@ class StandingJobs:
                 lost += 1
                 if lost == 5:
                     task.beat("找不到主人了，先待在原地")
-                await asyncio.sleep(FOLLOW_TICK)
+                    logger.warning(f"⚠️ 连续 5 次找不到主人")
+                self._following = False  # 失去目标时重置
+                await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
                 continue
             lost = 0
 
@@ -69,23 +168,40 @@ class StandingJobs:
             dist = (dx * dx + dy * dy) ** 0.5
             task.progress = int(time.time() - task.started_at)
 
-            if dist <= FOLLOW_NEAR:
-                task.beat("就在主人旁边")
-                await asyncio.sleep(FOLLOW_TICK)
-                continue
+            logger.info(f"📍 位置: 我({mx}, {my}), 主人({ox}, {oy}), 距离={int(dist)}")
 
+            # ── 迟滞带判断 ──
+            if not self._following:
+                # 没在追 → 距离超过触发阈值才追
+                if dist >= trigger:
+                    self._following = True
+                    task.beat(f"主人走远了({int(dist)}格)，追上去")
+                else:
+                    task.beat(f"主人在附近({int(dist)}格)")
+                    await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
+                    continue
+            else:
+                # 正在追 → 距离小于停止阈值才停
+                if dist <= stop_at:
+                    self._following = False
+                    task.beat(f"追到主人身边了({int(dist)}格)")
+                    await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
+                    continue
+
+            # 持续追
             task.beat(f"离主人 {int(dist)} 格，追上去")
             try:
-                # 落差大交给爬升逻辑，别傻乎乎撞墙
-                if (my - oy) > 3:
-                    await self.agent.climb_to(ox, oy)
-                else:
-                    await self.agent.navigate_to(ox, oy, timeout=8)
+                # v0.8 实时跟随（LumiBridge 代际接管）：fire-and-forget 流式导航，
+                # 每轮（0.6s）更新目标——主人走动 AI 立刻追，不再阻塞等 15 秒。
+                # C# 侧路径代际（navGen）保证新导航接管时旧任务不误清路径。
+                await self.agent.mod.navigate_stream_fire(ox, oy)
+                # 追了一步 → 通知交互引擎
+                await self._notify_step("follow", f"追主人中，距离{int(dist)}格", dist=dist)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
-            await asyncio.sleep(FOLLOW_TICK)
+            except Exception as e:
+                logger.error(f"❌ [follow_loop] navigate_stream_fire 异常: {e}")
+            await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
 
     # ---------------- 一直挖某种矿 ----------------
     async def mine_loop(self, task: StandingTask) -> None:
@@ -93,6 +209,7 @@ class StandingJobs:
         lt = self.lt
         ore = task.target or "铁矿"
         mining = self.agent.mining
+        empty_streak = 0  # 连续挖空次数（触发询问）
         while not lt.should_stop(task.kind):
             if not await lt.wait_turn(task.kind):
                 break
@@ -109,43 +226,108 @@ class StandingJobs:
                 raise
             except Exception as e:
                 task.beat(f"挖不动：{e}")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(self.timing.action_duration(1.5))
                 continue
 
             if got:
                 task.progress += int(got)
+                empty_streak = 0
                 task.beat(f"又挖到 {ore}，一共 {task.progress} 个")
+                await self._notify_step("mine",
+                    f"挖到{got}个{ore}，共{task.progress}个",
+                    ore=ore, got=int(got), total=task.progress)
             else:
+                empty_streak += 1
                 task.beat(f"这附近没{ore}了")
-                await asyncio.sleep(1.0)
-            await asyncio.sleep(0.3)
+                # v2.1: 连续挖空 → 主动问主人（不阻塞挖矿循环，回答由 coordinator 匹配）
+                if empty_streak >= 4:
+                    empty_streak = 0
+                    inq_mgr = getattr(self.agent, "inquiry", None)
+                    if inq_mgr and not inq_mgr.has_pending:
+                        inq = inq_mgr.ask(
+                            f"这附近挖不到{ore}了，换个地方还是继续挖？",
+                            options=["换个地方", "继续挖"], timeout=45.0)
+                        if inq:
+                            try:
+                                await self.agent.send_chat(inq.question)
+                            except Exception:
+                                pass
+                            # 后台等回答/超时，避免 pending 永久占位吞掉主人后续指令
+                            self._spawn_inquiry_wait(inq_mgr, inq)
+                await asyncio.sleep(self.timing.action_duration(1.0))
+            await asyncio.sleep(self.timing.action_duration(0.3))
 
     # ---------------- 守在这 ----------------
     async def guard_loop(self, task: StandingTask) -> None:
-        """守在某点附近，走远了自己回来。"""
+        """守在某点附近，走远了自己回来，有敌人就打。
+
+        守护逻辑（每轮优先级）：
+        1. 检查附近敌人 → 有敌人就战斗（守护半径内）
+        2. 检查距离守点位置 → 走远了就回去
+        3. 原地待命
+        """
         lt = self.lt
         hx, hy = self._me()
-        task.note = "守着这里"
+        guard_range = int(task.params.get("range", 15))  # 守护半径（从任务参数读取）
+        task.note = f"守护半径{guard_range}格"
+        combat = self.agent.combat
+
         while not lt.should_stop(task.kind):
             if not await lt.wait_turn(task.kind):
                 break
             try:
+                await self.agent.refresh_state()
+                state = self.agent.get_state()
                 mx, my = self._me()
-                if abs(mx - hx) + abs(my - hy) > 30:
+
+                # ── 1. 优先战斗：守护范围内有敌人 ──
+                enemies = state.get("nearby_npcs", [])
+                threat = None
+                for e in enemies:
+                    if int(e.get("damage", 0) or 0) <= 0:
+                        continue
+                    if int(e.get("life", 0) or 0) <= 0:
+                        continue
+                    ex = int(e.get("tile_x", 0) or 0)
+                    ey = int(e.get("tile_y", 0) or 0)
+                    dist_to_home = abs(ex - hx) + abs(ey - hy)
+                    if dist_to_home <= guard_range:
+                        threat = e
+                        break
+
+                if threat:
+                    task.beat(f"发现敌人 {threat.get('name', '???')}！开打")
+                    fought = await combat.fight_nearest(state, timeout=10)
+                    if fought:
+                        task.beat("击退敌人，继续守护")
+                        await self._notify_step("guard", "击退入侵者", enemy=threat.get("name"))
+                    else:
+                        task.beat("战斗失败，保持警戒")
+                    await asyncio.sleep(self.timing.action_duration(0.5))
+                    continue
+
+                # ── 2. 检查是否走远 ──
+                dist_from_home = abs(mx - hx) + abs(my - hy)
+                if dist_from_home > guard_range * 2:
                     task.beat("走远了，回守点")
                     await self.agent.navigate_to(hx, hy, timeout=15)
+                    await self._notify_step("guard", f"返回守点", dist=dist_from_home)
                 else:
-                    task.beat("守着呢")
+                    task.beat(f"守着呢（范围{guard_range}格）")
+                    await self._notify_step("guard", f"守点中，{task.progress}s", elapsed=task.progress)
+
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
+                self.agent.logger.error(f"[guard_loop] 异常: {e}")
                 pass
+
             task.progress = int(time.time() - task.started_at)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(self.timing.action_duration(1.2))
 
     # ---------------- 统一入口 ----------------
     async def start(self, kind: str, target: str = "", amount: int = 0,
-                    reason: str = "") -> Dict[str, Any]:
+                    reason: str = "", **params) -> Dict[str, Any]:
         """按 kind 起一个长期任务。"""
         table = {
             "follow": ("跟着主人", self.follow_loop),
@@ -155,6 +337,8 @@ class StandingJobs:
         if kind not in table:
             return {"ok": False, "output": f"我不会长期做「{kind}」这件事"}
         name, fn = table[kind]
+        if kind == "follow" and target == "stick":
+            name = "跟在主人身边"  # 贴身模式：任务名区分"跟着我"
         task = StandingTask(name=name, kind=kind, target=target,
-                            goal_amount=amount, reason=reason)
+                            goal_amount=amount, reason=reason, params=params)
         return await self.lt.start(task, fn)

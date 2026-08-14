@@ -1,6 +1,5 @@
-"""neko_terraria 感知层：游戏状态读取与截图视觉。"""
+"""neko_terraria 感知层：截图视觉感知（游戏态势由 core/context 提供）。"""
 
-from .game_state import GameStatePerception
 from .vision import VisualPerception
 
-__all__ = ["GameStatePerception", "VisualPerception"]
+__all__ = ["VisualPerception"]

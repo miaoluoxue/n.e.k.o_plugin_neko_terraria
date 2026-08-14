@@ -1,235 +1,262 @@
-"""Terraria 协议连接 + tModLoader mod 接口双通道管理。
-
-- 7777 通道：Terraria 服务端（完整登录握手 + 游戏操作）
-- 9877 通道：tModLoader C# mod 辅助控制接口（JSON-over-TCP）
-"""
+"""tModLoader Mod 接口单通道管理（9877 JSON-over-TCP）。游戏窗口由 launcher.py 启动，登录/心跳由游戏原生处理"""
 
 import asyncio
 import json
-import socket
-import struct
-from typing import Optional, Tuple
+import logging
+import time
+from typing import Callable, Dict, Optional
 
-from .protocol import PacketManager
+log = logging.getLogger(__name__)
 
 
 class Connection:
-    """管理 Terraria 协议 TCP 与 mod 本地接口双通道。"""
+    """管理 tModLoader Mod 接口 TCP 连接（9877 端口）。
 
-    def __init__(self, server_host: str, server_port: int,
-                 mod_host: str, mod_port: int) -> None:
-        self.server_host = server_host
-        self.server_port = server_port
+    独立读循环：后台 task 持续读流——
+    - 带 req_id 的响应按 req_id 分发给对应的 request_mod future（支持并发请求）
+    - 事件推送即时派发（状态缓存不再堆积延迟）
+    request_mod 只负责发送 + 等自己的 future，互不阻塞；
+    单条命令超时不再锁住其他命令（移动/导航不会被排队卡死）。
+    """
+
+    def __init__(self, mod_host: str, mod_port: int) -> None:
         self.mod_host = mod_host
         self.mod_port = mod_port
-        self.packet = PacketManager()
-        # 7777 服务端 socket（用于异步收发）
-        self._sock: Optional[socket.socket] = None
-        # 9877 mod 接口 stream
         self._mod_reader: Optional[asyncio.StreamReader] = None
         self._mod_writer: Optional[asyncio.StreamWriter] = None
-        self.connected = False
-        # 7777 发送串行锁，防止并发游戏操作交错写入
-        self._send_lock = asyncio.Lock()
-        # mod 串行锁
-        self._mod_lock = asyncio.Lock()
+        self._mod_lock = asyncio.Lock()          # 只保护发送（防并发写乱序）
         self._req_seq = 0
-
-    # ===== 7777 Terraria 服务端通道 =====
-
-    async def connect_server(self) -> bool:
-        """TCP 连接到 Terraria 服务端，设为非阻塞模式以支持 asyncio"""
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.setblocking(False)
-            loop = asyncio.get_event_loop()
-            await loop.sock_connect(self._sock, (self.server_host, self.server_port))
-            self.connected = True
-            return True
-        except Exception as e:
-            self.connected = False
-            return False
-
-    async def send_server_wait(self, packet: bytes) -> bool:
-        """向 7777 完整发送一个原始协议包，并等待发送完成。"""
-        if not self._sock or not self.connected:
-            return False
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.sock_sendall(self._sock, packet)
-            return True
-        except (OSError, RuntimeError) as e:
-            from .raw_bot import _log
-            _log(f"send_server_wait 失败: {type(e).__name__}: {e}")
-            self.connected = False
-            return False
-
-    def send_server(self, packet: bytes) -> Optional[asyncio.Task[bool]]:
-        """调度协议包发送，供无需等待结果的游戏期同步接口使用。"""
-        if not self._sock or not self.connected:
-            return None
-        try:
-            return asyncio.get_running_loop().create_task(
-                self.send_server_wait(packet))
-        except RuntimeError:
-            self.connected = False
-            return None
-
-    async def _recv_exactly(self, size: int, timeout: float) -> Optional[bytes]:
-        """在超时前从服务端精确读取指定字节数。"""
-        if not self._sock:
-            return None
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        chunks = bytearray()
-        while len(chunks) < size:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return None
-            chunk = await asyncio.wait_for(
-                loop.sock_recv(self._sock, size - len(chunks)), timeout=remaining)
-            if not chunk:
-                self.connected = False
-                return None
-            chunks.extend(chunk)
-        return bytes(chunks)
-
-    async def recv_server_packet(self, timeout: float = 5.0) -> Optional[bytes]:
-        """从 7777 接收一个完整的 Terraria 协议包
-        
-        Returns:
-            包数据（不含长度头），或超时/断开时返回 None
-        """
-        if not self._sock or not self.connected:
-            return None
-        try:
-            header = await self._recv_exactly(2, timeout)
-            if header is None:
-                return None
-            length = struct.unpack("<H", header)[0] - 2
-            if length <= 0 or length > 65533:
-                return None
-            return await self._recv_exactly(length, timeout)
-        except (asyncio.TimeoutError, OSError):
-            return None
-
-    async def recv_server_until(self, target_types: set,
-                                 timeout_per_packet: float = 5.0,
-                                 max_packets: int = 50) -> Optional[Tuple[int, bytes]]:
-        """持续接收包直到遇到目标类型之一
-        
-        Args:
-            target_types: 期望的包类型集合，如 {3, 7, 49, 129}
-            timeout_per_packet: 每个包的超时时间
-            max_packets: 最大接收包数（防止死循环）
-        
-        Returns:
-            (packet_type, data) 或 None（超时/断开）
-        """
-        for _ in range(max_packets):
-            data = await self.recv_server_packet(timeout_per_packet)
-            if data is None or len(data) == 0:
-                return None
-            pkt_type = data[0]
-            if pkt_type in target_types:
-                return (pkt_type, data)
-            # 其他类型的包忽略，继续等待目标类型
-        return None
+        self._event_callbacks: list = []
+        self._pending: Dict[int, asyncio.Future] = {}  # req_id → future
+        self._read_task: Optional[asyncio.Task] = None
 
     # ===== 9877 Mod 接口通道 =====
 
-    async def connect_mod(self, retry_ports: bool = True) -> bool:
-        """TCP 连接到 tModLoader mod 的辅助控制接口
+    async def connect_mod(self, retry_ports: bool = True, skip_first: bool = False,
+                          skip_count: int = 0) -> bool:
+        # 先关闭旧连接（如有）
+        self.close()
+        start_port = self.mod_port + max(skip_count, 1 if skip_first else 0)
 
-        Args:
-            retry_ports: 如果默认端口失败，是否尝试其他端口 (9878-9886)
-
-        Returns:
-            连接成功返回 True，否则 False
-        """
-        # 首先尝试默认端口
-        try:
-            self._mod_reader, self._mod_writer = await asyncio.open_connection(
-                self.mod_host, self.mod_port)
-            return True
-        except Exception as e:
-            # 默认端口失败，如果启用重试，尝试其他端口
-            if not retry_ports:
+        async def _try_connect(port: int) -> bool:
+            try:
+                # limit=8MB：大响应（enum_items 物品表/get_recipes 配方表/enum_chests 箱子列表）
+                # 可能几百 KB，StreamReader 默认 64KB limit 会导致 readline 抛
+                # ValueError("chunk exceed the limit") → 响应读不完 → 请求超时
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(self.mod_host, port,
+                                            limit=8 * 1024 * 1024), timeout=2.0)
+                self._mod_reader, self._mod_writer = r, w
+                self.mod_port = port
+                # ── 握手：读 C# 发来的 welcome，确认字节流干净 ──
+                try:
+                    welcome_line = await asyncio.wait_for(
+                        self._mod_reader.readline(), timeout=1.5)
+                    if welcome_line:
+                        try:
+                            welcome = json.loads(welcome_line.decode("utf-8"))
+                            if welcome.get("welcome"):
+                                print(f"[conn] 收到 welcome 握手 (port={port})，连接正常")
+                        except json.JSONDecodeError:
+                            pass  # 旧版模组不发 welcome
+                except asyncio.TimeoutError:
+                    pass  # 旧版模组不发 welcome
+                # 启动独立读循环（强制 cancel 旧的再重建，杜绝残留双读循环）
+                self._start_reader()
+                return True
+            except Exception as e:
+                print(f"[conn] _try_connect({port}) 失败: {e}")
                 return False
 
-            # 尝试端口范围: 9878-9886 (共10个备用端口)
-            original_port = self.mod_port
-            for port in range(original_port + 1, original_port + 11):
-                try:
-                    self._mod_reader, self._mod_writer = await asyncio.open_connection(
-                        self.mod_host, port)
-                    # 连接成功，更新端口
-                    self.mod_port = port
-                    return True
-                except Exception:
-                    continue
+        if await _try_connect(start_port):
+            return True
+        if not retry_ports:
+            return False
 
-            # 所有端口都失败
+        for port in range(start_port + 1, start_port + 11):
+            if await _try_connect(port):
+                return True
+        return False
+
+    def is_mod_connected(self) -> bool:
+        """检查 mod 连接是否还活着"""
+        if self._mod_writer is None:
+            return False
+        try:
+            return not self._mod_writer.is_closing()
+        except Exception:
             return False
 
     async def request_mod(self, cmd: dict, timeout: float = 3.0) -> Optional[dict]:
-        """向 mod 接口发送 JSON 命令并等待匹配的回执"""
+        """向 mod 接口发送 JSON 命令并等待回执（独立读循环按 req_id 分发）。
+
+        协议一次一条命令（参照备份设计）：发送 + 等待在锁内串行，
+        避免并发命令违反 C# 端"一次一条"的协议约束。
+        读循环意外死亡时自动重建（防止全部命令静默超时）。
+        """
+        if not self._mod_writer:
+            return None
+        # 读循环意外死亡时自动重建
+        self._ensure_read_loop()
+
         async with self._mod_lock:
             self._req_seq = (self._req_seq + 1) & 0xFFFF
             req_id = self._req_seq
             cmd = dict(cmd)
             cmd["req_id"] = req_id
+
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._pending[req_id] = fut
+            log.info(f"[conn] request_mod req_id={req_id} cmd={cmd.get('cmd')} "
+                     f"loop_id={id(loop)} reader_id={id(self._mod_reader)}")
             await self._send_mod_raw(cmd)
-            return await self._recv_mod_raw(req_id, timeout)
+            try:
+                resp = await asyncio.wait_for(fut, timeout=timeout)
+                return resp
+            except asyncio.TimeoutError:
+                log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
+                return None
+            finally:
+                self._pending.pop(req_id, None)
+
+    def _start_reader(self) -> None:
+        """启动后台读循环（每次连接强制 cancel 旧的再重建，杜绝残留）。
+
+        旧 reader 若仍在跑（cancel 异步，done() 未必立刻 True），直接重建，
+        否则新连接没有读循环，所有响应都会超时。
+        """
+        if self._read_task is not None and not self._read_task.done():
+            self._read_task.cancel()
+        self._read_task = asyncio.create_task(self._read_loop())
+
+    def _ensure_read_loop(self) -> None:
+        """读循环不在跑时重建（readline 异常/竞态导致死亡后的自愈）。"""
+        if self._mod_reader and (self._read_task is None or self._read_task.done()):
+            try:
+                self._read_task = asyncio.create_task(self._read_loop())
+                log.warning("[conn] 读循环已重建")
+            except Exception:
+                pass
 
     async def _send_mod_raw(self, cmd: dict) -> None:
         if not self._mod_writer:
+            log.warning("[conn] _send_mod_raw 失败: _mod_writer 为 None")
             return
         data = (json.dumps(cmd) + "\n").encode("utf-8")
         try:
             self._mod_writer.write(data)
             await self._mod_writer.drain()
-        except Exception:
-            pass
+            log.info(f"[conn] 已发送: {cmd.get('cmd')} req_id={cmd.get('req_id')}")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            log.warning(f"[conn] _send_mod_raw 连接错误: {e}")
+        except Exception as e:
+            log.error(f"[conn] _send_mod_raw 异常: {type(e).__name__}: {e}")
 
-    async def _recv_mod_raw(self, req_id: int, timeout: float = 1.0) -> Optional[dict]:
-        if not self._mod_reader:
-            return None
-        deadline = asyncio.get_event_loop().time() + timeout
-        tries = 0
+    # ===== 独立读循环（替代请求内读流） =====
+
+    async def _read_loop(self) -> None:
+        """后台持续读流：响应按 req_id 分发到 pending future，事件即时派发。"""
+        my_reader = self._mod_reader
+        log.info(f"[conn] 读循环启动 reader_id={id(my_reader)} "
+                 f"task_id={id(asyncio.current_task())} "
+                 f"loop_id={id(asyncio.get_running_loop())}")
         while True:
-            remain = deadline - asyncio.get_event_loop().time()
-            if remain <= 0:
-                return None
+            if not self._mod_reader:
+                log.warning("[conn] 读循环退出: _mod_reader 为 None")
+                break
             try:
-                line = await asyncio.wait_for(
-                    self._mod_reader.readline(), timeout=remain)
-            except Exception:
-                return None
+                line = await self._mod_reader.readline()
+            except asyncio.CancelledError:
+                raise  # close() 取消读循环，正常退出
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.warning(f"[conn] _read_loop 连接错误: {e}")
+                break
+            except Exception as e:
+                # 非连接类异常（RuntimeError 等）不退出——退出会杀死读循环，
+                # 导致所有后续请求静默超时。打日志后继续。
+                log.error(f"[conn] _read_loop 异常(继续): {type(e).__name__}: {e}")
+                await asyncio.sleep(0.1)
+                continue
             if not line:
-                return None
+                # EOF：对端关闭
+                log.warning("[conn] _read_loop EOF，连接已关闭")
+                break
             try:
+                log.info(f"[conn] 读到行: {line[:100]!r}")
                 resp = json.loads(line.decode("utf-8"))
+                if not isinstance(resp, dict):
+                    continue
+                resp_req_id = resp.get("req_id")
+                if resp_req_id is not None and resp_req_id in self._pending:
+                    fut = self._pending[resp_req_id]
+                    if not fut.done():
+                        try:
+                            fut.set_result(resp)
+                        except Exception as e:
+                            # 跨事件循环操作 future 会抛 RuntimeError（SDK 多循环时）
+                            log.error(f"[conn] set_result 失败 req_id={resp_req_id}: "
+                                      f"{type(e).__name__}: {e}")
+                elif resp.get("type") == "event":
+                    self._dispatch_event(resp)
+                # 其他（无 req_id 的非事件响应）：忽略
+            except json.JSONDecodeError:
+                continue
             except Exception:
                 continue
-            if resp.get("req_id") == req_id:
-                return resp
-            tries += 1
-            if tries > 8:
-                return None
+
+        # 循环退出（断线/EOF/异常）：唤醒所有等待者，避免 request_mod 卡死。
+        # 只有自己仍是当前读循环才清理——防止旧连接的读循环残留退出时
+        # 清掉新连接的 pending（会导致新连接请求被误判失败 → 无限重连）
+        log.warning(f"[conn] 读循环退出 reader_id={id(my_reader)} "
+                    f"task_id={id(asyncio.current_task())} "
+                    f"current_task_is_self={self._read_task is asyncio.current_task()}")
+        if self._read_task is asyncio.current_task():
+            self._read_task = None
+            # 连接已死：清掉引用，让 is_mod_connected() 返回 False → 上层触发重连
+            if self._mod_writer:
+                try:
+                    self._mod_writer.close()
+                except Exception:
+                    pass
+            self._mod_reader = None
+            self._mod_writer = None
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_result(None)
+            self._pending.clear()
+
+    # ===== 事件回调 =====
+
+    def on_message(self, callback: Callable) -> None:
+        """注册事件回调。模组主动推送的 type="event" 消息会被派发到此。"""
+        self._event_callbacks.append(callback)
+
+    def _dispatch_event(self, msg: dict) -> None:
+        """将事件消息派发给所有注册的回调。"""
+        for cb in self._event_callbacks:
+            try:
+                cb(msg)
+            except Exception:
+                pass  # 回调异常不阻塞主流程
 
     # ===== 通用 =====
 
     def close(self) -> None:
-        """关闭所有连接"""
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
+        """关闭 Mod 连接"""
+        # 先取消读循环，避免旧读循环残留（EOF 退出时误清新连接的 pending）
+        if self._read_task:
+            self._read_task.cancel()
+            self._read_task = None
         if self._mod_writer:
             try:
                 self._mod_writer.close()
             except Exception:
                 pass
-        self.connected = False
+        self._mod_reader = None
+        self._mod_writer = None
+        # 唤醒所有等待者（读循环退出时也会做，这里兜底）
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_result(None)
+        self._pending.clear()

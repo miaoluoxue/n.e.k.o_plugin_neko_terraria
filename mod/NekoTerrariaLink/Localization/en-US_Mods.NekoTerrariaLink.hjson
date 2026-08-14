@@ -10,6 +10,16 @@ Configs: {
 			Label: 监听端口 (mod_port)
 		}
 
+		AutoSelectCharacter: {
+			Tooltip: 在主菜单自动选择配置的角色。
+			Label: 启动时自动选角色
+		}
+
+		PlayerName: {
+			Tooltip: 自动加入或操作的目标角色名称。
+			Label: 角色名称
+		}
+
 		DisplayName: Neko Config
 	}
 }

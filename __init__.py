@@ -7,11 +7,14 @@ from typing import Any, Dict, Optional
 
 from plugin.sdk.plugin import NekoPluginBase, neko_plugin
 
-from .entries.lifecycle_mixin import LifecycleMixin
-from .entries.ui_actions import UiActionsMixin
-from .entries.ui_context import UiContextMixin
-from .llm.goal_tools import GoalToolsMixin
-from .llm.action_tools import ActionToolsMixin
+from .entries import (
+    LifecycleMixin,
+    UiActionsMixin,
+    UiContextMixin,
+    GoalToolsMixin,
+    ActionToolsMixin,
+    MemoryEntriesMixin,
+)
 
 
 @neko_plugin
@@ -22,6 +25,7 @@ class NTerrariaPlugin(
     UiContextMixin,
     GoalToolsMixin,
     ActionToolsMixin,
+    MemoryEntriesMixin,
 ):
     def __init__(self, ctx):
         super().__init__(ctx)

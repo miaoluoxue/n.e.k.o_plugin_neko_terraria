@@ -1,8 +1,29 @@
-"""neko_terraria 自主行为大脑（移植 v2 三层思考范式）。"""
+"""neko_terraria 自主行为大脑（移植 v2 三层思考范式 + 交互引擎）。"""
 
 from .brain import AutonomousBrain
 from .internal_state import InternalState
 from .motivation import MotivationSystem
 from .event_bus import EventBus
+from .interaction_engine import (
+    InteractionEngine,
+    SceneClassifier,
+    SceneState,
+    MoodArc,
+    MoodManager,
+    OwnerTracker,
+    SCENE_CONFIG,
+)
 
-__all__ = ["AutonomousBrain", "InternalState", "MotivationSystem", "EventBus"]
+__all__ = [
+    "AutonomousBrain",
+    "InternalState",
+    "MotivationSystem",
+    "EventBus",
+    "InteractionEngine",
+    "SceneClassifier",
+    "SceneState",
+    "MoodArc",
+    "MoodManager",
+    "OwnerTracker",
+    "SCENE_CONFIG",
+]

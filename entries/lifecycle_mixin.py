@@ -1,13 +1,21 @@
-"""生命周期：启动 Agent + 自主大脑，关闭时清理。"""
+"""生命周期：启动 Agent + 自主大脑 + 交互引擎，关闭时清理。
+
+v2.0 改进：
+- 交互引擎 InteractionEngine 由 AutonomousBrain 内部管理，brain.start() 自动拉起
+- LLMIntentParser 由 TaskCoordinator 内部管理，通过 _wire_llm_integration() 注入 LLM 调用
+- executor 回调钩子由 brain.start() 注册，连通 task_done/step_done/interrupted → 交互引擎
+- 交互相关配置项追加到 _load_config 白名单
+- v2.1: 交互引擎通过 agent._neko_interaction 暴露给 service，service 紧急事件走引擎管道
+- v2.1: LLM 同时注入 service（EMERGENCY_PROMPT 危险评估）
+- v2.1: _try_load_host_persona() 从主项目 characters.json 加载角色人设
+"""
 
 import asyncio
+import json
+import os
 from typing import Any, Dict, Optional
 
 from plugin.sdk.plugin import lifecycle
-
-from ..bridge.agent import TerrariaAgent
-from ..autonomous.brain import AutonomousBrain
-from ..core.service import TerrariaService
 
 
 class LifecycleMixin:
@@ -17,53 +25,248 @@ class LifecycleMixin:
     _config: Dict[str, Any]
 
     def _init_core_services(self) -> None:
-        self._config = {
-            "server_host": "127.0.0.1", "server_port": 7777,
-            "mod_host": "127.0.0.1", "mod_port": 9877,
-            "bot_name": "Neko", "bot_password": "",
-            "state_tick_interval_seconds": 1.0,
-            "fast_think_interval_seconds": 5.0,
-            "deep_think_min_seconds": 30,
-            "deep_think_max_seconds": 90,
-            "system_prompt_interval_seconds": 15.0,
-        }
-        self._agent = TerrariaAgent(self._config)
-        self._autonomous_brain = AutonomousBrain(self._agent, self._config)
-        self._service = TerrariaService(self._agent, self._config,
-                                        push_message=self.push_message)
+        from ..core.config_store import load_user_config
+        from ..bridge.agent import TerrariaAgent
+        from ..autonomous.brain import AutonomousBrain
+        from ..core.service import TerrariaService
+
+        # 所有默认值统一由 config_store.DEFAULTS 管理
+        # load_user_config() 读取 user_config.json，缺失项用 DEFAULTS 补齐
+        self._config = load_user_config()
+        self._agent = TerrariaAgent(self)
+        self._autonomous_brain = AutonomousBrain(self)
+        self._service = TerrariaService(self, push_message=self.push_message)
 
     async def _load_config(self) -> None:
-        # 1) 读取 plugin.toml 的 [neko_terraria] 段，覆盖默认值
+        # plugin.toml [neko_terraria] 段优先级最高（覆盖已加载的 DEFAULTS + user_config）
+        # _config 与 agent.cfg / brain.cfg 共享同一引用，修改自动生效，无需手动 sync
+        # ★ 宿主 config.dump 是同步阻塞（timeout 参数无效），曾导致 _boot 卡死 11 分钟，
+        # 感知/情感系统全部未启动——to_thread 移出事件循环 + wait_for 强制超时
         try:
-            cfg = await self.config.dump(timeout=5.0)
+            cfg = await asyncio.wait_for(
+                asyncio.to_thread(self.config.dump, timeout=5.0), timeout=6.0)
             neko = cfg.get("neko_terraria") if isinstance(cfg, dict) else None
             if isinstance(neko, dict):
-                for key in ("server_host", "server_port", "mod_host", "mod_port",
-                            "bot_name", "bot_password", "state_tick_interval_seconds",
+                for key in ("mod_host", "mod_port", "server_host", "server_port",
+                            "server_password", "game_path", "character_name",
+                            "window_hidden", "state_tick_interval_seconds",
                             "fast_think_interval_seconds", "deep_think_min_seconds",
-                            "deep_think_max_seconds"):
+                            "deep_think_max_seconds",
+                            "context_push_interval_seconds", "context_deep_push_interval_seconds",
+                            "llm_autonomous_enabled", "llm_think_min_seconds",
+                            "llm_think_max_seconds",
+                            "follow_trigger_dist", "follow_stop_dist",
+                            "auto_return_after_respawn",
+                            # v2.0: 交互引擎配置项
+                            "interaction_tick",
+                            "interaction_enabled",
+                            "llm_intent_enabled",
+                            "vision_analysis_enabled", "vision_min_interval",
+                            "recovery_ask_interval",
+                            "owner_track_window",):
                     if key in neko:
                         self._config[key] = neko[key]
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("读取配置失败，使用默认值: {}", exc)
 
-        # 2) 用户独立配置文件 data/config/user_config.json 优先级最高（长久存储，更新插件不丢）
-        try:
-            from ..core.config_store import load_user_config
-            user_cfg = load_user_config()
-            for key in ("server_host", "server_port", "mod_host", "mod_port",
-                        "bot_name", "bot_password"):
-                if key in user_cfg:
-                    # bot_password 允许空串（无密码），其他字段过滤空值
-                    if key == "bot_password" or user_cfg[key] not in (None, ""):
-                        self._config[key] = user_cfg[key]
-            self.logger.info("已从 data/config/user_config.json 载入用户配置")
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取用户配置文件失败: {}", exc)
+    # ── LLM 注入 ──────────────────────────────────────
 
-        # 同步配置到 agent（注意 agent 使用 cfg，不是 _config）
-        self._agent.cfg = self._config
-        self._autonomous_brain._config = self._config
+    async def _wire_llm_integration(self) -> None:
+        """双 LLM 架构：主 LLM（对话/人格）+ 意图 LLM（结构化推理）。
+
+        支持三种模式：
+        1. 宿主注入（__call_llm/__call_intent_llm）- 优先使用
+        2. 插件配置（config 中的 LLM 设置）- 自建客户端
+        3. 单 LLM 回退（未配置意图 LLM 时使用主 LLM）
+        """
+        from ..llm.throttle import get_throttle
+        get_throttle(self._config)
+
+        main_llm = await self._resolve_llm_call()
+        intent_llm = await self._resolve_intent_llm()
+
+        if not main_llm and not intent_llm:
+            self.logger.info("LLM 未配置，将使用正则 fallback 解析指令")
+            return
+
+        coordinator = getattr(self._agent, "coordinator", None)
+        if coordinator and intent_llm:
+            coordinator.set_llm_call(intent_llm)
+            model_info = "（独立意图模型）" if intent_llm != main_llm else "（共享主模型）"
+            self.logger.info(f"已注入意图解析 LLM {model_info}")
+
+        if self._service and main_llm:
+            self._service.set_llm_call(main_llm)
+            self.logger.info("已注入紧急评估 LLM")
+
+    async def _resolve_llm_call(self):
+        """主 LLM：对话、人格、汇报。优先使用宿主注入，否则从配置创建。"""
+        raw = getattr(self, "__call_llm", None)
+        if raw:
+            if asyncio.iscoroutinefunction(raw):
+                async def wrapper(prompt: str) -> str:
+                    return await raw(prompt)
+                return wrapper
+            else:
+                async def wrapper(prompt: str) -> str:
+                    return raw(prompt)
+                return wrapper
+
+        call_fn = getattr(self, "call_llm", None)
+        if call_fn:
+            async def wrapper(prompt: str) -> str:
+                return await call_fn(prompt)
+            return wrapper
+
+        return await self._create_llm_from_config("llm_main")
+
+    async def _resolve_intent_llm(self):
+        """意图 LLM：结构化推理、任务规划。优先宿主注入，否则配置创建，最后回退主 LLM。"""
+        raw = getattr(self, "__call_intent_llm", None)
+        if raw:
+            if asyncio.iscoroutinefunction(raw):
+                async def wrapper(prompt: str) -> str:
+                    return await raw(prompt)
+                return wrapper
+            else:
+                async def wrapper(prompt: str) -> str:
+                    return raw(prompt)
+                return wrapper
+
+        intent_from_config = await self._create_llm_from_config("llm_intent")
+        if intent_from_config:
+            return intent_from_config
+
+        return await self._resolve_llm_call()
+
+    async def _create_llm_from_config(self, prefix: str):
+        """从插件配置创建 LLM 客户端（prefix: "llm_main" 或 "llm_intent"）。"""
+        from ..llm.unified_client import create_llm_client
+
+        client = create_llm_client(self._config, prefix)
+        if not client:
+            return None
+
+        async def wrapper(prompt: str) -> str:
+            try:
+                return await client.call(prompt)
+            except Exception as e:
+                self.logger.warning(f"LLM 调用失败 ({prefix}): {e}")
+                raise
+
+        return wrapper
+
+    async def _wire_vision_llm(self) -> None:
+        """注入 LLM Vision 能力到 VisualPerception。
+
+        需要插件安装了支持视觉的 LLM 后端（如 Gemini Vision / GPT-4V）。"""
+        try:
+            # 检查配置开关
+            if not self._config.get("vision_analysis_enabled", True):
+                return
+
+            vision = getattr(self._agent, "vision", None)
+            if not vision or not hasattr(vision, "perception"):
+                return
+
+            vp = vision.perception  # VisualPerception 实例
+
+            # 宿主是否提供 vision LLM？（v3.0: 统一走宿主，无自带客户端）
+            vision_llm = getattr(self, "call_vision", None)
+            if vision_llm:
+                vp.set_llm_vision(vision_llm)
+                self.logger.info("已注入 LLM Vision 感知 → 猫娘能看游戏画面了")
+        except Exception:
+            pass  # vision 是可选的，静默跳过
+
+    # ── v2.1: 主项目角色人设加载 ────────────────────
+
+    async def _try_load_host_persona(self) -> Optional[Dict[str, Any]]:
+        """尝试从 N.E.K.O 主项目的 characters.json 加载当前角色的性格人设。
+
+        返回 {traits: [...], description: str, habits: {...}} 或 None。
+        如果主项目不可达或文件不存在，静默返回 None。
+        """
+        try:
+            # 推导主项目 config 路径：__file__ = .../neko_terraria/entries/lifecycle_mixin.py
+            # 上 2 级 → neko_terraria；上 4 级 → 主程序根（plugin/plugins/neko_terraria
+            # 的开发布局与 resources/bin/plugin/plugins/neko_terraria 的生产布局同构）
+            fdir = os.path.dirname(os.path.abspath(__file__))
+            host_root = fdir
+            for _ in range(4):
+                host_root = os.path.dirname(host_root)
+
+            # 优先 characters.json（旧布局），否则 characters/{locale}.json（新布局）
+            candidates = [
+                os.path.join(host_root, "config", "characters.json"),
+                os.path.join(host_root, "config", "characters", "zh-CN.json"),
+                os.path.join(host_root, "config", "characters", "zh_CN.json"),
+                os.path.join(host_root, "config", "characters", "en.json"),
+            ]
+            config_path = next((p for p in candidates if os.path.exists(p)), None)
+            if not config_path:
+                self.logger.debug(f"未找到主项目人设（尝试过: {candidates[0]} 等）")
+                return None
+
+            with open(config_path, "r", encoding="utf-8") as f:
+                characters = json.load(f)
+
+            # 获取当前活跃角色的名称
+            char_name = self._config.get("character_name", "")
+            if not char_name:
+                char_name = os.environ.get("NEKO_CHARACTER", "")
+
+            # 中文布局：{"主人": {...}, "猫娘": {"YUI": {...}}, ...}；
+            # 英文布局：{角色名: {...}} 或 list
+            persona = None
+            if isinstance(characters, dict):
+                cats = characters.get("猫娘", None)
+                if isinstance(cats, dict):
+                    if char_name and char_name in cats:
+                        persona = cats[char_name]
+                    elif "default" in cats:
+                        persona = cats["default"]
+                    else:
+                        persona = next(iter(cats.values()), None)
+                else:
+                    if char_name and char_name in characters:
+                        persona = characters[char_name]
+                    elif "default" in characters:
+                        persona = characters["default"]
+                    else:
+                        persona = next(iter(characters.values()), None)
+            elif isinstance(characters, list) and characters:
+                for c in characters:
+                    if isinstance(c, dict) and c.get("name", "").lower() == char_name.lower():
+                        persona = c
+                        break
+                if persona is None:
+                    persona = characters[0]
+
+            if not persona:
+                return None
+
+            # 提取人设信息（兼容中英文键名）
+            traits = (persona.get("核心特质", []) or persona.get("traits", [])
+                      or persona.get("core_traits", []))
+            description = (persona.get("一句话台词", "") or persona.get("description", "")
+                           or persona.get("prompt", ""))
+            habits = (persona.get("行为特点", {}) or persona.get("习惯", {})
+                      or persona.get("habits", {}) or persona.get("speech_habits", {}))
+
+            result = {
+                "traits": traits if isinstance(traits, list) else [traits],
+                "description": description if isinstance(description, str) else "",
+                "habits": habits if isinstance(habits, dict) else {},
+            }
+            self.logger.info(f"已加载主项目角色人设: {config_path} "
+                             f"(traits={len(result['traits'])})")
+            return result
+        except Exception as exc:
+            self.logger.debug(f"加载主项目人设失败（将使用默认人设）: {exc}")
+            return None
+
+    # ── 生命周期 ──────────────────────────────────────
 
     @lifecycle(id="startup")
     async def on_load(self) -> None:
@@ -90,18 +293,108 @@ class LifecycleMixin:
 
         # startup 在常驻事件循环中调度，create_task 启动的长任务可存活
         async def _boot() -> None:
-            await self._load_config()
-            ok = await self._agent.start()
-            if not ok:
-                self.logger.warning("Agent 启动失败，检查 Terraria 服务端/mod")
-                return
-            await self._autonomous_brain.start()
-            await self._service.start()
-            self.logger.info("猫娘已进入泰拉瑞亚世界")
+            try:
+                self.logger.info("[boot] 开始启动 neko_terraria...")
+                await self._load_config()
+                self.logger.info("[boot] 配置加载完成")
+
+                # v2.1: 加载主项目角色人设（注入到 config 中供 habits/context 使用）
+                persona = await self._try_load_host_persona()
+                if persona:
+                    self._config["_host_persona"] = persona
+                    self.logger.info("[boot] 角色人设已注入")
+
+                # v2.0: LLM 集成（agent 启动前注入，确保首次 handle() 就能走 LLM）
+                await self._wire_llm_integration()
+                self.logger.info("[boot] LLM 集成完成")
+
+                self.logger.info("[boot] 正在连接游戏 Agent...")
+                ok = await self._agent.start()
+                if not ok:
+                    self.logger.warning("Agent 启动失败，检查 Terraria 服务端/mod 是否运行")
+                    self.logger.warning("  → 请确认: 1) game_path 配置正确 2) tModLoader 可运行 3) mod TCP 端口 9877 可用")
+                    return
+                self.logger.info("[boot] Agent 启动成功")
+
+                # v2.0: brain.start() 内部会拉起交互引擎 + 注册 executor 回调
+                await self._autonomous_brain.start()
+                self.logger.info("[boot] 自治大脑启动完成")
+
+                # v2.1: 交互引擎暴露给 agent → service/coordinator 可通过 agent._neko_interaction 访问
+                self._agent._neko_interaction = self._autonomous_brain.interaction
+                self._service.interaction = self._autonomous_brain.interaction
+
+                # v3.0: 绑定游戏事件发射器到交互引擎
+                self._service.bind_emitter_to_interaction()
+
+                await self._service.start()
+                self.logger.info("[boot] 游戏状态服务启动完成")
+
+                # v2.0: vision LLM 后注入（vision 在 agent.start() 后才初始化）
+                await self._wire_vision_llm()
+
+                # v2.1: 启动视觉管线。截图源（v0.7）：主玩家窗口截图优先（猫娘"看"
+                # 主人画面，陪伴感核心），失败时降级到 mod 截图（猫娘自己视角）。
+                vp = getattr(self._agent, "vision", None)
+                if vp:
+                    try:
+                        from ..perception.owner_screen import owner_window_frame
+                        mod_shot = self._agent.mod.screenshot
+
+                        async def _frame_source():
+                            try:
+                                f = await owner_window_frame()
+                                if f:
+                                    return f
+                            except Exception:
+                                pass
+                            return await mod_shot()
+
+                        vp.set_frame_source(_frame_source)
+                    except Exception:
+                        vp.set_frame_source(self._agent.mod.screenshot)
+                    await vp.start()
+                    self.logger.info("[boot] 视觉感知管线已启动（主人画面优先）")
+
+                # v0.7: 常驻场景上下文注入（read 模式不打扰，供主 LLM 人设感知）
+                try:
+                    await self.push_message(
+                        parts=[{"type": "text", "text": (
+                            "[场景] 猫娘在泰拉瑞亚世界里陪主人玩：她在游戏里有一个身体"
+                            "（会疼、会累、会害怕、会冷），能看到主人的画面动态，"
+                            "对主人有长期依恋情感。用角色人设自然地互动，"
+                            "该场景贯穿本次会话。")}],
+                        visibility=[], ai_behavior="read")
+                except Exception:
+                    pass
+
+                self.logger.info("猫娘已进入泰拉瑞亚世界（v2.1 交互引擎 + 紧急事件已接通）")
+            except Exception as e:
+                import traceback
+                self.logger.error(f"[boot] 启动过程中抛出未捕获异常: {e}")
+                self.logger.error(f"[boot] 堆栈跟踪:\n{traceback.format_exc()}")
+                # 如果是 asyncio 任务内部的异常，也要让宿主感知
+                try:
+                    await self.push_message(
+                        parts=[{"type": "text",
+                                "text": f"[系统] neko_terraria 启动失败: {e}"}],
+                        visibility=["hud"], ai_behavior="blind")
+                except Exception:
+                    pass
         asyncio.create_task(_boot())
 
     @lifecycle(id="shutdown")
     async def on_unload(self) -> None:
+        # v3.0: 关闭记忆存储（SQLite）
+        closer = getattr(self, "_close_memory", None)
+        if closer:
+            try:
+                closer()
+            except Exception:
+                pass
+        vp = getattr(self._agent, "vision", None)
+        if vp:
+            await vp.stop()
         await self._service.stop()
         await self._autonomous_brain.stop()
         await self._agent.stop()

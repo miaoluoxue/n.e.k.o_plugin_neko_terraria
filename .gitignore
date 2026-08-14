@@ -1,0 +1,21 @@
+# ── 运行时/缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+*.log
+logs/
+
+# ── AI 客户端运行时（角色存档/世界/Mods 编译产物/配置——含个人数据）──
+mod/tModLoader/
+
+# ── C# 编译中间产物 ──
+*.tmod
+mod/NekoTerrariaLink/bin/
+mod/NekoTerrariaLink/obj/
+
+# ── 插件运行时数据（bond.json/配方缓存/物品缓存）──
+data/
+
+# ── 密钥/环境 ──
+.env
+*.key

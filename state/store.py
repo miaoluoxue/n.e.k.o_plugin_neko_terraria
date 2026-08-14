@@ -7,7 +7,7 @@ class StateStore:
     def __init__(self) -> None:
         self.data: Dict[str, Any] = {
             "connected": False, "hp": 0, "mp": 0,
-            "current_goal": "", "bot_name": "Neko",
+            "current_goal": "", "character_name": "AI-Neko",
         }
 
     def update(self, patch: Dict[str, Any]) -> None:

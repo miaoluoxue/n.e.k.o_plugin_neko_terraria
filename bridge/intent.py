@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 # 天生长期的行为（没有自然终点）
 FOLLOW_WORDS = ("跟着", "跟上", "跟我", "跟随", "别走丢", "一起走")
+# 贴身跟随：跟在身边/贴贴（距离阈值更近，5-8格触发 / 2-3格停止）
+STICK_WORDS = ("身边", "贴身", "贴贴", "寸步不离", "别离开我", "别走远", "黏着我")
 GUARD_WORDS = ("守着", "守在", "待在这", "别乱跑", "原地待命")
 MINE_WORDS = ("挖", "采", "开采")
 
@@ -57,6 +59,9 @@ class Intent:
 
 def _parse_amount(text: str) -> int:
     """从话里抠出数量，没有就返回 0（= 不限量 = 长期）。"""
+    # "一组" 优先于单字匹配（否则先命中"一"返回 1）
+    if "一组" in text:
+        return 99
     m = re.search(r"(\d+)\s*(个|块|颗|组|次|只)?", text)
     if m:
         try:
@@ -66,9 +71,6 @@ def _parse_amount(text: str) -> int:
     for cn, n in CN_NUM.items():
         if re.search(cn + r"\s*(个|块|颗|组|次|只)", text):
             return n
-    # "一组" 在泰拉瑞亚里通常是 999，但按常见理解给 99
-    if "一组" in text:
-        return 99
     return 0
 
 
@@ -91,8 +93,9 @@ def parse(text: str) -> Intent:
     t = (text or "").strip()
     low = t.replace(" ", "")
 
-    # 1) 先看是不是喊停
-    if any(w in low for w in STOP_WORDS):
+    # 1) 先看是不是喊停（"别停下/不要停止"这类否定不算停止）
+    neg_stop = any(w in low for w in ("别停下", "不要停", "别停止", "不要停止", "别停手"))
+    if not neg_stop and any(w in low for w in STOP_WORDS):
         kind = ""
         if any(w in low for w in ("跟", "跟着")):
             kind = "follow"
@@ -102,7 +105,10 @@ def parse(text: str) -> Intent:
             kind = "guard"
         return Intent(mode="stop", kind=kind, raw=t, reason="主人喊停")
 
-    # 2) 跟随：天生长期
+    # 2) 跟随：天生长期（先查贴身模式，再查普通跟随）
+    if any(w in low for w in STICK_WORDS):
+        return Intent(mode="longterm", kind="follow", target="stick", raw=t,
+                      reason="主人让我跟在身边")
     if any(w in low for w in FOLLOW_WORDS):
         return Intent(mode="longterm", kind="follow", raw=t,
                       reason="主人让我跟着")

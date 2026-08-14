@@ -28,7 +28,13 @@ namespace NekoTerrariaLink
                 case null: return "null";
                 case string s: return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
                 case double d: return d.ToString(CultureInfo.InvariantCulture);
+                case float f: return f.ToString(CultureInfo.InvariantCulture);
                 case int i: return i.ToString(CultureInfo.InvariantCulture);
+                case long l: return l.ToString(CultureInfo.InvariantCulture);
+                case short sh: return sh.ToString(CultureInfo.InvariantCulture);
+                case byte by: return by.ToString(CultureInfo.InvariantCulture);
+                case uint ui: return ui.ToString(CultureInfo.InvariantCulture);
+                case ulong ul: return ul.ToString(CultureInfo.InvariantCulture);
                 case bool b: return b ? "true" : "false";
                 case Dict d:
                     var sb = new StringBuilder("{");
@@ -77,7 +83,23 @@ namespace NekoTerrariaLink
             if (c == '[') return ParseArray(ref rest);
             if (c == '"') return ParseString(ref rest);
             if (c == 't' || c == 'f') return ParseBool(ref rest);
+            if (c == 'n') return ParseNull(ref rest);
             return ParseNumber(ref rest);
+        }
+
+        private static object ParseNull(ref string rest)
+        {
+            if (rest.StartsWith("null"))
+            {
+                rest = rest.Substring(4);
+                return null;
+            }
+            // 非法 token，跳过并返回 null
+            int i = 0;
+            while (i < rest.Length && !(rest[i] == ',' || rest[i] == '}' || rest[i] == ']'))
+                i++;
+            rest = rest.Substring(i);
+            return null;
         }
 
         private static Dict ParseObject(ref string rest)
@@ -87,7 +109,7 @@ namespace NekoTerrariaLink
             if (rest.StartsWith("}")) { rest = rest.Substring(1); return d; }
             while (true)
             {
-                string key = ParseString(ref rest).ToString();
+                string key = ParseString(ref rest);
                 rest = rest.TrimStart();
                 rest = rest.Substring(1).TrimStart(); // skip :
                 object val = ParseValue(rest, ref rest);
@@ -127,8 +149,9 @@ namespace NekoTerrariaLink
             return dl;
         }
 
-        private static StringBuilder ParseString(ref string rest)
+        private static string ParseString(ref string rest)
         {
+            rest = rest.TrimStart(); // eat any whitespace before the opening quote
             rest = rest.Substring(1); // skip opening "
             var sb = new StringBuilder();
             while (rest.Length > 0 && rest[0] != '"')
@@ -145,7 +168,7 @@ namespace NekoTerrariaLink
                 }
             }
             if (rest.Length > 0) rest = rest.Substring(1);
-            return sb;
+            return sb.ToString();
         }
 
         private static bool ParseBool(ref string rest)
@@ -159,9 +182,19 @@ namespace NekoTerrariaLink
             int i = 0;
             while (i < rest.Length && (char.IsDigit(rest[i]) || rest[i] == '.' || rest[i] == '-'))
                 i++;
+            if (i == 0)
+            {
+                // 不是有效的数字开头（例如遇到了 } ] , 等），跳过直到下一个分隔符
+                while (i < rest.Length && !(rest[i] == ',' || rest[i] == '}' || rest[i] == ']'))
+                    i++;
+                rest = rest.Substring(i);
+                return 0;
+            }
             var num = rest.Substring(0, i);
             rest = rest.Substring(i);
-            return double.Parse(num, CultureInfo.InvariantCulture);
+            if (!double.TryParse(num, NumberStyles.Float, CultureInfo.InvariantCulture, out double result))
+                return 0;
+            return result;
         }
     }
 }

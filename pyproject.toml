@@ -1,8 +1,37 @@
 [project]
 name = "neko_terraria"
-version = "0.1.0"
-description = "AI cat-girl as autonomous Terraria player plugin for N.E.K.O."
-requires-python = ">=3.13.5"
+version = "0.3.0"
+description = "AI cat-girl as independent player in Terraria via headful tModLoader client."
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
 vision = ["pillow>=10.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9.0",
+]
+
+[tool.neko.build]
+exclude_dirs = [
+    ".github",
+    ".vscode",
+    ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "docs",
+    "tests",
+    "tools",
+    "archive",
+    "data",
+    "mod/tModLoader",
+    "mod/NekoTerrariaLink/bin",
+    "mod/NekoTerrariaLink/obj",
+]
+exclude_files = [
+    ".gitignore",
+    "README.md",
+    "uv.lock",
+    "*.tmod",
+]

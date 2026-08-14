@@ -1,9 +1,14 @@
-"""TerrariaAgent：双轨调度，指令抢占与自主行为并行。"""
+"""TerrariaAgent：有头客户端架构（全渲染，非无头协议模拟）。
+- 通过 GameLauncher 启动完整的 tModLoader 图形客户端
+- 移动/战斗控制通过 ModLink (TCP 9877) 实现
+- 登录/心跳由游戏原生网络栈处理，不自行模拟协议
+
+"""
 
 import asyncio
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..autonomous.event_bus import get_event_bus
 from .combat import CombatEngine
 from .connection import Connection
 from .equipment import EquipmentManager
@@ -17,59 +22,167 @@ from .task_brain import TaskBrain
 from .longterm import LongTermManager
 from .standing_jobs import StandingJobs
 from .coordinator import TaskCoordinator
+from .task_inquiry import TaskInquiry
 from .inventory_ops import InventoryOps
 from .recipe_book import RecipeBook
-from .raw_bot import RawBot
+from .launcher import GameLauncher
 from .task_chain import Goal, TaskChain
 
 
+# ── 联机模式检测阈值（参照 Lumi_Nox） ──
+# 附近玩家距离阈值：存在非自身玩家且距离 < 该值 → 视为联机模式
+MULTIPLAYER_DIST_THRESHOLD = 200  # tile
+
+
 class TerrariaAgent:
-    def __init__(self, cfg: Dict[str, Any]) -> None:
-        self.cfg = cfg
-        self.conn = Connection(
-            cfg["server_host"], cfg["server_port"],
-            cfg["mod_host"], cfg["mod_port"])
-        self.bot = RawBot(self.conn)
+    def __init__(self, plugin) -> None:
+        from ..core.config_store import PLUGIN_ROOT  # 延迟导入打断循环
+
+        self.plugin = plugin
+        self.cfg = plugin._config
+        self.conn = Connection(self.cfg["mod_host"], self.cfg["mod_port"])
+        self.launcher = GameLauncher(self.cfg)
         self.mod = ModLink(self.conn)
-        self.combat = CombatEngine(self.mod, self.bot, self)
-        self.mining = MiningEngine(self.mod, self.bot, self)
+        self.combat = CombatEngine(self.mod, self)
+        self.mining = MiningEngine(self.mod, self)
         self.equip = EquipmentManager(self.mod)
         self.tasks = TaskChain(self.mining, self.mod, self.equip, self)
-        self.registry = ModItemRegistry(Path(__file__).resolve().parent.parent)
+        self.registry = ModItemRegistry(PLUGIN_ROOT)
         self.capability = Capability(self)
         self.planner = Planner(self)
         self.executor = TaskExecutor(self)
-        # 配方书要先于大脑建好：大脑推演合成时直接用它（含 mod 配方）
         self.recipe_book = RecipeBook(self)
         self.brain = TaskBrain(self)
-        # 后台常驻轨：跟随/一直挖矿这类没有终点的长期任务
         self.longterm = LongTermManager(self)
         self.jobs = StandingJobs(self)
-        self.coordinator = TaskCoordinator(self)
+        self.coordinator = TaskCoordinator(self, name=self._character_name())
+        self.inquiry = TaskInquiry(self)   # v2.1: 任务中决策询问
         self.items = InventoryOps(self)
+        from .events import EventResponder
+        self.events = EventResponder(self)
+        # v2.1: 视觉管线（截图源在 lifecycle 注入；无源时自动降级）
+        from ..core.vision import VisionPipeline
+        self.vision = VisionPipeline(
+            self.cfg, agent=self,
+            push_message=getattr(plugin, "push_message", None))
         self._state: Dict[str, Any] = {}
         self._inv_full: Dict[str, Any] = {"hotbar": [], "equipped": [], "inventory": []}
         self._chests: List[Dict[str, Any]] = []
+        self._world_info: Dict[str, Any] = {}
         self._log: List[Dict[str, Any]] = []
         self._running = False
 
+        # ── 死亡/复活状态（参照 Lumi_Nox bridge._is_dead） ──
+        self._is_dead: bool = False
+        self._death_message: str = ""           # 最后一条死亡信息
+        self._death_position: Optional[tuple] = None  # (tile_x, tile_y) 死亡位置
+        self._death_count: int = 0              # 累计死亡次数
+        self._last_hp: int = 0                  # 上一帧血量（用于暴跌检测）
+
+        # ── 复活回调 ──
+        self.respawn_callbacks: list = []       # 复活时触发，供 brain 注册
+
+        # ── 联机模式 ──
+        self._multiplayer_mode: bool = False    # 检测到附近有玩家 → 联机模式
+
     async def start(self) -> bool:
-        ok = await self.bot.login(
-            self.cfg["bot_name"], self.cfg.get("bot_password", ""))
-        if not ok:
+        """启动 AI 客户端 → 加入游戏。
+
+        所有默认值统一由 config_store.DEFAULTS 管理，此处直接从 self.cfg 取，
+        不再写死第二份 fallback。
+        """
+        server_host: str = self.cfg["server_host"]
+        server_port: int = self.cfg["server_port"]
+        server_password: str = self.cfg["server_password"]
+        character_name: str = self._character_name()
+
+        if not await self.launcher.launch():
             return False
+
+        # launcher 已等待 3s；Mod TCP 监听器约在进程启动后 10~12s 就绪
+        # 此处补偿等待，避免无效重试
+        await asyncio.sleep(8.0)
+
+        # 连接 AI Mod（只有 AI 装了 NekoTerrariaLink → 独占 9877）
+        if not await self._ensure_mod_connected():
+            self.launcher._log("无法连接到 AI 的 NekoTerrariaLink Mod，检查 AI 客户端是否正常加载")
+            return False
+
+        # 注册 mod 事件回调（死亡/Boss/入侵等主动推送事件）
+        self.conn.on_message(self._handle_mod_event)
+
+        # 等待游戏加载到主菜单（此时 DrawMenu hook 已在跑自动选角色）
+        await asyncio.sleep(1.0)
+
+        # ===== 1) 通知 mod 选定角色（统一从前端 character_name 读取） =====
+        # Mod 自身也有 AutoSelect 机制，即使 Python 命令失败也能兜底
+        if character_name:
+            ok = await self.mod.select_character(name=character_name)
+            if not ok:
+                self.launcher._log(f"指定角色 '{character_name}' 命令失败（Mod AutoSelect 兜底）")
+            else:
+                self.launcher._log(f"已选中角色 '{character_name}'")
+        else:
+            await self.mod.select_character()
+
+        # ===== 2) 加入服务器 —— 使用状态机轮询，模仿 Terraria-Bot =====
+        # join_server(wait_confirm=True) 会在 mod 侧等待真实连接确认（netMode→1 + player.active）
+        self.launcher._log(f"正在连接服务器 {server_host}:{server_port}...")
+        for retry in range(5):
+            # 先确保 Mod TCP 连通
+            if not await self._ensure_mod_connected():
+                self.launcher._log(f"Mod 连接丢失 (第{retry+1}次重试)，正在重连...")
+                if retry < 4:
+                    await asyncio.sleep(1.0)
+                continue
+
+            self.launcher._log(f"发送 join_server 命令 (第{retry+1}次)...")
+            ok = await self.mod.join_server(
+                server_host, server_port, server_password,
+                character_name=character_name,
+                wait_confirm=True, confirm_timeout=25)
+            if ok:
+                self.launcher._log("AI 成功进入服务器！")
+                break
+            # 未确认入服：多半是 TCP 半开（AI 客户端已断但本地未检测），
+            # 强制断开让下一次 _ensure_mod_connected 真正重连
+            self.launcher._log(f"join_server 未确认入服 (第{retry+1}次)，重试...")
+            self.conn.close()
+            if retry < 4:
+                await asyncio.sleep(1.0)
+        else:
+            self.launcher._log("AI 加入服务器失败，请确认服务器已开启且配置正确")
+            return False
+
         self._running = True
+        self.events.bind()
         asyncio.create_task(self.tasks.run_loop())
         asyncio.create_task(self._state_loop())
         asyncio.create_task(self._auto_register())
         return True
 
+    async def _ensure_mod_connected(self) -> bool:
+        """确保已连接到 AI Mod 的 TCP 端口，未连接则尝试重连。"""
+        if self.conn.is_mod_connected():
+            return True
+        for retry in range(10):
+            if await self.conn.connect_mod(retry_ports=(retry >= 3)):
+                return True
+            if retry < 9:
+                await asyncio.sleep(1.0)
+        return False
+
+    def _character_name(self) -> str:
+        """直接从配置文件读取角色名，零 cfg 传播依赖。"""
+        from ..core.config_store import load_user_config
+        return load_user_config().get("character_name", "Neko")
+
     async def refresh_state(self) -> Dict[str, Any]:
-        # 立即拉一次状态（不等 _state_loop 周期），供分段执行后重新评估
-        st = await self.mod.get_state(self.bot.player_name)
+        """立即刷新状态"""
+        player_name = self._character_name()
+        st = await self.mod.get_state(player_name)
         if st:
             self._state = st
-            self.bot.sync_position(st.get("x", 0), st.get("y", 0))
         return self._state
 
     def log(self, msg: str, kind: str = "info") -> None:
@@ -80,17 +193,23 @@ class TerrariaAgent:
             self._log = self._log[-100:]
 
     async def _auto_register(self) -> None:
-        # 进游戏时增量同步 mod 物品：新写入、消失删除，保持目录整洁
+        """进游戏时增量同步 mod 物品。
+
+        enum_items + get_recipes 是一次性重请求（C# 侧遍历全物品/全配方），
+        启动瞬间并发会占用命令锁，把推送事件/导航命令堵住。
+        延迟 auto_register_delay_seconds 再跑，等入服推送稳定。
+        """
+        await asyncio.sleep(
+            self.cfg.get("auto_register_delay_seconds", 25.0))
         try:
             mods = await self.mod.enum_items()
             diff = self.registry.sync_from_enum(mods)
             if diff["added"]:
-                self.bot.send_msg(f"认识了新 mod：{', '.join(diff['added'])}")
+                self.log(f"认识了新 mod：{', '.join(diff['added'])}", "info")
             if diff["removed"]:
-                self.bot.send_msg(f"这些 mod 不见了：{', '.join(diff['removed'])}")
+                self.log(f"这些 mod 不见了：{', '.join(diff['removed'])}", "warn")
         except Exception:
             pass
-        # mod 换了配方也会变，强制重拉一次配方书
         try:
             n = await self.recipe_book.refresh(force=True)
             if n:
@@ -100,39 +219,215 @@ class TerrariaAgent:
 
     async def stop(self) -> None:
         self._running = False
+        self.launcher.close()
         self.conn.close()
 
     async def _state_loop(self) -> None:
+        """定期刷新状态 + 死亡/复活/联机模式检测（参照 Lumi_Nox）"""
+        player_name = self._character_name()
+        bus = get_event_bus()
+        self.log(f"_state_loop 启动, player_name='{player_name}', running={self._running}")
+        self.plugin.logger.info(f"[_state_loop] 启动 player_name='{player_name}'")
+        loop_count = 0
         while self._running:
+            loop_count += 1
             try:
-                self._state = await self.mod.get_state(self.bot.player_name)
-                if self._state:
-                    self.bot.sync_position(
-                        self._state.get("x", 0), self._state.get("y", 0))
-                else:
-                    # 查询失败，记录日志
-                    self.log("Mod 状态查询失败: 未找到玩家", "warn")
+                # 轮询式：每秒主动拉状态（请求内读流，响应可靠收到）
+                st = await self.mod.get_state(player_name)
+                if st:
+                    self._state = st
+                    # ── 死亡/复活检测（基于推送的缓存血量） ──
+                    hp = st.get("hp", -1)
+
+                    # 检测死亡：hp==0 且之前未标记死亡
+                    if hp == 0 and not self._is_dead:
+                        self._is_dead = True
+                        self._death_count += 1
+                        tx = st.get("tile_x", st.get("x", 0))
+                        ty = st.get("tile_y", st.get("y", 0))
+                        self._death_position = (tx, ty)
+                        self._death_message = f"角色在 tile=({tx},{ty}) 死亡 (第{self._death_count}次)"
+                        print(f"[agent] 💀 {self._death_message}")
+                        bus.fire("player_died", {
+                            "count": self._death_count,
+                            "position": self._death_position,
+                            "message": self._death_message,
+                        })
+
+                    # 检测复活：hp>0 且之前标记为死亡
+                    if hp > 0 and self._is_dead:
+                        self._is_dead = False
+                        tx = st.get("tile_x", st.get("x", 0))
+                        ty = st.get("tile_y", st.get("y", 0))
+                        print(f"[agent] ✨ 角色复活！hp={hp} pos=({tx},{ty}) 累计死亡={self._death_count}")
+                        bus.fire("player_respawned", {
+                            "hp": hp,
+                            "position": {"tile_x": tx, "tile_y": ty},
+                            "death_count": self._death_count,
+                        })
+                        # 触发复活回调（brain 注册的自动寻路等）
+                        for cb in self.respawn_callbacks:
+                            try:
+                                if asyncio.iscoroutinefunction(cb):
+                                    asyncio.ensure_future(cb())
+                                else:
+                                    cb()
+                            except Exception:
+                                pass
+
+                    # 更新上一帧血量（供 service 暴跌检测）
+                    self._last_hp = hp
+
+                    # ── 联机模式检测（参照 Lumi_Nox） ──
+                    nearby = st.get("nearby_players", []) or []
+                    has_other = False
+                    if nearby and isinstance(nearby, list):
+                        me_x = int(st.get("tile_x", 0) or 0)
+                        me_y = int(st.get("tile_y", 0) or 0)
+                        for p in nearby:
+                            if isinstance(p, dict):
+                                name = p.get("name", "")
+                                px = int(p.get("tile_x", 0) or 0)
+                                py = int(p.get("tile_y", 0) or 0)
+                                dist = ((px - me_x) ** 2 + (py - me_y) ** 2) ** 0.5
+                                if name and name != player_name and dist < MULTIPLAYER_DIST_THRESHOLD:
+                                    has_other = True
+                                    break
+                    if has_other != self._multiplayer_mode:
+                        self._multiplayer_mode = has_other
+                        mode_str = "联机" if self._multiplayer_mode else "单人"
+                        print(f"[agent] 🔄 模式切换 → {mode_str}模式")
+                        bus.fire("multiplayer_mode_changed", {"mode": mode_str})
+
             except Exception as e:
-                self._state = {}
-                self.log(f"Mod 状态查询异常: {e}", "error")
-            # 顺带缓存背包三大类与箱子，供 UI 同步读取
-            try:
-                self._inv_full = await self.mod.get_inventory()
-            except Exception:
-                pass
-            if len(self._chests) == 0:
+                self.log(f"_state_loop 处理异常: {e}", "error")
+
+            # 背包完全按需：挖矿/查询/装备时主动 get_inventory，这里不轮询。
+            # 箱子缓存低频刷新（变化慢），供取物/存物使用
+            if loop_count % 30 == 0:
                 try:
                     self._chests = await self.mod.enum_chests()
-                except Exception:
-                    pass
+                    self.events.report_new_chests(self._chests)
+                except Exception as e:
+                    self.log(f"enum_chests 异常: {e}", "error")
+
+            if not self._world_info:
+                try:
+                    self._world_info = await self.mod.get_server_info()
+                    self.log(f"get_server_info: keys={list(self._world_info.keys())}")
+                except Exception as e:
+                    self.log(f"get_server_info 异常: {e}", "error")
+
             await asyncio.sleep(self.cfg.get("state_tick_interval_seconds", 1.0))
+
+    # ── 事件处理（参照 Lumi_Nox bridge._on_combat_event） ──
+
+    def _handle_mod_event(self, msg: dict) -> None:
+        """处理模组主动推送的事件消息。
+
+        事件格式：{"type":"event","event":"player_died","message":"..."}
+        可能事件：player_died, boss_spawned, boss_killed, invasion_start, npc_arrived 等
+        """
+        event = msg.get("event", "")
+        bus = get_event_bus()
+        print(f"[agent] 📨 mod事件: {event} msg={msg.get('message','')[:80]}")
+
+        if event == "player_died":
+            # 事件推送的死亡（优先于轮询，更及时）
+            if not self._is_dead:
+                self._is_dead = True
+                self._death_count += 1
+                self._death_message = msg.get("message", f"角色死了 (第{self._death_count}次)")
+                print(f"[agent] 💀 {self._death_message}")
+                bus.fire("player_died", {
+                    "count": self._death_count,
+                    "message": self._death_message,
+                    "source": "mod_event",
+                })
+
+        elif event == "boss_spawned":
+            bus.fire("boss_spawned", {"name": msg.get("boss_name", msg.get("message", "未知Boss"))})
+
+        elif event == "boss_killed":
+            bus.fire("boss_killed", {"name": msg.get("boss_name", msg.get("message", "未知Boss"))})
+
+        elif event == "invasion_start":
+            bus.fire("invasion_start", {"message": msg.get("message", "")})
+
+        elif event == "invasion_end":
+            bus.fire("invasion_end", {"message": msg.get("message", "")})
+
+        # v3.0: 导航状态流事件（nav_moving/nav_arrived/nav_stuck/nav_timeout）
+        # → 转发给 mod_link 的导航监听（navigate_async）
+        elif event.startswith("nav_"):
+            try:
+                self.mod._on_nav_event(msg)
+            except Exception:
+                pass
+
+        # v3.0: mod 主动汇报血量/位置（1s 一次）→ 更新 _state 缓存，
+        # 不依赖 get_state 轮询的响应解析（避免 hp=0 问题）
+        elif event == "player_status":
+            try:
+                self._state["hp"] = int(msg.get("hp", self._state.get("hp", 0)))
+                self._state["max_life"] = int(msg.get("max_hp", self._state.get("max_life", 100)))
+                self._state["tile_x"] = int(msg.get("x", self._state.get("tile_x", 0)))
+                self._state["tile_y"] = int(msg.get("y", self._state.get("tile_y", 0)))
+                if msg.get("alive") is False and not self._is_dead:
+                    self._is_dead = True
+            except Exception:
+                pass
+
+        # v3.0: mod 统一推送全量游戏状态（血量/位置/背包/敌人/玩家/时间，2s 一次）
+        elif event == "game_state":
+            try:
+                pl = msg.get("player", {}) or {}
+                self._state["hp"] = int(pl.get("hp", self._state.get("hp", 0)))
+                self._state["max_life"] = int(pl.get("max_life", self._state.get("max_life", 100)))
+                self._state["tile_x"] = int(pl.get("tile_x", self._state.get("tile_x", 0)))
+                self._state["tile_y"] = int(pl.get("tile_y", self._state.get("tile_y", 0)))
+                if "alive" in pl:
+                    self._state["alive"] = bool(pl.get("alive"))
+                # 背包
+                inv = msg.get("inventory", {}) or {}
+                if inv:
+                    self._inv_full = {
+                        "hotbar": inv.get("hotbar", []),
+                        "equipped": inv.get("equipped", []),
+                        "inventory": inv.get("inventory", []),
+                        "selected_slot": pl.get("selected_slot", 0),
+                    }
+                # 附近敌人/玩家/时间
+                if "nearby_npcs" in msg:
+                    npcs = msg.get("nearby_npcs", []) or []
+                    # C# 推流 npcs 用 tileX/tileY（camelCase），归一化供战斗/大脑读取
+                    for n in npcs:
+                        if isinstance(n, dict) and "tileX" in n and "tile_x" not in n:
+                            n["tile_x"] = n.get("tileX", 0)
+                            n["tile_y"] = n.get("tileY", 0)
+                    self._state["nearby_npcs"] = npcs
+                if "nearby_players" in msg:
+                    self._state["nearby_players"] = msg.get("nearby_players", [])
+                if "time_of_day" in msg:
+                    self._state["time_of_day"] = msg.get("time_of_day", "")
+            except Exception:
+                pass
+
+        # 其他事件统一转发
+        elif event:
+            bus.fire(event, msg)
+
+    def on_respawn(self, callback) -> None:
+        """注册复活回调。复活时自动调用，用于 brain 注册自动寻路等。"""
+        self.respawn_callbacks.append(callback)
 
     async def submit_goal(self, goal: Goal) -> None:
         await self.tasks.submit(goal)
 
     async def run_complex_task(self, steps: List[Dict[str, Any]], goal_text: str = "",
                                source: str = SRC_OWNER,
-                               dry_run: bool = False) -> Dict[str, Any]:
+                               dry_run: bool = False,
+                               _retried: bool = False) -> Dict[str, Any]:
         """收到任务 → 想(评估) → 处理(规划) → 做(执行)。主人的任务可打断自主行为。"""
         # 想：推演整串步骤，缺东西就自己想补救办法
         assess = await self.brain.think(steps)
@@ -141,6 +436,21 @@ class TerrariaAgent:
             self.log(f"  思考：{t}", "task")
         if not assess.doable:
             await self.send_chat(f"主人，{assess.say()}~")
+            # v2.1: 需要主人提供信息（缺材料/目标模糊）→ 发起决策询问，带答案重试一次
+            if not _retried and self.inquiry and assess.need_from_owner:
+                inq = self.inquiry.ask(
+                    question=f"主人，{assess.say()}，怎么办？",
+                    options=["你来决定", "先不做"],
+                    context={"need": assess.need_from_owner, "goal": goal_text},
+                    timeout=30.0)
+                if inq:
+                    await self.send_chat(inq.question)
+                    ans = await self.inquiry.wait_answer(inq)
+                    if ans not in ("auto", "hold", "timeout"):
+                        self.log(f"主人回答：{ans}，带答案重试任务", "task")
+                        return await self.run_complex_task(
+                            steps, f"{goal_text}（主人说：{ans}）",
+                            source, dry_run=dry_run, _retried=True)
             return {"ok": False, "status": "not_doable", "phase": "think",
                     "output": assess.say(), "why": assess.explain(),
                     "need": assess.need_from_owner}
@@ -187,10 +497,10 @@ class TerrariaAgent:
         return await self.coordinator.handle(text, source)
 
     async def start_longterm(self, kind: str, target: str = "",
-                             amount: int = 0, reason: str = "") -> Dict[str, Any]:
+                             amount: int = 0, reason: str = "", **params) -> Dict[str, Any]:
         """直接起一个长期任务（跟随/挖矿/守点）。"""
         return await self.jobs.start(kind, target=target, amount=amount,
-                                     reason=reason)
+                                     reason=reason, **params)
 
     async def stop_longterm(self, kind: str = "",
                             why: str = "主人喊停") -> Dict[str, Any]:
@@ -217,10 +527,20 @@ class TerrariaAgent:
         return {"ok": True, "foreground_cancelled": fg, "longterm_stopped": names}
 
     async def send_chat(self, text: str) -> None:
-        self.bot.send_msg(text)
+        """通过 Mod 发送聊天消息"""
+        await self.mod.send_chat(text)
 
     def get_state(self) -> Dict[str, Any]:
         return self._state
+
+    def remember(self, key: str, value: str, category: str = "fact") -> None:
+        try:
+            plugin = getattr(self, "plugin", None)
+            store_fn = getattr(plugin, "_memory_store", None)
+            if store_fn:
+                store_fn().remember(key, value, category=category)
+        except Exception:
+            pass
 
     @property
     def current_goal(self) -> str:
@@ -232,18 +552,43 @@ class TerrariaAgent:
         return item_id(name, self.registry)
 
     async def follow_player(self, player_pos: tuple) -> None:
-        # 自动寻路走到玩家身边（能绕过障碍）
+        """自动寻路走到玩家身边"""
         px, py = player_pos
-        await self.navigate_to(px, py, timeout=8)
+        await self.executor.run(
+            "跟随玩家",
+            lambda info: self.navigate_to(px, py, timeout=8),
+            source=SRC_AUTO
+        )
 
     async def heal_self(self) -> bool:
-        # 用注册表中标记为 heal（加血）的物品自愈
+        # 用注册表中标记为 heal（加血）的物品自愈：
+        # 先确保背包有（没有就 give 一个），再选中并使用
         heals = self.registry.find_by_tag("heal")
         for pid in heals:
-            ok = await self.mod.give_item(pid, 1)
-            if ok:
+            try:
+                inv = await self.mod.get_inventory()
+                slot_id = None
+                for slot in (inv.get("hotbar", []) or []) + (inv.get("inventory", []) or []):
+                    if slot.get("id") == pid:
+                        slot_id = slot.get("inv_slot", 0)
+                        break
+                if slot_id is None:
+                    ok = await self.mod.give_item(pid, 1)
+                    if not ok:
+                        continue
+                    inv2 = await self.mod.get_inventory()
+                    for slot in (inv2.get("hotbar", []) or []) + (inv2.get("inventory", []) or []):
+                        if slot.get("id") == pid:
+                            slot_id = slot.get("inv_slot", 0)
+                            break
+                if slot_id is None:
+                    continue
+                await self.mod.select_item(slot_id)
+                await self.mod.use_item_slot(slot_id)
                 self.log("喝了加血物品", "item")
                 return True
+            except Exception:
+                continue
         return False
 
     async def use_item_on_self(self, name: str) -> bool:
@@ -253,28 +598,23 @@ class TerrariaAgent:
         return await self.mod.give_item(iid, 1)
 
     async def navigate_to(self, x: int, y: int, timeout: int = 25) -> bool:
-        # 自动寻路走到坐标（mod 侧：坑洞规避/按住跳跃/搭土/钩锁）
-        # 预判能力：目标在上方且自己无上攀手段时，及时汇报而非硬冲
+        """自动寻路走到坐标（v3.0: 流式导航——C# BFS 寻路 + 状态流，可中断）"""
         await self.capability.refresh()
         st = self._state
         cur_y = st.get("tile_y", 0)
-        height_diff = cur_y - y  # 向上为正
+        height_diff = cur_y - y
         if height_diff > 3 and not self.capability.can_climb(height_diff):
-            # 单次上不去：交给分段规划器找中途平台（如钩锁分两次上）
             self.log(f"落差{height_diff}格单次上不去，尝试分段爬升", "nav")
             return await self.climb_to(x, y)
-        cur_x = float(st.get("x", x * 16))
-        cur_y_px = float(st.get("y", y * 16))
-        distance = abs(x * 16 - cur_x) + abs(y * 16 - cur_y_px)
-        duration = min(float(timeout), max(0.25, distance / 160.0))
-        ok = await self.bot.move_to(x * 16, y * 16, duration)
+
+        ok = await self.mod.navigate_async(x, y, timeout)
         self.log(f"走到 ({x},{y}) " + ("成功" if ok else "失败/超时"), "nav")
         if not ok:
             await self.send_chat(f"主人，我过不去 ({x},{y})，卡住了，等你想想办法~")
         return ok
 
     async def climb_to(self, x: int, y: int, _round: int = 1) -> bool:
-        # 复杂垂直移动（深坑回地面）：先规划分段，再逐段执行，每段后重新评估
+        """复杂垂直移动（深坑回地面）：先规划分段，再逐段执行"""
         if _round > 5:
             self.log("爬升重规划超过5轮，放弃", "warn")
             await self.send_chat("主人，我试了好几次都上不去，你来帮帮我吧~")
@@ -295,20 +635,18 @@ class TerrariaAgent:
                 self.log("爬升被打断", "warn")
                 return False
             self.log(f"第{i+1}/{len(plan.legs)}段：{leg.method} → ({leg.tx},{leg.ty})", "nav")
-            ok = await self.bot.move_to(
-                leg.tx * 16, leg.ty * 16, duration=1.0)
+            ok = await self.mod.navigate_to(leg.tx, leg.ty, timeout=1)
             if not ok:
                 await self.send_chat(
                     f"主人，我卡在第{i+1}段了（{leg.method}到 {leg.tx},{leg.ty}），上不去啦~")
                 self.log(f"第{i+1}段失败，中止爬升", "warn")
                 return False
-            # 每段后重新评估：资源已消耗、地形可能变化，剩余路径重新规划
             await self.capability.refresh()
 
         if plan.feasible:
             self.log("爬升完成", "nav")
             return True
-        # 只到中途平台：重新规划剩余路程（如第二次钩锁）；无高度进展则停止避免死循环
+
         await self.refresh_state()
         now_y = self._state.get("tile_y", 0)
         if start_y - now_y < 1:
@@ -321,8 +659,15 @@ class TerrariaAgent:
     async def get_inventory(self) -> Dict[str, Any]:
         return await self.items.get_inventory()
 
+    async def refresh_inventory(self) -> Dict[str, Any]:
+        """按需刷新背包缓存（C# 不推背包，需要时主动拉取）。"""
+        try:
+            self._inv_full = await self.mod.get_inventory()
+        except Exception:
+            pass
+        return self._inv_full
+
     def get_inventory_sync(self) -> Dict[str, Any]:
-        # UI context 同步读缓存（由 _state_loop 定期刷新）
         return self._inv_full
 
     def locate_item(self, name: str) -> Dict[str, Any]:

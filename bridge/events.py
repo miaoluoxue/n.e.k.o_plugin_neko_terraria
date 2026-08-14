@@ -1,0 +1,100 @@
+"""Boss/入侵事件应对 + 发现汇报。订阅 event_bus，通知主人并决策。"""
+
+import time
+from typing import Any, Dict
+
+RETREAT_HP_RATIO = 0.5
+
+
+class EventResponder:
+    def __init__(self, agent) -> None:
+        self.agent = agent
+        self._known_chests: set = set()
+
+    def bind(self) -> None:
+        from ..autonomous.event_bus import get_event_bus
+        bus = get_event_bus()
+        bus.subscribe("boss_spawned", self._on_boss_spawned)
+        bus.subscribe("boss_killed", self._on_boss_killed)
+        bus.subscribe("invasion_start", self._on_invasion_start)
+        bus.subscribe("invasion_end", self._on_invasion_end)
+        bus.subscribe("player_died", self._on_player_died)
+
+    def _remember(self, key: str, value: str, category: str = "world") -> None:
+        try:
+            self.agent.remember(key, value, category=category)
+        except Exception:
+            pass
+
+    def _push(self, text: str, behavior: str = "respond") -> None:
+        plugin = getattr(self.agent, "plugin", None)
+        push = getattr(plugin, "push_message", None)
+        if not push:
+            return
+        try:
+            push(parts=[{"type": "text", "text": text}], ai_behavior=behavior)
+        except Exception:
+            pass
+
+    def _boss_position(self, name: str) -> tuple:
+        st = self.agent.get_state()
+        for e in st.get("nearby_npcs", []) or []:
+            if isinstance(e, dict) and e.get("name") == name:
+                return int(e.get("tile_x", 0) or 0), int(e.get("tile_y", 0) or 0)
+        return 0, 0
+
+    async def _on_boss_spawned(self, data: Any) -> None:
+        name = (data.get("name", "未知Boss") if isinstance(data, dict)
+                else "未知Boss")
+        st = self.agent.get_state()
+        hp = int(st.get("hp", 100) or 100)
+        mx = int(st.get("max_life", 100) or 100) or 100
+        self._remember("世界-Boss出现", f"{name} 出现了")
+        if mx and hp / mx < RETREAT_HP_RATIO:
+            self._push(f"主人，{name}出现了！我只有{hp}/{mx}血，先躲远点保命~")
+            await self._retreat(name)
+        else:
+            self._push(f"主人，{name}出现了！要我打还是躲起来？")
+
+    async def _retreat(self, name: str) -> None:
+        bx, by = self._boss_position(name)
+        if not bx and not by:
+            return
+        mx, my = int(self.agent.get_state().get("tile_x", 0) or 0), \
+                 int(self.agent.get_state().get("tile_y", 0) or 0)
+        away = -1 if bx > mx else 1
+        try:
+            await self.agent.mod.navigate_async(mx + away * 15, my, timeout=6)
+        except Exception:
+            pass
+
+    async def _on_boss_killed(self, data: Any) -> None:
+        name = data.get("name", "Boss") if isinstance(data, dict) else "Boss"
+        self._remember("世界-Boss击杀", f"{name} 被击败了")
+        self._push(f"我们把{name}打倒了！")
+
+    async def _on_invasion_start(self, data: Any) -> None:
+        self._remember("世界-入侵", "有入侵者来袭")
+        self._push("主人，有入侵者打过来了！小心~")
+
+    async def _on_invasion_end(self, data: Any) -> None:
+        self._remember("世界-入侵结束", "入侵者被打退了")
+        self._push("入侵者被打退了！")
+
+    async def _on_player_died(self, data: Any) -> None:
+        pos = None
+        if isinstance(data, dict):
+            pos = data.get("position") or data.get("death_position")
+        loc = f" 位置({pos[0]},{pos[1]})" if pos else ""
+        self._remember("世界-死亡记录", f"我在{loc}阵亡过")
+
+    def report_new_chests(self, chests: list) -> None:
+        current = set()
+        for c in chests or []:
+            if isinstance(c, dict):
+                current.add((int(c.get("x", 0) or 0), int(c.get("y", 0) or 0)))
+        fresh = current - self._known_chests
+        if fresh and self._known_chests:
+            x, y = next(iter(fresh))
+            self._push(f"主人，我发现了一个新箱子（{x},{y}）~")
+        self._known_chests = current

@@ -180,7 +180,7 @@ class RecipeBook:
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             self.cache_file.write_text(
-                json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+                json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 

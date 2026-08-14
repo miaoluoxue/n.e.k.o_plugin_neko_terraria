@@ -67,6 +67,20 @@ class ModLink:
             {"cmd": "use_item_slot", "slot": inv_slot})
         return bool(resp and resp.get("ok"))
 
+    async def screenshot(self) -> Optional[Dict[str, Any]]:
+        """请求 mod 截图一帧（C# 侧需实现 'screenshot' 命令）。
+
+        返回 {"b64": ..., "mime": ...}；mod 未实现/失败返回 None（视觉管线静默降级）。
+        """
+        try:
+            resp = await self.conn.request_mod({"cmd": "screenshot"}, timeout=5.0)
+            if resp and resp.get("ok") and resp.get("image"):
+                return {"b64": resp["image"],
+                        "mime": resp.get("mime", "image/png")}
+        except Exception:
+            pass
+        return None
+
     async def get_inventory(self) -> Dict[str, Any]:
         # 返回三大类：hotbar(手持栏) / equipped(装备栏) / inventory(主背包)
         resp = await self.conn.request_mod({"cmd": "get_inventory"})
@@ -98,15 +112,119 @@ class ModLink:
         return bool(resp and resp.get("ok"))
 
     async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
-        # 寻路是长任务：整段占锁等回执，期间不允许别的请求插进来抢答复
         resp = await self.conn.request_mod(
             {"cmd": "navigate_to", "x": x, "y": y, "timeout": timeout},
             timeout=timeout + 2)
         return bool(resp and resp.get("ok"))
 
+    # ── v3.0: 流式导航（参照 Lumi_Nox）──
+    # C# 侧 BFS 寻路 + 逐点执行，通过 nav_* 事件流回传状态
+    # （nav_moving/nav_arrived/nav_stuck/nav_timeout），Python 可中断/感知进度
+
+    async def navigate_async(self, x: int, y: int, timeout: int = 20) -> bool:
+        """流式导航：发 navigate_stream，等 nav_arrived/stuck/timeout 事件确认真正到达。
+
+        ACK 只表示导航已启动，不代表到达——必须等最终 nav 事件。
+        """
+        import asyncio
+        callbacks = getattr(self, "_nav_callbacks", None)
+        if callbacks is None:
+            callbacks = set()
+            self._nav_callbacks = callbacks
+        done = asyncio.Event()
+        result = {"event": "nav_timeout"}
+
+        def on_nav(msg):
+            evt = msg.get("event", "")
+            if evt in ("nav_arrived", "nav_stuck", "nav_timeout"):
+                result["event"] = evt
+                done.set()
+
+        callbacks.add(on_nav)
+        try:
+            resp = await self.conn.request_mod(
+                {"cmd": "navigate_stream", "x": x, "y": y, "timeout": timeout},
+                timeout=timeout + 2)
+            # 导航未启动（no_path/连接问题）直接失败，不等事件
+            if resp is None or not resp.get("ok"):
+                return False
+            await asyncio.wait_for(done.wait(), timeout=timeout + 2)
+            return result["event"] == "nav_arrived"
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            callbacks.discard(on_nav)
+
+    async def navigate_stream_fire(self, x: int, y: int) -> None:
+        """流式导航 fire-and-forget：发 navigate_stream 不等事件。
+
+        跟随场景用：每轮实时更新目标（C# 侧路径代际接管，旧任务不误清），
+        相比 navigate_async 阻塞等待（15s 延迟）做到"主人走 AI 立刻追"。
+        """
+        try:
+            await self.conn.request_mod(
+                {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
+                timeout=1.5)
+        except Exception:
+            pass
+
+    def _on_nav_event(self, msg: dict) -> None:
+        """agent 转发 nav_* 事件到此（connection → agent._handle_mod_event → 这里）。"""
+        for cb in list(getattr(self, "_nav_callbacks", None) or ()):
+            try:
+                cb(msg)
+            except Exception:
+                pass
+
+    async def warp_to(self, x: int, y: int) -> bool:
+        """传送到指定坐标"""
+        resp = await self.conn.request_mod(
+            {"cmd": "warp", "x": x, "y": y})
+        return bool(resp and resp.get("ok"))
+
+    async def damage_npc(self, npc_slot: int, damage: int) -> bool:
+        """对 NPC 造成伤害"""
+        resp = await self.conn.request_mod(
+            {"cmd": "damage_npc", "slot": npc_slot, "damage": damage})
+        return bool(resp and resp.get("ok"))
+
+    async def send_chat(self, text: str) -> bool:
+        """发送聊天消息"""
+        resp = await self.conn.request_mod(
+            {"cmd": "send_chat", "text": text})
+        return bool(resp and resp.get("ok"))
+
     async def get_capabilities(self) -> Dict[str, Any]:
         resp = await self.conn.request_mod({"cmd": "get_capabilities"})
         return resp if resp else {}
+
+    async def collect_items(self, radius: int = 600) -> int:
+        """收集附近掉落物品
+
+        Args:
+            radius: 收集半径（像素）
+
+        Returns:
+            收集到的物品数量
+        """
+        resp = await self.conn.request_mod(
+            {"cmd": "collect_items", "radius": radius}, timeout=5.0)
+        return int(resp.get("collected", 0)) if resp else 0
+
+    async def dig_tile(self, x: int, y: int, timeout: float = 5.0) -> bool:
+        """原生物品挖掘（LumiBridge 移植）：自动选镐子 + 光标定位 + controlUseItem。
+        有工具动画/消耗/属性，比 break_tile 直接改 tile 真实。</summary>"""
+        resp = await self.conn.request_mod(
+            {"cmd": "dig_tile", "x": x, "y": y}, timeout=timeout)
+        return bool(resp and resp.get("ok"))
+
+    async def find_ore(self, radius: int = 30, tile_type: int = 0) -> List[Dict[str, Any]]:
+        """扫描附近矿石（C# 参照 Lumi find_trees）：返回按距离排序的矿坐标列表。
+        tile_type>0 时只返回该类型（铁矿石 tile 类型 = 铁矿物品 id）。"""
+        resp = await self.conn.request_mod(
+            {"cmd": "find_ore", "radius": radius, "tile_type": tile_type},
+            timeout=5.0)
+        return resp.get("ores", []) if resp else []
 
     async def scan_ledges(self, x0: int, y0: int, x1: int, y1: int) -> List[Dict[str, Any]]:
         # 扫描两点之间的可落脚平台，供分段爬升规划
@@ -122,6 +240,22 @@ class ModLink:
     async def get_state(self, player_name: str = "") -> Dict[str, Any]:
         resp = await self.conn.request_mod(
             {"cmd": "get_state", "player_name": player_name})
+        # 临时诊断：确认 resp 是不是真的 get_state 响应（排查 hp=0 串线）
+        try:
+            if not getattr(self, "_diag_cnt", None):
+                self._diag_cnt = 0
+            self._diag_cnt += 1
+            if self._diag_cnt % 30 == 1:
+                p = resp.get("player", {}) if isinstance(resp, dict) else None
+                print(f"[diag] get_state resp: type={resp.get('type','?') if isinstance(resp, dict) else '?'} "
+                      f"req_id={resp.get('req_id','?') if isinstance(resp, dict) else '?'} "
+                      f"found={resp.get('found','?') if isinstance(resp, dict) else '?'} "
+                      f"player.hp={p.get('hp','?') if p else '?'} "
+                      f"player.x={p.get('x','?') if p else '?'} "
+                      f"player.tileX={p.get('tileX','?') if p else '?'} "
+                      f"keys={list(resp.keys())[:6] if isinstance(resp, dict) else resp}")
+        except Exception:
+            pass
         if not resp or resp.get("found") is False:
             return {}
         # 将 mod 原生字段映射为 Python 习惯字段，供大脑/战斗统一使用
@@ -143,9 +277,14 @@ class ModLink:
             ],
             "nearby_players": [
                 {"name": pl.get("name", ""), "tile_x": pl.get("tileX", 0),
-                 "tile_y": pl.get("tileY", 0)}
+                 "tile_y": pl.get("tileY", 0),
+                 "hp": pl.get("hp", 0), "max_life": pl.get("max_life", 0),
+                 "velocity_x": pl.get("velocityX", 0), "velocity_y": pl.get("velocityY", 0)}
                 for pl in resp.get("nearbyPlayers", [])
             ],
+            "biome": p.get("biome", ""), "buffs": p.get("buffs", []),
+            "movement_state": p.get("movement_state", ""),
+            "brightness": p.get("brightness", 1.0),
             "time_of_day": "白天" if resp.get("time", {}).get("dayTime", True) else "夜晚",
         }
         return out
@@ -167,4 +306,65 @@ class ModLink:
           world_name        世界名称
         """
         resp = await self.conn.request_mod({"cmd": "get_server_info"}, timeout=5.0)
+        return resp if resp else {}
+
+    async def join_server(self, host: str, port: int, password: str = "",
+                          character_name: str = "",
+                          wait_confirm: bool = False, confirm_timeout: int = 30) -> bool:
+        """通过 Mod 加入多人服务器。
+
+        character_name: 目标角色名——mod 侧会精确匹配（含自动重命名第一个 .plr），
+                        确保角色文件存在且 fresh Player 命名正确。
+        wait_confirm=False: 只发起连接（旧行为兼容），返回 ACK ok 即成功。
+        wait_confirm=True:  发起后轮询 join_status，等待真实入服确认（模仿 Terraria-Bot 状态机）。
+        """
+        cmd = {"cmd": "join_server", "host": host, "port": port}
+        if character_name:
+            cmd["character_name"] = character_name
+        if password:
+            cmd["password"] = password
+        resp = await self.conn.request_mod(cmd, timeout=5.0)
+        ack_ok = bool(resp and resp.get("ok"))
+        if not wait_confirm:
+            return ack_ok
+
+        # wait_confirm：不依赖 ACK（可能因读循环重建/网络抖动丢失），
+        # 命令发出后直接轮询 join_status，以真实入服为准
+        import asyncio
+        consecutive_fail = 0
+        for attempt in range(confirm_timeout * 4):  # 每 250ms 查一次
+            await asyncio.sleep(0.25)
+            status = await self.join_status()
+            if not status:
+                # 响应连续超时说明连接可能已断，提前返回让 agent 强制重连
+                consecutive_fail += 1
+                if consecutive_fail >= 4:
+                    return False
+                continue
+            consecutive_fail = 0
+            if status.get("joined") or status.get("in_world"):
+                return True
+            if not status.get("pending") and attempt > 60:  # 15s 后如果 pending=false 还没入服，失败了
+                return False
+        return False
+
+    async def join_status(self) -> Dict[str, Any]:
+        """查询 join 进度——模仿 Terraria-Bot 的状态机轮询。
+        返回: {phase, net_mode, in_world, connected, joined, pending, timeout, menu_mode, ...}"""
+        resp = await self.conn.request_mod({"cmd": "join_status"}, timeout=3.0)
+        return resp if resp else {}
+
+    async def select_character(self, name: str = "", index: int = -1) -> bool:
+        """通知 mod 选择指定角色。传 name 按文件名匹配，传 index 按索引，都不传则选第一个。"""
+        cmd: Dict[str, Any] = {"cmd": "select_character"}
+        if name:
+            cmd["name"] = name
+        if index >= 0:
+            cmd["index"] = index
+        resp = await self.conn.request_mod(cmd, timeout=5.0)
+        return bool(resp and resp.get("ok"))
+
+    async def get_network_info(self) -> Dict[str, Any]:
+        """查询当前游戏的网络状态：是否在服务器上、作为主机还是客户端等"""
+        resp = await self.conn.request_mod({"cmd": "get_network_info"}, timeout=3.0)
         return resp if resp else {}

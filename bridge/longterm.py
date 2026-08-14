@@ -12,9 +12,12 @@
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # 长期任务状态
 LT_RUNNING = "running"    # 正在跑
@@ -36,6 +39,7 @@ class StandingTask:
     started_at: float = field(default_factory=time.time)
     last_beat: float = field(default_factory=time.time)
     note: str = ""
+    params: Dict[str, Any] = field(default_factory=dict)  # 额外参数（如守护半径）
 
     def beat(self, note: str = "") -> None:
         # 心跳：证明任务还活着，同时更新一句人话进度
@@ -110,8 +114,13 @@ class LongTermManager:
         return bool(ev and ev.is_set())
 
     def active(self) -> List[Dict[str, Any]]:
-        return [t.snapshot() for t in self._tasks.values()
+        logger.info(f"🔍 active() 被调用，当前 _tasks: {list(self._tasks.keys())}")
+        result = [t.snapshot() for t in self._tasks.values()
                 if t.status != LT_STOPPED]
+        logger.info(f"📊 active() 返回 {len(result)} 个任务: {[t.get('name') for t in result]}")
+        for t in self._tasks.values():
+            logger.info(f"  - 任务 {t.name}: status={t.status}, kind={t.kind}")
+        return result
 
     def get(self, kind: str) -> Optional[StandingTask]:
         return self._tasks.get(kind)
@@ -132,38 +141,55 @@ class LongTermManager:
     # ---------- 生命周期 ----------
     async def start(self, task: StandingTask, loop_fn: Callable) -> Dict[str, Any]:
         """启动一个长期任务。loop_fn(task) 内部应循环并调用 wait_turn。"""
+        logger.info(f"🟢 启动长期任务: {task.name} (kind={task.kind})")
         await self.stop(task.kind, why="换新的长期任务")
         ev = asyncio.Event()
         self._stop_flags[task.kind] = ev
         self._tasks[task.kind] = task
+        self._log(f"🟢 启动长期任务: {task.name} (kind={task.kind})", "task")
+        logger.info(f"📦 _tasks 现在有: {list(self._tasks.keys())}")
         # 若前台正忙，新长期任务直接以让路状态起步，不抢操作权
         if self._yield_flag.is_set():
             task.status = LT_YIELDED
 
         async def _wrap() -> None:
             try:
+                logger.info(f"🚀 任务协程开始执行: {task.name}")
                 await loop_fn(task)
+                logger.info(f"✅ 任务协程正常结束: {task.name}")
             except asyncio.CancelledError:
+                logger.info(f"⚠️ 任务协程被取消: {task.name}")
                 pass
             except Exception as e:
+                logger.error(f"❌ 长期任务出错：{task.name} → {e}", exc_info=True)
                 self._log(f"长期任务出错：{task.name} → {e}", "warn")
             finally:
+                logger.info(f"🏁 任务协程结束，设置状态为 STOPPED: {task.name}")
                 task.status = LT_STOPPED
 
         self._runners[task.kind] = asyncio.ensure_future(_wrap())
         self._log(f"开始长期任务：{task.name}", "task")
+        logger.info(f"🎯 任务协程已提交到事件循环: {task.kind}")
         return {"ok": True, "status": "started", "output": f"好的，我{task.name}~"}
 
     async def stop(self, kind: str, why: str = "") -> bool:
         """停止某类长期任务（协作式，先置位再取消兜底）。"""
+        logger.info(f"🛑 stop() 被调用: kind={kind}, why={why}")
+        self._log(f"🛑 stop() 被调用: kind={kind}, why={why}", "task")
         t = self._tasks.get(kind)
         if t is None:
+            logger.info(f"⚠️ 任务 {kind} 不存在，无需停止")
+            self._log(f"⚠️  {kind} 不存在，无需停止", "task")
             return False
+        logger.info(f"🔄 停止任务 {t.name} (当前状态: {t.status})")
+        self._log(f"停止任务: {t.name} (status={t.status})", "task")
         ev = self._stop_flags.get(kind)
         if ev:
             ev.set()
         r = self._runners.get(kind)
         if r and not r.done():
+            logger.info(f"⏹️ 取消任务协程: {kind}")
+            self._log(f"取消运行器: {kind}", "task")
             r.cancel()
             try:
                 await asyncio.wait([r], timeout=3)
@@ -172,9 +198,26 @@ class LongTermManager:
         t.status = LT_STOPPED
         self._tasks.pop(kind, None)
         self._runners.pop(kind, None)
-        self._stop_flags.pop(kind, None)
+        if r is None or r.done():
+            self._stop_flags.pop(kind, None)
         if why:
             self._log(f"停止长期任务：{t.name}（{why}）", "task")
+        self._log(f"✅ {kind} 已停止", "task")
+        logger.info(f"✅ 任务 {kind} 已完全停止，_tasks 剩余: {list(self._tasks.keys())}")
+        # 任务生命周期推送：长期任务被停止 = 任务结束，通知主 LLM（read 模式，
+        # 猫娘感知状态变化即可，不强制说话打断）
+        try:
+            plugin = getattr(self.agent, "plugin", None)
+            push = getattr(plugin, "push_message", None)
+            if push:
+                import asyncio as _aio
+                _aio.get_running_loop().create_task(push(
+                    parts=[{"type": "text", "text":
+                            f"[任务状态] 「{t.name}」已停止（{why or '主人喊停'}）。"
+                            f"这是状态通知，不是新任务。"}],
+                    ai_behavior="read"))
+        except Exception:
+            pass
         return True
 
     async def stop_all(self, why: str = "主人喊停") -> List[str]:

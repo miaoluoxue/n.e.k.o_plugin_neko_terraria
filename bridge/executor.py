@@ -1,9 +1,12 @@
 """任务执行器：任务生命周期与占用仲裁的唯一权威（谁在做、能否打断、怎么停）。"""
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+from ..polish.human_timing import HumanTiming
 
 # 来源优先级：主人命令 > 自主行为。低优先级不能打断高优先级
 SRC_OWNER = "owner"
@@ -35,15 +38,26 @@ class TaskExecutor:
     """单槽位执行器：同一时刻只有一个任务在跑。
 
     主人命令可抢占自主行为；自主行为遇到任何进行中的任务则让位不触发。
+
+    v2.0: 回调系统——step_done / task_done / interrupted 事件通知，
+          供交互引擎订阅，实现干活汇报 / 任务打断对话。
     """
 
     def __init__(self, agent=None) -> None:
         self.agent = agent
         self._current: Optional[TaskInfo] = None
+        self.timing = HumanTiming()  # v2.1: 人类化延迟
         self._task: Optional[asyncio.Task] = None
         self._cancel = asyncio.Event()
         self._lock = asyncio.Lock()
         self._last: Optional[Dict[str, Any]] = None
+        # 回调系统：事件名 → [callable]
+        self._callbacks: Dict[str, list] = {
+            "step_done":    [],
+            "task_done":    [],
+            "interrupted":  [],
+            "task_started": [],
+        }
 
     # --- 状态查询 ---
     def busy(self) -> bool:
@@ -106,6 +120,7 @@ class TaskExecutor:
             self._task = inner
 
         self._log(f"开始任务：{name}", "task")
+        await self.notify("task_started", name=name, source=source, steps=steps)
         # 前台一开工，长期任务（跟随/挖矿）自动让路，避免抢操作权
         lt = getattr(self.agent, "longterm", None) if self.agent else None
         if lt:
@@ -118,12 +133,20 @@ class TaskExecutor:
             if self._current is info:
                 self._current = None
                 self._task = None
+            await self.notify("interrupted", name=name, reason="cancelled")
             if lt and not self.busy():
                 lt.release_yield()
             return self._last
         except Exception as e:
+            # 异常任务只发 interrupted（不发 task_done，避免事件双发）
             self._log(f"任务异常：{name} → {e}", "warn")
             out = {"ok": False, "status": "error", "output": f"「{name}」出错了：{e}"}
+            self._last = out
+            if self._current is info:
+                self._current = None
+                self._task = None
+            await self.notify("interrupted", name=name, reason=f"error:{e}")
+            return out
         finally:
             if self._current is info:
                 info.phase = "done"
@@ -137,8 +160,40 @@ class TaskExecutor:
         out.setdefault("status", "ok" if out.get("ok") else "failed")
         self._last = out
         self._log(f"任务结束：{name} → {out.get('status')}", "task")
+        await self.notify("task_done", name=name, status=out.get("status"), result=out)
         return out
 
     def should_stop(self) -> bool:
         # 任务内部循环用它做协作式退出，保证能被主人随时叫停
         return self._cancel.is_set()
+
+    # ── 回调系统（v2.0 交互引擎挂钩） ───────────────────────
+
+    def on(self, event: str, cb) -> None:
+        """注册事件回调。event: step_done / task_done / interrupted / task_started"""
+        if event in self._callbacks and cb not in self._callbacks[event]:
+            self._callbacks[event].append(cb)
+
+    def off(self, event: str, cb) -> None:
+        """移除事件回调。"""
+        if event in self._callbacks and cb in self._callbacks[event]:
+            self._callbacks[event].remove(cb)
+
+    async def notify(self, event: str, **data) -> None:
+        """通知所有订阅者。data 里放 event 相关字段。
+
+        async 回调 fire-and-forget（create_task），不阻塞任务执行流。
+        """
+        if event not in self._callbacks:
+            return
+        data["event"] = event
+        for cb in list(self._callbacks[event]):
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    task = asyncio.create_task(cb(data))
+                    task.add_done_callback(
+                        lambda t: None if t.cancelled() else t.exception())
+                else:
+                    cb(data)
+            except Exception:
+                pass  # 回调异常不传播，不杀 executor

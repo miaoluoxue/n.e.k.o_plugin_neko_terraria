@@ -59,7 +59,11 @@ class InventoryOps:
         return total
 
     async def nearest_chest_with(self, name: str) -> Optional[Dict[str, Any]]:
-        # 找最近且含有该物品的箱子
+        # 找最近且含有该物品的箱子（按需刷新箱子缓存，C# 不推箱子）
+        try:
+            self.agent._chests = await self.agent.mod.enum_chests()
+        except Exception:
+            pass
         iid = self.agent.resolve_item(name)
         if iid < 0:
             return None
@@ -77,10 +81,12 @@ class InventoryOps:
         loc = self.locate_item(name)
         if not loc.get("found") or loc.get("where") == "chest":
             return False
+        slot = loc.get("inv_slot")
+        if slot is None:
+            return False  # 装备栏物品无 inv_slot，不可存箱
         if not await self.agent.navigate_to(chest["x"], chest["y"]):
             return False
-        ok = await self.mod.store_item(
-            chest["x"], chest["y"], loc["inv_slot"], stack)
+        ok = await self.mod.store_item(chest["x"], chest["y"], slot, stack)
         if ok:
             self._log(f"把 {name}×{stack} 放进了箱子({chest['x']},{chest['y']})")
         return ok
