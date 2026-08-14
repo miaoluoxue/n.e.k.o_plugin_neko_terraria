@@ -21,3 +21,7 @@ data/bond.json
 # ── 密钥/环境 ──
 .env
 *.key
+
+# ── 测试/CI ──
+.pytest_cache/
+store.db

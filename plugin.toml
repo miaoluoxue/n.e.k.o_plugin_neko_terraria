@@ -4,8 +4,8 @@ name = "泰拉瑞亚猫娘"
 description = "让 AI 猫娘作为独立玩家加入泰拉瑞亚世界：有头客户端、自动匹配 Host&Play/专用服务器、双轨任务调度、自主行为、mod 物品合成推演。"
 short_description = "Terraria AI cat-girl teammate with headful client and mod crafting."
 keywords = ["terraria", "泰拉瑞亚", "泰拉", "游戏", "game", "autonomous", "cat", "猫娘", "跟着", "跟随", "follow", "跟在我身边", "跟过来", "挖矿", "采矿", "mine", "守卫", "守在这", "guard", "战斗", "打怪", "fight", "合成", "craft", "mod", "ai-teammate", "headful-client"]
-version = "0.2.1"
-entry = "plugins.neko_terraria:NTerrariaPlugin"
+version = "0.3.0"
+entry = "plugin.plugins.neko_terraria:NTerrariaPlugin"
 
 [plugin.author]
 name = "N.E.K.O Team"
