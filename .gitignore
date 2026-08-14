@@ -15,7 +15,8 @@ mod/tModLoader/favorites.json
 mod/tModLoader/achievements.dat
 mod/tModLoader/servers.dat
 mod/tModLoader/LastLaunchedMods.txt
-"mod/tModLoader/input profiles.json"
+mod/tModLoader/*.lnk
+mod/tModLoader/input profiles.json
 mod/tModLoader/Players/Backups/
 mod/tModLoader/Players/*.bak
 mod/tModLoader/Players/*.tplr
