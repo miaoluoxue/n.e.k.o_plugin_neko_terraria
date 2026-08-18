@@ -2,20 +2,20 @@
 
 import asyncio
 import random
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict
 
-from .event_bus import EventBus, get_event_bus
-from .internal_state import InternalState
-from .motivation import MotivationSystem
-from ..bridge.task_chain import Goal
 from ..bridge.executor import SRC_AUTO
-from ..polish.human_timing import HumanTiming
-from ..polish.attention import AttentionDrift
+from ..bridge.task_chain import Goal
 from ..core.context import build_user_context
+from ..polish.attention import AttentionDrift
+from ..polish.human_timing import HumanTiming
+from .event_bus import get_event_bus
 
 # v2.0: 交互引擎
 from .interaction_engine import InteractionEngine
-
+from .internal_state import InternalState
+from .motivation import MotivationSystem
 
 # ── LLM 自主决策的触发文本 ──
 
@@ -52,8 +52,7 @@ class AutonomousBrain:
         # v2.0: 交互引擎接管对话交互（直接传整个 cfg——
         # 之前取 cfg["interaction"] 子字典恒为空，导致 interaction_tick 等配置读不到）
         try:
-            self.interaction = InteractionEngine(
-                self.agent, plugin, self.cfg or {})
+            self.interaction = InteractionEngine(self.agent, plugin, self.cfg or {})
         except Exception:
             self.interaction = None
 
@@ -72,6 +71,7 @@ class AutonomousBrain:
         # v0.7: 处境融合层（身体感×画面感×记忆 → 心情/台词/行为）
         try:
             from .situation import SituationEngine
+
             coord = getattr(self.agent, "coordinator", None)
             llm = None
             if coord:
@@ -86,6 +86,7 @@ class AutonomousBrain:
         # v0.7: Heart 依恋值（主人关系跨会话）
         try:
             from .heart import Heart
+
             self.heart = Heart(self.agent)
             self.plugin.logger.info(f"[brain] Heart 依恋层已启动 (bond={self.heart.bond:.0f})")
         except Exception:
@@ -181,19 +182,20 @@ class AutonomousBrain:
     async def _guard_check(self, state: Dict[str, Any]) -> bool:
         """无条件优先级守卫。返回 True 表示本轮已处理（跳过其余自主行为）。
 
-        1. 自保：HP<50% 喝药；HP<30% 且附近有敌 → 向反方向拉开距离
-        2. 战斗优先：无前台任务 + 附近有敌 → 暂停长期任务打怪（参照 Lumi P1）
+        v0.11（A2）：比照 Lumi 生存循环 P0/P1——
+          P0 自保：HP<50% 喝药（独立动作，不打断任务）
+          P1 战斗：无前台任务时打怪；有前台任务则只提醒不打断
+        不再有敌就无限占 fast_think（那会吞掉主人的 finite 任务）。
         """
         if not state:
             return False
         hp = int(state.get("hp", 100) or 100)
-        max_hp = int(state.get("max_life", 100) or 100)
+        max_hp = int(state.get("max_life", 100) or 100) or 100
         ratio = hp / max_hp if max_hp > 0 else 1.0
-        enemies = [e for e in (state.get("nearby_npcs", []) or [])
-                   if e.get("damage", 0) > 0 and e.get("life", 0) > 0]
+        enemies = [e for e in (state.get("nearby_npcs", []) or []) if e.get("damage", 0) > 0 and e.get("life", 0) > 0]
 
         handled = False
-        # ── 自保 1：血量 <50% 先喝药（独立动作，不打断任务） ──
+        # ── P0 自保 1：血量 <50% 先喝药（独立动作，不打断任务） ──
         if 0 < ratio < 0.5:
             try:
                 if await self.agent.heal_self():
@@ -202,15 +204,15 @@ class AutonomousBrain:
             except Exception:
                 pass
 
-        # ── 自保 2：血量 <30% 且附近有敌 → 向反方向拉开 8 格 ──
+        # ── P0 自保 2：血量 <30% 且附近有敌 → 向反方向拉开 8 格 ──
         if ratio < 0.3 and enemies and not handled:
             try:
                 me_x = int(state.get("tile_x", 0) or 0)
                 me_y = int(state.get("tile_y", 0) or 0)
                 nearest = min(
                     enemies,
-                    key=lambda e: abs(int(e.get("tile_x", 0) or 0) - me_x)
-                                  + abs(int(e.get("tile_y", 0) or 0) - me_y))
+                    key=lambda e: abs(int(e.get("tile_x", 0) or 0) - me_x) + abs(int(e.get("tile_y", 0) or 0) - me_y),
+                )
                 dx = me_x - int(nearest.get("tile_x", me_x) or me_x)
                 dy = me_y - int(nearest.get("tile_y", me_y) or me_y)
                 dist = (dx * dx + dy * dy) ** 0.5
@@ -224,33 +226,42 @@ class AutonomousBrain:
                     try:
                         inter = getattr(self, "interaction", None)
                         if inter:
-                            await inter.push_speech(
-                                "血好少，先跑开躲一下喵！", behavior="respond")
+                            await inter.push_speech("血好少，先跑开躲一下喵！", behavior="respond")
                     except Exception:
                         pass
             except Exception:
                 pass
 
-        # ── 战斗优先：无前台任务 + 附近有敌 → 暂停长期任务打怪 ──
+        # ── P1 战斗：无前台任务才打（参照 Lumi P1 优先级，但可让路） ──
         if enemies and not handled:
             ex = getattr(self.agent, "executor", None)
             fg_busy = bool(ex and ex.busy())
-            if not fg_busy:
-                lt = getattr(self.agent, "longterm", None)
+            if fg_busy:
+                # 有主线任务：不打断，最多一句话提醒（交给交互引擎）
                 try:
-                    if lt:
-                        lt.request_yield()   # 长期任务让路，避免抢操作权
-                    self._busy = True
-                    try:
-                        await self.agent.combat.fight_nearest(state, timeout=8)
-                    finally:
-                        self._busy = False
-                    handled = True
+                    if self.interaction and self.state.boredom > 0.2:
+                        pass  # 避免抢话：任务的 step/完成回调自会说话
                 except Exception:
                     pass
+                return handled  # 不占 fast_think
+            # 无任务：打（带 check_task，战斗中被主人新任务打断则放弃）
+            lt = getattr(self.agent, "longterm", None)
+            try:
+                if lt:
+                    lt.request_yield()  # 长期任务让路，避免抢操作权
+                self._busy = True
+                try:
+                    await self.agent.combat.fight_nearest(
+                        state, timeout=8, check_task=lambda: ex.busy() if ex else False
+                    )
                 finally:
-                    if lt:
-                        lt.release_yield()
+                    self._busy = False
+                handled = True
+            except Exception:
+                pass
+            finally:
+                if lt:
+                    lt.release_yield()
         return handled
 
     async def _act_on_drive(self, drive: str, state: Dict[str, Any]) -> None:
@@ -282,21 +293,18 @@ class AutonomousBrain:
                 else:
                     await self.agent.send_chat("血量低，先躲一下")
         elif drive == "gather":
-            await self._auto_task("自主储备材料",
-                                  [{"action": "gather", "item": "wood", "amount": 15}])
+            await self._auto_task("自主储备材料", [{"action": "gather", "item": "wood", "amount": 15}])
         elif drive == "explore" and self.state.boredom > 0.55:
             # v3.0 巡逻兜底（参照 Lumi P4）：主人 30 格内陪伴优先不巡逻
             near_owner = False
             me = (state.get("tile_x", 0), state.get("tile_y", 0))
-            for p in (state.get("nearby_players", []) or []):
-                if abs(int(p.get("tile_x", 0) or 0) - me[0]) < 30 and \
-                   abs(int(p.get("tile_y", 0) or 0) - me[1]) < 30:
+            for p in state.get("nearby_players", []) or []:
+                if abs(int(p.get("tile_x", 0) or 0) - me[0]) < 30 and abs(int(p.get("tile_y", 0) or 0) - me[1]) < 30:
                     near_owner = True
                     break
             if not near_owner:
                 await self.agent.send_chat("有点无聊，我去周围转转~")
-                await self.agent.submit_goal(
-                    Goal(goal_type="explore", target="nearby", reason="无聊探索"))
+                await self.agent.submit_goal(Goal(goal_type="explore", target="nearby", reason="无聊探索"))
         elif drive == "social" and players and random.random() < 0.2:
             await self.agent.send_chat("主人在这呀，我跟着你~")
 
@@ -340,6 +348,7 @@ class AutonomousBrain:
                     continue
 
                 import time
+
                 self._last_llm_think = time.monotonic()
 
                 # 构造 LLM 思考请求
@@ -352,19 +361,16 @@ class AutonomousBrain:
                 try:
                     # 全局限流检查
                     from ..llm.throttle import get_throttle
+
                     throttle = get_throttle()
                     if not throttle.acquire(source="brain_think", priority="low"):
-                        self.plugin.logger.info(
-                            f"[brain] LLM 自主思考被限流，跳过本次")
+                        self.plugin.logger.info("[brain] LLM 自主思考被限流，跳过本次")
                         continue
 
                     push = getattr(self.plugin, "push_message", None)
                     if push:
-                        await push(
-                            parts=[{"type": "text", "text": prompt}],
-                            ai_behavior="respond")
-                        self.plugin.logger.info(
-                            f"[brain] LLM 自主思考已推送，boredom={self.state.boredom:.2f}")
+                        await push(parts=[{"type": "text", "text": prompt}], ai_behavior="respond")
+                        self.plugin.logger.info(f"[brain] LLM 自主思考已推送，boredom={self.state.boredom:.2f}")
                     else:
                         # 无 LLM 通道：规则兜底
                         await self._deep_boredom_fallback()
@@ -383,8 +389,7 @@ class AutonomousBrain:
         if self.occupied():
             return
         if self.state.boredom > 0.9:
-            await self._auto_task("无聊储备",
-                                  [{"action": "gather", "item": "wood", "amount": 20}])
+            await self._auto_task("无聊储备", [{"action": "gather", "item": "wood", "amount": 20}])
 
     # ── 复活后自动寻路找主人（参照 Lumi_Nox 死亡复活重置目标） ──
 
@@ -408,16 +413,15 @@ class AutonomousBrain:
             name = owner.get("name", "主人")
 
             print(f"[brain] ✨ 复活后检测到玩家 {name} 距离={dist}，自动寻路回去")
-            self.plugin.logger.info(
-                f"[brain] 复活后自动寻路 → {name} pos=({ox},{oy}) dist={dist}")
+            self.plugin.logger.info(f"[brain] 复活后自动寻路 → {name} pos=({ox},{oy}) dist={dist}")
 
             try:
                 # 先推一条消息给 LLM 知会
                 push = getattr(self.plugin, "push_message", None)
                 if push:
                     await push(
-                        content=f"我复活了！检测到 {name} 在附近({int(dist)}格)，我马上回去～",
-                        ai_behavior="read")
+                        content=f"我复活了！检测到 {name} 在附近({int(dist)}格)，我马上回去～", ai_behavior="read"
+                    )
 
                 await self.agent.navigate_to(ox, oy, timeout=30)
                 self.agent.log("复活后回到主人身边了", "info")
@@ -431,8 +435,7 @@ class AutonomousBrain:
         """受击即时响应：C# 推 combat_hit → 交互引擎立即惊呼。"""
         if self.interaction:
             text = data.get("message", "受到伤害") if isinstance(data, dict) else "受到伤害"
-            await self.interaction.inject_event(
-                "combat_hit", intensity=0.6, description=text)
+            await self.interaction.inject_event("combat_hit", intensity=0.6, description=text)
 
     async def _on_interrupt(self, data: Any) -> None:
         """v2.0 分级打断：根据中断级别区别处理。
@@ -471,9 +474,7 @@ class AutonomousBrain:
         if level >= 2:
             # 先注入关心，给一小段对话窗口
             if self.interaction:
-                await self.interaction.inject_event(
-                    "danger_found", intensity=0.7,
-                    description=why)
+                await self.interaction.inject_event("danger_found", intensity=0.7, description=why)
             await self.agent.interrupt_current(why)
             return
 
@@ -481,7 +482,7 @@ class AutonomousBrain:
         # 不强制打断前台任务（主人"换个任务"这种软指令，让当前一小步自然结束）
         lt = getattr(self.agent, "longterm", None)
         if lt:
-            await lt.stop_all(why)   # 长期任务让路（跟随/挖矿这类无终点的）
+            await lt.stop_all(why)  # 长期任务让路（跟随/挖矿这类无终点的）
         self._busy = False
 
     @property
@@ -505,12 +506,12 @@ class AutonomousBrain:
         try:
             if status == "ok":
                 cue = f"[任务结果] 「{name}」完成了" + (f"：{out}" if out else "") + "。"
+                await self.agent.speak(cue, ai_behavior="read")
             else:
                 cue = f"[任务结果] 「{name}」没完成（{status}）" + (f"：{out}" if out else "") + "。"
-            await self.plugin.push_message(
-                parts=[{"type": "text",
-                        "text": cue + "\n用猫娘语气向主人汇报这个结果（1-2句，不要添加不存在的细节）"}],
-                ai_behavior="respond", priority=5)
+                await self.agent.speak(
+                    cue + "\n用猫娘语气向主人汇报这个结果（1-2句，不要添加不存在的细节）", ai_behavior="respond"
+                )
         except Exception:
             pass
 
@@ -522,8 +523,7 @@ class AutonomousBrain:
                 self._emitter.on_goal_completed(gtype, gtarget)
 
         if self.interaction:
-            await self.interaction.inject_event(
-                "task_done", intensity=0.5, description=desc, data=data)
+            await self.interaction.inject_event("task_done", intensity=0.5, description=desc, data=data)
 
     async def _on_executor_task_started(self, data: Dict) -> None:
         name = data.get("name", "新任务")
@@ -533,24 +533,22 @@ class AutonomousBrain:
             gtype = goal_data.get("type", "")
             gtarget = goal_data.get("target", "")
             if gtype and gtarget:
-                self._emitter.on_goal_set(gtype, gtarget,
-                                          goal_data.get("reason", ""))
+                self._emitter.on_goal_set(gtype, gtarget, goal_data.get("reason", ""))
 
         # 任务开始直推主 LLM（read 模式，绕开交互引擎说话冷却）：
         # 让猫娘知道任务真的开始了、还在执行中——这是"任务没完成"认知的关键一环
         try:
-            await self.plugin.push_message(
-                parts=[{"type": "text", "text":
-                        f"[任务状态] 开始执行「{name}」。这是任务开始通知，"
-                        f"任务仍在进行中，完成后会汇报。"}],
-                ai_behavior="read")
+            await self.agent.speak(
+                f"[任务状态] 开始执行「{name}」。这是任务开始通知，任务仍在进行中，完成后会汇报。",
+                ai_behavior="read",
+            )
         except Exception:
             pass
 
         if self.interaction:
             await self.interaction.inject_event(
-                "task_started", intensity=0.1,
-                description=f"开始做「{name}」", data=data)
+                "task_started", intensity=0.1, description=f"开始做「{name}」", data=data
+            )
 
     async def _on_executor_interrupted(self, data: Dict) -> None:
         name = data.get("name", "任务")
@@ -565,32 +563,28 @@ class AutonomousBrain:
 
         # 任务被中断直推主 LLM：猫娘必须知道任务没有完成
         try:
-            await self.plugin.push_message(
-                parts=[{"type": "text", "text":
-                        f"[任务状态] 「{name}」被中断了（{reason}）。"
-                        f"这是状态通知，任务没有完成。"}],
-                ai_behavior="read")
+            await self.agent.speak(
+                f"[任务状态] 「{name}」被中断了（{reason}）。这是状态通知，任务没有完成。",
+                ai_behavior="respond",
+            )
+        except Exception:
+            pass
         except Exception:
             pass
 
         if self.interaction:
             self.interaction.remember_interrupted_task(name)
             desc = f"「{name}」被中断了（{reason}）"
-            await self.interaction.inject_event(
-                "task_interrupted", intensity=0.6, description=desc, data=data)
+            await self.interaction.inject_event("task_interrupted", intensity=0.6, description=desc, data=data)
 
     async def _on_executor_step(self, data: Dict) -> None:
         kind = data.get("kind", "task")
         desc = data.get("desc", f"{kind} 一步完成")
         # 步骤进度直推主 LLM（read）：任务进行中的持续证据，猫娘不会误以为已完成
         try:
-            await self.plugin.push_message(
-                parts=[{"type": "text", "text":
-                        f"[任务进度] {desc}。任务仍在执行中。"}],
-                ai_behavior="read")
+            await self.agent.speak(f"[任务进度] {desc}。任务仍在执行中。", ai_behavior="read")
         except Exception:
             pass
 
         if self.interaction:
-            await self.interaction.inject_event(
-                "step_done", intensity=0.15, description=desc, data=data)
+            await self.interaction.inject_event("step_done", intensity=0.15, description=desc, data=data)

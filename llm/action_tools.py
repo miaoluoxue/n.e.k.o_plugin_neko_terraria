@@ -1,7 +1,4 @@
 """猫娘动作工具：warp / summon / mine / craft / give / equip。
-
-重构说明：
-- 移除 bot.warp 等直接调用
 - 改为通过 ModLink 实现
 """
 

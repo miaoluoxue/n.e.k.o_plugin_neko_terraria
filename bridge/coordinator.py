@@ -296,11 +296,16 @@ class TaskCoordinator:
             "collect": ("gather", "收集"),
             "place":   ("goto",   "放置"),
             "craft":   ("craft",  "制作"),
+            "explore": ("explore", "探索"),
         }
         action, _ = kind_map.get(kind, ("goto", "执行"))
         item = target or "矿"
         if action == "goto" and item == "矿" and kind != "hunt":
             item = "目标"
+        if kind == "explore":
+            # 探索类：target 可能是方向/地点（地下/左/右），无 target 默认附近
+            return [{"action": "explore", "item": item if item != "矿" else "附近",
+                     "amount": 1}]
         if target and amount:
             return [{"action": action, "item": item, "amount": max(1, amount)}]
         if target:

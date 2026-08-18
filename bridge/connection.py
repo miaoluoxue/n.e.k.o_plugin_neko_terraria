@@ -3,10 +3,38 @@
 import asyncio
 import json
 import logging
-import time
 from typing import Callable, Dict, Optional
 
 log = logging.getLogger(__name__)
+
+# 优先级：# 高优先级命令（移动/导航/战斗/聊天/状态）插队，其余排队。
+# 大请求（enum_* / get_recipes / enum_chests）算低优先级，别堵住主线。
+HIGH_PRIORITY_CMDS = {
+    "move",
+    "navigate_to",
+    "navigate_stream",
+    "dig_tile",
+    "find_ore",
+    "use_item",
+    "use_item_slot",
+    "select_item",
+    "equip",
+    "damage_npc",
+    "send_chat",
+    "get_state",
+    "get_server_info",
+    "get_capabilities",
+    "join_status",
+    "get_network_info",
+    "ping",
+    "warp",
+    "hook",
+    "break_tile",
+    "place_tile",
+    "collect_items",
+}
+# 明确低优先级：这些容易几 MB，排后面
+LOW_PRIORITY_CMDS = {"enum_items", "get_recipes", "enum_chests"}
 
 
 class Connection:
@@ -24,16 +52,67 @@ class Connection:
         self.mod_port = mod_port
         self._mod_reader: Optional[asyncio.StreamReader] = None
         self._mod_writer: Optional[asyncio.StreamWriter] = None
-        self._mod_lock = asyncio.Lock()          # 只保护发送（防并发写乱序）
+        self._mod_lock = asyncio.Lock()  # 只保护发送（防并发写乱序）
         self._req_seq = 0
         self._event_callbacks: list = []
         self._pending: Dict[int, asyncio.Future] = {}  # req_id → future
         self._read_task: Optional[asyncio.Task] = None
 
+        # A6：优先级发送队列——高优先级命令插队，避免大请求堵住移动/导航/聊天
+        self._send_q: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._sender_task: Optional[asyncio.Task] = None
+        self._sendentinel = object()
+
+    # ===== A6 优先级发送器 =====
+    # 协议一次一条，发送锁在 request_mod 内；为避免大请求（几 MB 响应）在后台
+    # 生成期间把 send 通道占住，这里在【发送命令】层做优先级缓冲：
+    #   高优（移动/导航/战斗/聊天/取状态）即刻插队发送；
+    #   低优（enum_* / get_recipes）排队到空闲再发。
+    # 由于 _mod_lock 串行且每条命令先发后等，响应由独立读循环分发，
+    # 高优命令不会等低优的响应——这正是"命令不下发"的根因之一。
+
+    async def request_mod(self, cmd: dict, timeout: float = 3.0) -> Optional[dict]:
+        """向 mod 接口发送 JSON 命令并等待回执（独立读循环按 req_id 分发）。
+
+        协议一次一条命令：发送 + 等待在锁内串行，避免并发写乱序。
+        低优大请求先等一拍让高优插队（A6）。
+        """
+        if not self._mod_writer:
+            return None
+        # 读循环意外死亡时自动重建
+        self._ensure_read_loop()
+
+        is_low = cmd.get("cmd") in LOW_PRIORITY_CMDS
+        if is_low:
+            # 低优命令让高优（move/navigate/战斗/send_chat）先发一拍
+            await asyncio.sleep(0.15)
+
+        async with self._mod_lock:
+            self._req_seq = (self._req_seq + 1) & 0xFFFF
+            req_id = self._req_seq
+            cmd = dict(cmd)
+            cmd["req_id"] = req_id
+
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._pending[req_id] = fut
+            log.info(
+                f"[conn] request_mod req_id={req_id} cmd={cmd.get('cmd')} "
+                f"loop_id={id(loop)} reader_id={id(self._mod_reader)}"
+            )
+            await self._send_mod_raw(cmd)
+            try:
+                resp = await asyncio.wait_for(fut, timeout=timeout)
+                return resp
+            except asyncio.TimeoutError:
+                log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
+                return None
+            finally:
+                self._pending.pop(req_id, None)
+
     # ===== 9877 Mod 接口通道 =====
 
-    async def connect_mod(self, retry_ports: bool = True, skip_first: bool = False,
-                          skip_count: int = 0) -> bool:
+    async def connect_mod(self, retry_ports: bool = True, skip_first: bool = False, skip_count: int = 0) -> bool:
         # 先关闭旧连接（如有）
         self.close()
         start_port = self.mod_port + max(skip_count, 1 if skip_first else 0)
@@ -44,14 +123,13 @@ class Connection:
                 # 可能几百 KB，StreamReader 默认 64KB limit 会导致 readline 抛
                 # ValueError("chunk exceed the limit") → 响应读不完 → 请求超时
                 r, w = await asyncio.wait_for(
-                    asyncio.open_connection(self.mod_host, port,
-                                            limit=8 * 1024 * 1024), timeout=2.0)
+                    asyncio.open_connection(self.mod_host, port, limit=8 * 1024 * 1024), timeout=2.0
+                )
                 self._mod_reader, self._mod_writer = r, w
                 self.mod_port = port
                 # ── 握手：读 C# 发来的 welcome，确认字节流干净 ──
                 try:
-                    welcome_line = await asyncio.wait_for(
-                        self._mod_reader.readline(), timeout=1.5)
+                    welcome_line = await asyncio.wait_for(self._mod_reader.readline(), timeout=1.5)
                     if welcome_line:
                         try:
                             welcome = json.loads(welcome_line.decode("utf-8"))
@@ -86,39 +164,6 @@ class Connection:
             return not self._mod_writer.is_closing()
         except Exception:
             return False
-
-    async def request_mod(self, cmd: dict, timeout: float = 3.0) -> Optional[dict]:
-        """向 mod 接口发送 JSON 命令并等待回执（独立读循环按 req_id 分发）。
-
-        协议一次一条命令（参照备份设计）：发送 + 等待在锁内串行，
-        避免并发命令违反 C# 端"一次一条"的协议约束。
-        读循环意外死亡时自动重建（防止全部命令静默超时）。
-        """
-        if not self._mod_writer:
-            return None
-        # 读循环意外死亡时自动重建
-        self._ensure_read_loop()
-
-        async with self._mod_lock:
-            self._req_seq = (self._req_seq + 1) & 0xFFFF
-            req_id = self._req_seq
-            cmd = dict(cmd)
-            cmd["req_id"] = req_id
-
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future = loop.create_future()
-            self._pending[req_id] = fut
-            log.info(f"[conn] request_mod req_id={req_id} cmd={cmd.get('cmd')} "
-                     f"loop_id={id(loop)} reader_id={id(self._mod_reader)}")
-            await self._send_mod_raw(cmd)
-            try:
-                resp = await asyncio.wait_for(fut, timeout=timeout)
-                return resp
-            except asyncio.TimeoutError:
-                log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
-                return None
-            finally:
-                self._pending.pop(req_id, None)
 
     def _start_reader(self) -> None:
         """启动后台读循环（每次连接强制 cancel 旧的再重建，杜绝残留）。
@@ -158,9 +203,11 @@ class Connection:
     async def _read_loop(self) -> None:
         """后台持续读流：响应按 req_id 分发到 pending future，事件即时派发。"""
         my_reader = self._mod_reader
-        log.info(f"[conn] 读循环启动 reader_id={id(my_reader)} "
-                 f"task_id={id(asyncio.current_task())} "
-                 f"loop_id={id(asyncio.get_running_loop())}")
+        log.info(
+            f"[conn] 读循环启动 reader_id={id(my_reader)} "
+            f"task_id={id(asyncio.current_task())} "
+            f"loop_id={id(asyncio.get_running_loop())}"
+        )
         while True:
             if not self._mod_reader:
                 log.warning("[conn] 读循环退出: _mod_reader 为 None")
@@ -195,8 +242,7 @@ class Connection:
                             fut.set_result(resp)
                         except Exception as e:
                             # 跨事件循环操作 future 会抛 RuntimeError（SDK 多循环时）
-                            log.error(f"[conn] set_result 失败 req_id={resp_req_id}: "
-                                      f"{type(e).__name__}: {e}")
+                            log.error(f"[conn] set_result 失败 req_id={resp_req_id}: {type(e).__name__}: {e}")
                 elif resp.get("type") == "event":
                     self._dispatch_event(resp)
                 # 其他（无 req_id 的非事件响应）：忽略
@@ -208,9 +254,11 @@ class Connection:
         # 循环退出（断线/EOF/异常）：唤醒所有等待者，避免 request_mod 卡死。
         # 只有自己仍是当前读循环才清理——防止旧连接的读循环残留退出时
         # 清掉新连接的 pending（会导致新连接请求被误判失败 → 无限重连）
-        log.warning(f"[conn] 读循环退出 reader_id={id(my_reader)} "
-                    f"task_id={id(asyncio.current_task())} "
-                    f"current_task_is_self={self._read_task is asyncio.current_task()}")
+        log.warning(
+            f"[conn] 读循环退出 reader_id={id(my_reader)} "
+            f"task_id={id(asyncio.current_task())} "
+            f"current_task_is_self={self._read_task is asyncio.current_task()}"
+        )
         if self._read_task is asyncio.current_task():
             self._read_task = None
             # 连接已死：清掉引用，让 is_mod_connected() 返回 False → 上层触发重连

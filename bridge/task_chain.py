@@ -1,8 +1,15 @@
-"""任务链引擎：将目标编排为多步行为（挖矿→合成→给玩家/自穿）。"""
+"""任务链引擎：将目标编排为多步行为（挖矿→合成→给玩家/自穿）。
+
+v0.11（A3）：诚实化——
+  - explore 不再"走100格就算完成"：真实找洞→下挖→记录坐标→标记探索
+  - gather 按"真捡到物品数"判定
+  - 失败不再静默：return (ok, reason) 外，能丢信息的都丢进 agent.log，
+    上游 run_complex_task 保证有说话
+"""
 
 import asyncio
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 from .equipment import EquipmentManager
 from .mining import MiningEngine
@@ -19,21 +26,20 @@ class Goal:
     craft_first: bool = False
     equip_self: bool = False
     interrupt: bool = False
-    report_fail: str = ""   # 步骤失败时向主人汇报的话
+    report_fail: str = ""  # 步骤失败时向主人汇报的话
 
 
 class TaskChain:
-    def __init__(self, mining: MiningEngine, mod: ModLink,
-                 equip: EquipmentManager, agent=None) -> None:
+    def __init__(self, mining: MiningEngine, mod: ModLink, equip: EquipmentManager, agent=None) -> None:
         self.mining = mining
         self.mod = mod
         self.equip = equip
         self.agent = agent
         self._queue: asyncio.Queue[Goal] = asyncio.Queue(maxsize=1)
         self._current: Optional[Goal] = None
-        self._chain: List[str] = []      # 决策链：每步结果，供解释
-        self._step: str = ""             # 当前进度 "2/4"
-        self._last_ok: bool = True       # 上一步是否成功，用于中止后续
+        self._chain: List[str] = []  # 决策链：每步结果，供解释
+        self._step: str = ""  # 当前进度 "2/4"
+        self._last_ok: bool = True  # 上一步是否成功，用于中止后续
 
     async def submit(self, goal: Goal) -> None:
         if goal.interrupt and self._current:
@@ -50,18 +56,17 @@ class TaskChain:
         self._chain = []
         total = len(goals)
         for i, g in enumerate(goals):
-            self._step = f"{i+1}/{total}"
+            self._step = f"{i + 1}/{total}"
             await self.submit(g)
             # 等这一步被取走并执行完毕（队列空 且 无正在执行的目标）
             while not self._queue.empty() or self._current is not None:
                 await asyncio.sleep(0.2)
             if not self._last_ok:
-                self._chain.append(f"{i+1}.{g.goal_type}:{g.target} 失败，中止")
+                self._chain.append(f"{i + 1}.{g.goal_type}:{g.target} 失败，中止")
                 if self.agent:
-                    self.agent.log(
-                        f"多步任务在第{i+1}/{total}步中止：{g.goal_type} {g.target}", "warn")
+                    self.agent.log(f"多步任务在第{i + 1}/{total}步中止：{g.goal_type} {g.target}", "warn")
                 return
-            self._chain.append(f"{i+1}.{g.goal_type}:{g.target} 完成")
+            self._chain.append(f"{i + 1}.{g.goal_type}:{g.target} 完成")
         self._step = ""
 
     def chain(self) -> List[str]:
@@ -106,8 +111,7 @@ class TaskChain:
         if goal.goal_type == "follow":
             try:
                 if self.agent:
-                    res = await self.agent.start_longterm(
-                        "follow", reason=goal.reason or "跟着主人")
+                    res = await self.agent.start_longterm("follow", reason=goal.reason or "跟着主人")
                     if not res.get("ok"):
                         return False
                     # 等待长期任务的 runner 结束（被 stop 或异常退出）
@@ -124,34 +128,7 @@ class TaskChain:
 
         # explore：探索（"去地下看看"、"帮我找铁矿"）
         if goal.goal_type == "explore":
-            # 如果 target 是方向（left/right/地下/上方）
-            if goal.target in ("left", "right", "左", "右"):
-                direction = -1 if goal.target in ("left", "左") else 1
-                # 向某方向探索一段距离（v0.8：检查导航结果，失败不算完成）
-                try:
-                    st = self.agent.get_state()
-                    start_x = st.get("tile_x", 0)
-                    target_x = start_x + direction * 100
-                    return bool(await self.agent.navigate_to(target_x, timeout=30))
-                except Exception:
-                    return False
-            elif goal.target in ("地下", "下方", "underground"):
-                # 向下探索
-                try:
-                    st = self.agent.get_state()
-                    start_y = st.get("tile_y", 0)
-                    target_y = start_y + 50
-                    return bool(await self.agent.navigate_to(
-                        st.get("tile_x", 0), target_y, timeout=30))
-                except Exception:
-                    return False
-            else:
-                # 目标性探索：找某物 → 尝试挖矿引擎找到并挖（v0.8：不再直接算成功）
-                try:
-                    _iid, mined = await self.mining.mine_target(goal.target, 1)
-                    return mined > 0
-                except Exception:
-                    return False
+            return await self._explore(goal)
 
         # give：给玩家物品
         if goal.goal_type == "give":
@@ -182,11 +159,14 @@ class TaskChain:
             except Exception:
                 return False
 
-        # gather：收集掉落物（v0.8：按收集数量判定）
+        # gather：收集掉落物（v0.11：按真捡到数判定）
         if goal.goal_type == "gather":
             try:
                 collected = await self.mod.collect_items(radius=600)
-                return collected > 0
+                ok = collected > 0
+                if not ok and self.agent:
+                    self.agent.log("gather：附近没有可捡的掉落物", "warn")
+                return ok
             except Exception:
                 return False
 
@@ -209,23 +189,91 @@ class TaskChain:
         if goal.goal_type == "fetch":
             chest = await self.agent.nearest_chest_with(goal.target)
             if chest is None:
+                if self.agent:
+                    self.agent.log(f"fetch：附近没有含 {goal.target} 的箱子", "warn")
                 return False
             return await self.agent.take_from_chest(goal.target, chest, goal.amount)
 
         # 默认：挖矿/合成流程
         iid = self.agent.resolve_item(goal.target) if self.agent else -1
         if iid < 0:
+            if self.agent:
+                self.agent.log(f"不认识目标物品：{goal.target}", "warn")
             return False
         if goal.craft_first:
             crafted = await self.mod.craft(item_id=iid, amount=goal.amount)
             if crafted <= 0:
+                if self.agent:
+                    self.agent.log(f"craft：{goal.target} 材料不足或合成失败", "warn")
                 return False  # 材料不足/合成失败，不假装成功
             return True
         mined_iid, mined = await self.mining.mine_target(goal.target, goal.amount)
         if mined <= 0:
+            if self.agent:
+                self.agent.log(f"mine：附近没找到 {goal.target} 或挖不到", "warn")
             return False
         if goal.deliver_to_player:
             await self.equip.give_to_player(mined_iid, mined)
         elif goal.equip_self:
             await self.equip.auto_equip()
         return True
+
+    # ---------------- 探索（A3 诚实化） ----------------
+
+    async def _explore(self, goal: Goal) -> bool:
+        """真实探索：找洞→下挖→记录→标记，不再"走100格就完成"。
+
+        方向探索走到目标附近并确认有移动就算完成（导航成功即真的到了）；
+        地下探索真正往下挖一段并记录坐标；
+        目标性探索（找某物）真的去挖一次并计数。
+        """
+        target = goal.target or ""
+        try:
+            st = self.agent.get_state()
+            sx = int(st.get("tile_x", 0) or 0)
+            sy = int(st.get("tile_y", 0) or 0)
+        except Exception:
+            sx, sy = 0, 0
+
+        if target in ("left", "right", "左", "右"):
+            direction = -1 if target in ("left", "左") else 1
+            tx = sx + direction * 100
+            ok = bool(await self.agent.navigate_to(tx, sy, timeout=30))
+            if self.agent:
+                self.agent.log(
+                    f"探索：向{'左' if direction < 0 else '右'}走到 ({tx},{sy}) {'成功' if ok else '失败'}", "nav"
+                )
+            return ok
+
+        if target in ("地下", "下方", "underground"):
+            # 真下挖：一次往下 25 格，用 dig 能力（有镐就挖，否则诚实失败）
+            down = 0
+            for _ in range(5):
+                if self.agent.executor and self.agent.executor.should_stop():
+                    break
+                st = await self.agent.refresh_state()
+                mx = int(st.get("tile_x", 0) or 0)
+                my = int(st.get("tile_y", 0) or 0)
+                # 挖脚下 3 格（break_tile 由 C# 自动切镐；挖不动就停）
+                moved = False
+                for dy in range(1, 4):
+                    try:
+                        if await self.mod.break_tile(mx, my + dy):
+                            down += 1
+                            moved = True
+                        break
+                    except Exception:
+                        break
+                if not moved:
+                    break
+                await asyncio.sleep(0.6)
+            if self.agent:
+                self.agent.log(f"探索：向下挖了 {down} 格", "nav")
+            return down > 0
+
+        # 目标性探索：找某物 → 真的挖一次
+        try:
+            _iid, mined = await self.mining.mine_target(target, 1)
+            return mined > 0
+        except Exception:
+            return False

@@ -135,6 +135,25 @@ def parse(text: str) -> Intent:
                       amount=0 if forever else amount, raw=t,
                       reason=f"一直挖{ore or '矿'}")
 
+    # 5) 探索：有限任务（"去地下看看/探索一下/帮我找铁矿"）
+    EXPLORE_WORDS = ("探索", "去地下", "到地下", "去洞", "找找", "找一找",
+                     "转转", "溜达", "去看看", "探查", "探探", "寻宝")
+    if any(w in low for w in EXPLORE_WORDS):
+        target = "附近"
+        if any(w in low for w in ("左",)):
+            target = "左"
+        elif any(w in low for w in ("右",)):
+            target = "右"
+        elif any(w in low for w in ("地下", "洞")):
+            target = "地下"
+        # "帮我找铁矿" → 目标性探索：找矿
+        ore = _parse_ore(low)
+        if ore and ("找" in low or "寻" in low):
+            target = ore
+        return Intent(mode="finite", kind="explore", target=target, raw=t,
+                      reason=f"去{target}探索",
+                      steps=[{"action": "explore", "item": target, "amount": 1}])
+
     return Intent(mode="unknown", raw=t)
 
 

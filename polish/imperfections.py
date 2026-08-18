@@ -50,14 +50,8 @@ class ImperfectionInjector:
 
     @staticmethod
     def jitter_text(text: str, intensity: float = 0.5) -> str:
-        """对 LLM 回复文本做不完美后处理。
-
-        纯函数：不依赖实例状态，intensity 由调用方传入。
-        - stutter: 开头加省略号（犹豫）
-        - filler:  句中插入语气词
-        - typo:    以"~"结尾表示轻微手滑
-        - forget:  句末加星号备注
-        """
+        """对 LLM 回复文本做不完美后处理。"""
+        
         if intensity < 0.3 or not text or len(text) < 3:
             return text
 

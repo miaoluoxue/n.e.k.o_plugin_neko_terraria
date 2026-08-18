@@ -1,8 +1,4 @@
-"""个人习惯：性格种子与行为偏好。
-
-v2.1: 支持从主项目 characters.json 加载 persona traits，
-覆盖/扩充默认的猫娘 traits。习惯倍率注入交互引擎 urge 增量。
-"""
+"""个人习惯：性格种子与行为偏好。"""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -50,11 +46,7 @@ STYLE_MAP: List[Tuple[str, float, str]] = [
 
 @dataclass
 class PersonalHabits:
-    """角色的说话习惯。影响交互引擎的 urge 增量倍率 + 说话风格。
-
-    - prefs: {trait_name → value(0~1)}
-    - _urge_modifier: 乘积形式的 urge 总体倍率因子
-    """
+    """角色的说话习惯。影响交互引擎的 urge 增量倍率 + 说话风格。"""
 
     seed: str = "neko"
     prefs: Dict[str, float] = field(default_factory=lambda: dict(FALLBACK_TRAITS))

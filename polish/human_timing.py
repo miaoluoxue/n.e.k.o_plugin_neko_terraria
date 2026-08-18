@@ -16,20 +16,16 @@ class HumanTiming:
 
     # ---- 命令处理 ----
     def command_delay(self) -> float:
-        """收到命令后"理解+决定"的思考延迟，0.6-1.8s。
-        
-        在 pre_reply 已发、任务开始前插入，
-        模拟「听到→反应→动手」的自然节奏。
-        """
+        """收到命令后"理解+决定"的思考延迟，0.6-1.8s。"""
+
         return random.uniform(0.6, 1.8)
 
     def step_gap(self) -> float:
-        """步骤间"看一眼成果"的呼吸间隙，0.3-1.0s。
-        
-        在任务步骤间插入，避免连续操作像脚本。
-        """
+        """步骤间"看一眼成果"的呼吸间隙，0.3-1.0s。"""
+
         return random.uniform(0.3, 1.0)
 
     def startup_delay(self) -> float:
         """启动动画等待，0.5-2s。"""
+        
         return random.uniform(0.5, 2.0)
