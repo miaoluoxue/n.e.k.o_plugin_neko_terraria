@@ -20,7 +20,6 @@ exclude_dirs = [
     ".pytest_cache",
     ".ruff_cache",
     "__pycache__",
-    "docs",
     "tests",
     "tools",
     "archive",
