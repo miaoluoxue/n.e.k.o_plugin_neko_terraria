@@ -5,21 +5,17 @@ __pycache__/
 *.log
 logs/
 
-# ── AI 客户端运行时（部署必需保留：ModConfigs/Mods/Players 角色皮肤）──
-# 个人运行时数据排除：
+# ── AI 客户端运行时（部署必需保留：ModConfigs/Mods/Players 角色皮肤/config.json）──
+# 个人运行时数据排除（世界存档/日志/资源包/云同步缓存）：
 mod/tModLoader/Worlds/
 mod/tModLoader/Logs/
 mod/tModLoader/ResourcePacks/
-mod/tModLoader/config.json
 mod/tModLoader/favorites.json
 mod/tModLoader/achievements.dat
 mod/tModLoader/servers.dat
 mod/tModLoader/LastLaunchedMods.txt
 mod/tModLoader/*.lnk
 mod/tModLoader/input profiles.json
-mod/tModLoader/Players/Backups/
-mod/tModLoader/Players/*.bak
-mod/tModLoader/Players/*.tplr
 
 # ── C# 编译中间产物（Mods/*.tmod 编译产物保留：AI 客户端部署必需）──
 mod/NekoTerrariaLink/bin/

@@ -30,20 +30,16 @@ exclude_dirs = [
     "mod/tModLoader/Worlds",
     "mod/tModLoader/Logs",
     "mod/tModLoader/ResourcePacks",
-    "mod/tModLoader/Players/Backups",
 ]
 exclude_files = [
     ".gitignore",
     "README.md",
     "uv.lock",
-    "mod/tModLoader/config.json",
     "mod/tModLoader/favorites.json",
     "mod/tModLoader/achievements.dat",
     "mod/tModLoader/servers.dat",
     "mod/tModLoader/LastLaunchedMods.txt",
     "mod/tModLoader/input profiles.json",
-    "mod/tModLoader/Players/*.bak",
-    "mod/tModLoader/Players/*.tplr",
 ]
 exclude = [
     # C# mod 源码不进发布包（.tmod 已编译好；源码在 git 供开发者构建）
