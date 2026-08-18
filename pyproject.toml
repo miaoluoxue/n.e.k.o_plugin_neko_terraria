@@ -24,8 +24,8 @@ exclude_dirs = [
     "tools",
     "archive",
     "data",
-    "mod/NekoTerrariaLink/bin",
-    "mod/NekoTerrariaLink/obj",
+    # C# mod 工程整个不进发布包（.tmod 已编译好放在 mod/tModLoader/Mods；源码在 git 供开发者构建）
+    "mod/NekoTerrariaLink",
     "mod/tModLoader/Worlds",
     "mod/tModLoader/Logs",
     "mod/tModLoader/ResourcePacks",
@@ -34,13 +34,11 @@ exclude_files = [
     ".gitignore",
     "README.md",
     "uv.lock",
+    "ruff.toml",
+    "LICENSE",
     "mod/tModLoader/favorites.json",
     "mod/tModLoader/achievements.dat",
     "mod/tModLoader/servers.dat",
     "mod/tModLoader/LastLaunchedMods.txt",
     "mod/tModLoader/input profiles.json",
-]
-exclude = [
-    # C# mod 源码不进发布包（.tmod 已编译好；源码在 git 供开发者构建）
-    "mod/NekoTerrariaLink/*.cs",
 ]
