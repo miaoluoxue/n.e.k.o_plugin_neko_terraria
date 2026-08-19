@@ -55,8 +55,10 @@ class TerrariaAgent:
         self.executor = TaskExecutor(self)
         self.recipe_book = RecipeBook(self)
         from .base import BaseManager
+        from .explore import UndergroundExplorer
 
         self.base = BaseManager(self)
+        self.explorer = UndergroundExplorer(self)
         self.brain = TaskBrain(self)
         self.longterm = LongTermManager(self)
         self.jobs = StandingJobs(self)

@@ -307,7 +307,18 @@ class TaskChain:
             return ok
 
         if target in ("地下", "下方", "underground"):
-            # 真下挖：一次往下 25 格，用 dig 能力（有镐就挖，否则诚实失败）
+            # v0.5: 完整地下探索闭环（找洞→下挖→挖矿→回家），替代单纯下挖 25 格
+            explorer = getattr(self.agent, "explorer", None)
+            if explorer is not None:
+                try:
+                    return await explorer.explore(direction=1, max_time=180.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if self.agent:
+                        self.agent.log(f"地下探索异常: {e}", "warn")
+                    return False
+            # 兜底：真下挖（有镐才挖，否则诚实失败）
             down = 0
             for _ in range(5):
                 if self.agent.executor and self.agent.executor.should_stop():
@@ -315,17 +326,15 @@ class TaskChain:
                 st = await self.agent.refresh_state()
                 mx = int(st.get("tile_x", 0) or 0)
                 my = int(st.get("tile_y", 0) or 0)
-                # 挖脚下 3 格（break_tile 由 C# 自动切镐；挖不动就停）
-                # #15: break 必须在 if 内——否则 dy=2/3 永不尝试，只挖 1 格就宣布完成
                 moved = False
                 for dy in range(1, 4):
                     try:
                         if await self.mod.break_tile(mx, my + dy):
                             down += 1
                             moved = True
-                            break  # 挖通这一格，进入下一轮继续下挖
+                            break
                     except Exception:
-                        break  # 该格异常：停止尝试
+                        break
                 if not moved:
                     break
                 await asyncio.sleep(0.6)

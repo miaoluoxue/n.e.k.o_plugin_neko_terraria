@@ -156,32 +156,21 @@ def _pick_candidate(
 ) -> Optional[Dict[str, Any]]:
     """从 all 配方里挑出最好的可升级目标。
 
-    配方结构（C# SendRecipes）是平铺的 {item_id,name,amount,mod,available,materials,stations}，
-    其中材料/工作台在顶层不在 result 里；这里按"产物名/id 对齐"取统计键。
+    配方结构（C# SendRecipes v0.5）是平铺的
+    {item_id,name,amount,mod,available,materials,stations,damage,pick,axe,defense}，
+    物品属性在顶层（result 为空）。取统计键直接读顶层。
     """
     best: Optional[Dict[str, Any]] = None
     best_val = cur
     for r in recipes:
-        result = r.get("result", {})
-        # 兼容平铺结构：result 可能为空，直接用顶层 name/item_id 对齐
-        name = (result.get("name") if isinstance(result, dict) else None) or r.get("name", "")
-        iid = (result.get("item_id") if isinstance(result, dict) else None) or r.get("item_id", -1)
-        if not name and iid in (None, -1):
+        iid = int(r.get("item_id", -1) or -1)
+        name = str(r.get("name", "") or "")
+        if iid < 0 or not name:
             continue
-        val = int(result.get(key, 0) or 0) if isinstance(result, dict) else _stat_of_recipe(r, key)
-        if val <= 0:
-            val = _stat_of_recipe(r, key)
+        val = int(r.get(key, 0) or 0)
         if val < cur + min_gain:
             continue
         if best is None or val > best_val:
             best = r
             best_val = val
     return best
-
-
-def _stat_of_recipe(r: Dict[str, Any], key: str) -> int:
-    """从平铺配方里兜底取统计键（武器 damage / 镐 pick / 防具 defense 在 result 或顶层）。"""
-    header = r.get("result", {})
-    if isinstance(header, dict):
-        return int(header.get(key, 0) or 0)
-    return 0

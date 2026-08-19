@@ -1984,6 +1984,11 @@ namespace NekoTerrariaLink
                             ["amount"] = createItem.stack, ["mod"] = modName,
                             ["available"] = RecipeAvailable(r),
                             ["materials"] = mats, ["stations"] = stations,
+                            // v0.5: 物品属性（升级引擎比较用）——武器伤害/镐力/斧力/防御
+                            ["damage"] = createItem.damage,
+                            ["pick"] = createItem.pick,
+                            ["axe"] = createItem.axe,
+                            ["defense"] = createItem.defense,
                         });
                     }
                     Send(s, new Dict { ["req_id"] = reqId, ["type"] = "recipes", ["recipes"] = list });
