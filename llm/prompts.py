@@ -62,7 +62,7 @@ def build_dynamic_prompt(name: str = "Neko",
                           log_events: str = "") -> str:
     """生成完整的动态系统提示词。
 
-    层次结构（参照 Lumi_Nox）：
+    层次结构：
     1. 人设（角色名）
     2. 世界规则（固定知识）
     3. 当前能力（从 capability.refresh() 获取，动态）

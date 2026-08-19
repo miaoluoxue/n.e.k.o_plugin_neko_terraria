@@ -111,7 +111,7 @@ class ModLink:
             "item_id": item_id, "stack": stack})
         return bool(resp and resp.get("ok"))
 
-    # ── v0.5 基地系统能力（对应 Lumi init_base/go_home_and_resupply） ──
+    # ── v0.5 基地系统能力（基地与补给系统） ──
 
     async def get_spawn(self) -> Optional[tuple]:
         """查询世界出生点坐标 (tile_x, tile_y)。"""
@@ -176,7 +176,7 @@ class ModLink:
             timeout=timeout + 2)
         return bool(resp and resp.get("ok"))
 
-    # ── v3.0: 流式导航（参照 Lumi_Nox）──
+    # ── v3.0: 流式导航──
     # C# 侧 BFS 寻路 + 逐点执行，通过 nav_* 事件流回传状态
     # （nav_moving/nav_arrived/nav_stuck/nav_timeout），Python 可中断/感知进度
 
@@ -271,14 +271,14 @@ class ModLink:
         return int(resp.get("collected", 0)) if resp else 0
 
     async def dig_tile(self, x: int, y: int, timeout: float = 5.0) -> bool:
-        """原生物品挖掘（LumiBridge 移植）：自动选镐子 + 光标定位 + controlUseItem。
+        """原生物品挖掘（mod 原生能力）：自动选镐子 + 光标定位 + controlUseItem。
         有工具动画/消耗/属性，比 break_tile 直接改 tile 真实。</summary>"""
         resp = await self.conn.request_mod(
             {"cmd": "dig_tile", "x": x, "y": y}, timeout=timeout)
         return bool(resp and resp.get("ok"))
 
     async def find_ore(self, radius: int = 30, tile_type: int = 0) -> List[Dict[str, Any]]:
-        """扫描附近矿石（C# 参照 Lumi find_trees）：返回按距离排序的矿坐标列表。
+        """扫描附近矿石（扫描矿点）：返回按距离排序的矿坐标列表。
         tile_type>0 时只返回该类型（铁矿石 tile 类型 = 铁矿物品 id）。"""
         resp = await self.conn.request_mod(
             {"cmd": "find_ore", "radius": radius, "tile_type": tile_type},

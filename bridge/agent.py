@@ -29,7 +29,7 @@ from .task_brain import TaskBrain
 from .task_chain import Goal, TaskChain
 from .task_inquiry import TaskInquiry
 
-# ── 联机模式检测阈值（参照 Lumi_Nox） ──
+# ── 联机模式检测阈值 ──
 # 附近玩家距离阈值：存在非自身玩家且距离 < 该值 → 视为联机模式
 MULTIPLAYER_DIST_THRESHOLD = 200  # tile
 
@@ -85,7 +85,7 @@ class TerrariaAgent:
         self._log: List[Dict[str, Any]] = []
         self._running = False
 
-        # ── 死亡/复活状态（参照 Lumi_Nox bridge._is_dead） ──
+        # ── 死亡/复活状态（按生存循环惯例 bridge._is_dead） ──
         self._is_dead: bool = False
         self._death_message: str = ""  # 最后一条死亡信息
         self._death_position: Optional[tuple] = None  # (tile_x, tile_y) 死亡位置
@@ -253,7 +253,7 @@ class TerrariaAgent:
         self.conn.close()
 
     async def _state_loop(self) -> None:
-        """定期刷新状态 + 死亡/复活/联机模式检测（参照 Lumi_Nox）"""
+        """定期刷新状态 + 死亡/复活/联机模式检测"""
         player_name = self._character_name()
         bus = get_event_bus()
         self.log(f"_state_loop 启动, player_name='{player_name}', running={self._running}")
@@ -314,7 +314,7 @@ class TerrariaAgent:
                     # 更新上一帧血量（供 service 暴跌检测）
                     self._last_hp = hp
 
-                    # ── 联机模式检测（参照 Lumi_Nox） ──
+                    # ── 联机模式检测 ──
                     nearby = st.get("nearby_players", []) or []
                     has_other = False
                     if nearby and isinstance(nearby, list):
@@ -379,7 +379,7 @@ class TerrariaAgent:
 
             await asyncio.sleep(self.cfg.get("state_tick_interval_seconds", 1.0))
 
-    # ── 事件处理（参照 Lumi_Nox bridge._on_combat_event） ──
+    # ── 事件处理（按生存循环惯例 bridge._on_combat_event） ──
 
     def _handle_mod_event(self, msg: dict) -> None:
         """处理模组主动推送的事件消息。

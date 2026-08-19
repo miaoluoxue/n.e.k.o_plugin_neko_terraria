@@ -65,7 +65,7 @@ class AutonomousBrain:
         ]
         self.bus.subscribe("interrupt", self._on_interrupt)
         self.bus.subscribe("combat_hit", self._on_combat_hit)
-        # 注册复活回调：复活后自动寻路找主人（参照 Lumi_Nox）
+        # 注册复活回调：复活后自动寻路找主人
         self.agent.on_respawn(self._on_respawn)
 
         # v0.7: 处境融合层（身体感×画面感×记忆 → 心情/台词/行为）
@@ -167,7 +167,7 @@ class AutonomousBrain:
             try:
                 state = self.agent.get_state()
                 # P0 优先级守卫：自保（喝药/逃跑）无条件优先 + 长期任务中遇怪战斗
-                # 参照 Lumi_Nox 主循环 P0 自保 > P1 战斗（不被任务占用抑制）
+                # 按生存循环惯例 主循环 P0 自保 > P1 战斗（不被任务占用抑制）
                 if await self._guard_check(state):
                     await asyncio.sleep(interval)
                     continue
@@ -188,7 +188,7 @@ class AutonomousBrain:
     async def _guard_check(self, state: Dict[str, Any]) -> bool:
         """无条件优先级守卫。返回 True 表示本轮已处理（跳过其余自主行为）。
 
-        v0.11（A2）：比照 Lumi 生存循环 P0/P1——
+        v0.11（A2）：按生存循环 P0/P1——
           P0 自保：HP<50% 喝药（独立动作，不打断任务）
           P1 战斗：无前台任务时打怪；有前台任务则只提醒不打断
         不再有敌就无限占 fast_think（那会吞掉主人的 finite 任务）。
@@ -238,7 +238,7 @@ class AutonomousBrain:
             except Exception:
                 pass
 
-        # ── P1 战斗：无前台任务才打（参照 Lumi P1 优先级，但可让路） ──
+        # ── P1 战斗：无前台任务才打（P1 优先级，但可让路） ──
         if enemies and not handled:
             ex = getattr(self.agent, "executor", None)
             fg_busy = bool(ex and ex.busy())
@@ -305,7 +305,7 @@ class AutonomousBrain:
         elif drive == "gather":
             await self._auto_task("自主储备材料", [{"action": "gather", "item": "wood", "amount": 15}])
         elif drive == "explore" and self.state.boredom > 0.55:
-            # v3.0 巡逻兜底（参照 Lumi P4）：主人 30 格内陪伴优先不巡逻
+            # v3.0 巡逻兜底（按巡逻兜底）：主人 30 格内陪伴优先不巡逻
             near_owner = False
             me = (state.get("tile_x", 0), state.get("tile_y", 0))
             for p in state.get("nearby_players", []) or []:
@@ -405,7 +405,7 @@ class AutonomousBrain:
         if self.state.boredom > 0.9:
             await self._auto_task("无聊储备", [{"action": "gather", "item": "wood", "amount": 20}])
 
-    # ── 复活后自动寻路找主人（参照 Lumi_Nox 死亡复活重置目标） ──
+    # ── 复活后自动寻路找主人（按生存循环惯例 死亡复活重置目标） ──
 
     def _on_respawn(self) -> None:
 

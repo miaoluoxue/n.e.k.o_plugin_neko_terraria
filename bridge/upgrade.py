@@ -1,6 +1,6 @@
 """英雄成长引擎（v0.10）：小猫娘自己也会变强 —— 周期扫配方、合成升级装备并换装。
 
-参照 Lumi_Nox TaskRunner.check_upgrade / UPGRADE_CHECK_INTERVAL：
+按生存循环惯例 TaskRunner.check_upgrade / UPGRADE_CHECK_INTERVAL：
 - 每 upgrade_interval_secs 检查一次 vs 当前手持/防具
 - 有可合成且防御/伤害更高的 → 合成 → auto_equip 穿戴上
 - 合成缺材料：能自己挖/砍优先补，否则保持静默（下次再来）

@@ -21,7 +21,7 @@ class CombatEngine:
         self._blacklist: Dict[tuple, float] = {}
         self.blacklist_secs = 30
         self.no_dmg_timeout = 4
-        # ── 风筝参数（参照 Lumi_Nox KITE_IDEAL_DIST/KITE_TOO_CLOSE） ──
+        # ── 风筝参数（按生存循环惯例 KITE_IDEAL_DIST/KITE_TOO_CLOSE） ──
         self.kite_ideal_dist = 3.0  # 理想距离（曼哈顿）：站桩打
         self.kite_too_close = 1.0  # 过近：后退
         self.kite_too_far = 8.0  # 过远：追击靠近
@@ -47,13 +47,21 @@ class CombatEngine:
 
         check_task: 外部提供的"是否有更重要的前台任务"谓词。
           为真 → 战斗中放弃（打不死就不打，不占任务槽，交给守卫方调度）。
-          视频对照 Lumi_P1：战斗优先但可让路。
+          战斗优先但可让路。
         """
         px0 = int(state.get("tile_x", 0) or 0)
         py0 = int(state.get("tile_y", 0) or 0)
         target = self._pick_target(state, px0, py0)
         if not target:
             return False
+
+        # 战斗前选好武器（近战/远程/魔法/召唤中伤害最高，陪玩真实感）
+        try:
+            life = getattr(self.agent, "life", None)
+            if life is not None:
+                await life.select_tool("weapon")
+        except Exception:
+            pass
 
         slot = int(target.get("slot", 0) or 0)
         start = time.time()

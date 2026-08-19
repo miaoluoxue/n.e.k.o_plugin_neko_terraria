@@ -1,6 +1,6 @@
 """状态快照周期推 + 游戏上下文注入 LLM + 主动 nudge + 事件发射器。
 
-设计（参照 Lumi_Nox）：
+设计：
 - 游戏状态以 read 模式推给 LLM，不强制回复
 - 紧急事件（低血/Boss）注入 InteractionEngine，统一管理响应
 - GameEventEmitter 覆盖 19 种日常事件，自然语言叙事

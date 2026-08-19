@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 def build_anchor_msg(agent: Any,
                      goal_info: Optional[Dict[str, Any]] = None) -> str:
-    """紧凑一行状态锚点，参照 Lumi_Nox 拼入 user_input。
+    """紧凑一行状态锚点，按生存循环惯例 拼入 user_input。
 
     数据源对齐 mod 真实返回（get_state + 背包快照），并包含
     "我在干什么"（第一人称能力认知）。

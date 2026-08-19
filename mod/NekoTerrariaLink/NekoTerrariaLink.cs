@@ -174,7 +174,7 @@ namespace NekoTerrariaLink
 
         internal void EventMonitorTick()
         {
-            ProcessCommandQueue();   // 命令主线程执行（LumiBridge 架构）
+            ProcessCommandQueue();   // 命令主线程执行（架构）
             // 无客户端连接时不检测（省帧开销）
             if (_activeStream == null) return;
             var p = Main.LocalPlayer;
@@ -1280,7 +1280,7 @@ namespace NekoTerrariaLink
         }
 
         // ══════════════════════════════════════════════════════════
-        // 流式导航（参照 Lumi_Nox）：BFS 寻路 + 逐点执行 + 状态流回传
+        // 流式导航：BFS 寻路 + 逐点执行 + 状态流回传
         // 协议：navigate_stream 命令 → 推 {"type":"event","event":"nav_moving|nav_arrived|nav_stuck|nav_timeout",x,y}
         //       最终带 req_id 响应（ok）。Python 侧订阅 nav_* 事件流，可中断。
         // ══════════════════════════════════════════════════════════
@@ -1309,7 +1309,7 @@ namespace NekoTerrariaLink
             catch { }
         }
 
-        /// <summary>路径点动作类型（移植 MoreAIPlayer CompanionPathfinder）。</summary>
+        /// <summary>路径点动作类型（路径点动作类型）。</summary>
         internal enum NavAction { Move, DropThroughPlatform }
 
         /// <summary>路径点（feet 语义）：X=脚底列，Y=脚底行（支撑在 Y+1）。
@@ -1324,7 +1324,7 @@ namespace NekoTerrariaLink
             public override int GetHashCode() => X * 65536 + Y;
         }
 
-        /// <summary>移动能力（动态跳高，移植 LumiBridge）：一次空中段最大上升/水平跨越。</summary>
+        /// <summary>移动能力（动态跳高，移植 Bridge）：一次空中段最大上升/水平跨越。</summary>
         private struct MovementCaps
         {
             public int MaxRise;
@@ -1340,7 +1340,7 @@ namespace NekoTerrariaLink
             return new MovementCaps { MaxRise = maxRise, MaxGap = maxGap };
         }
 
-        /// <summary>实际最大跳高（格）：动力段（jumpSpeed×jumpHeight 帧）+ 惯性滑行模拟（移植 LumiBridge）。</summary>
+        /// <summary>实际最大跳高（格）：动力段（jumpSpeed×jumpHeight 帧）+ 惯性滑行模拟（移植 Bridge）。</summary>
         private static int MaxJumpHeight(Player p)
         {
             float jumpSpeed = Player.jumpSpeed;      // 配饰可修改
@@ -1382,7 +1382,7 @@ namespace NekoTerrariaLink
             return false;
         }
 
-        /// <summary>A* 寻路（feet 语义，移植 MoreAIPlayer/LumiBridge）：
+        /// <summary>A* 寻路（feet 语义，移植）：
         /// 边 = Walk(含一步台阶)/悬崖下落/平台下落/跳跃(带垂直走廊检查 + 跳跃高度编码)。
         /// 目标宽松判定 |dx|&lt;=1, |dy|&lt;=2。</summary>
         private static List<NavPoint> FindPathAStar(int x0, int y0, int x1, int y1,
@@ -1453,7 +1453,7 @@ namespace NekoTerrariaLink
         private static float H(int x, int y, int tx, int ty) =>
             Math.Abs(tx - x) + Math.Abs(ty - y) * 2f;
 
-        /// <summary>生成邻居（feet 语义，移植 MoreAIPlayer/LumiBridge）：Walk/Fall/Drop/Jump。
+        /// <summary>生成邻居（feet 语义，移植）：Walk/Fall/Drop/Jump。
         /// 元组第 5 项 = 跳跃高度（格），执行器按帧表精确跳跃。</summary>
         private static void GenerateNeighbors(int x, int y, MovementCaps caps,
             bool allowPlatformDrop, int maxDropTiles, List<(int, int, float, NavAction, int)> result)
@@ -1530,13 +1530,13 @@ namespace NekoTerrariaLink
             var t = Main.tile[x, y];
             if (t == null || !t.HasTile) return false;
             int type = t.TileType;
-            // 门（10/11/388/389）、平台（19）、笼子（51/52/382/385/387）可穿过（LumiBridge 三分类）
+            // 门（10/11/388/389）、平台（19）、笼子（51/52/382/385/387）可穿过（三分类）
             if (type == 10 || type == 11 || type == 19 || type == 51 || type == 52
                 || type == 382 || type == 385 || type == 387 || type == 388 || type == 389) return false;
             return true;
         }
 
-        /// <summary>OneWay 平台（可站立、可按↓穿过）——参照 Lumi_Nox 的 Tile 三分类。</summary>
+        /// <summary>OneWay 平台（可站立、可按↓穿过）——按生存循环惯例 的 Tile 三分类。</summary>
         internal static bool IsPlatform(int x, int y)
         {
             if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) return false;
@@ -1725,6 +1725,11 @@ namespace NekoTerrariaLink
                 var entry = new Dict {
                     ["id"] = it.type, ["stack"] = it.stack, ["inv_slot"] = i,
                     ["name"] = it.Name, ["defense"] = it.defense,
+                    // 工具/武器属性：use(melee/ranged/magic/tool…) + 伤害/镐力/斧力
+                    ["use"] = ItemUse(it),
+                    ["damage"] = it.damage,
+                    ["pick"] = it.pick,
+                    ["axe"] = it.axe,
                 };
                 if (i >= 0 && i < 10) hotbar.Add(entry);
                 else if (i >= 10 && i < 50) inv.Add(entry);
@@ -1764,7 +1769,7 @@ namespace NekoTerrariaLink
             return true;
         }
 
-        /// <summary>原生物品挖掘（LumiBridge 移植）：自动选镐子 → PreItemCheck 修正光标 →
+        /// <summary>原生物品挖掘（mod 原生能力）：自动选镐子 → PreItemCheck 修正光标 →
         /// controlUseItem 持续挖（工具动画/消耗/属性）。不可挖 tile 返回 false。</summary>
         private bool DigTile(Dict cmd)
         {
@@ -1790,7 +1795,7 @@ namespace NekoTerrariaLink
             return true;
         }
 
-        /// <summary>tile 可挖性检查（LumiBridge TrySetDigTarget 简化）：树/箱子/祭坛/仙人掌等
+        /// <summary>tile 可挖性检查（Bridge TrySetDigTarget 简化）：树/箱子/祭坛/仙人掌等
         /// 锚点类 tile 不可挖（挖了也不掉落/卡动画）。</summary>
         private static bool TrySetDigTarget(int x, int y)
         {
@@ -2165,7 +2170,7 @@ namespace NekoTerrariaLink
             });
         }
 
-        /// <summary>矿石 tile 类型表（Main.tileOre 在 1.4.5 不存在，用显式列表；Lumi find_trees 同款扫描）。</summary>
+        /// <summary>矿石 tile 类型表（Main.tileOre 在 1.4.5 不存在，用显式列表； find_trees 同款扫描）。</summary>
         private static readonly int[] OreTileTypes = {
             TileID.Copper, TileID.Tin, TileID.Iron, TileID.Lead, TileID.Silver, TileID.Tungsten,
             TileID.Gold, TileID.Platinum, TileID.Meteorite, TileID.Demonite, TileID.Crimtane,
@@ -2173,7 +2178,7 @@ namespace NekoTerrariaLink
             TileID.Orichalcum, TileID.Adamantite, TileID.Titanium, TileID.Chlorophyte,
         };
 
-        /// <summary>扫描附近矿石（参照 Lumi find_trees）：返回最近 10 个矿坐标，
+        /// <summary>扫描附近矿石（参照  find_trees）：返回最近 10 个矿坐标，
         /// tile_type&gt;0 时只返回该类型（铁矿石 tile 类型 = 铁矿物品 id，Python 直接匹配）。</summary>
         private void SendOrePositions(NetworkStream s, long reqId, Dict cmd)
         {
@@ -2207,7 +2212,7 @@ namespace NekoTerrariaLink
             Send(s, new Dict { ["req_id"] = reqId, ["type"] = "ore_positions", ["ores"] = ores });
         }
 
-        /// <summary>扫描附近树木（Lumi find_trees 同款）：返回最近树的树根坐标。</summary>
+        /// <summary>扫描附近树木（ find_trees 同款）：返回最近树的树根坐标。</summary>
         private void SendTreePositions(NetworkStream s, long reqId, Dict cmd)
         {
             var p = Main.LocalPlayer;

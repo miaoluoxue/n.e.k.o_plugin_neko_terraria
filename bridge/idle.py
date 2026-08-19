@@ -1,6 +1,6 @@
 """空闲自驱引擎（v0.11 A4）：没人在指挥时猫娘也自己找事干，提供"陪玩感"。
 
-参照 Lumi_Nox bridge._run_survival_loop 的 multiplayer fallback：
+
 - 主人走远 → 追上去（迟滞带，防抖）
 - 周期就近挖矿（find_ore → dig_tile → 收集，背包计数确认）
 - 低亮度 → 掏火把照亮

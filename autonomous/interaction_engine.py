@@ -612,7 +612,7 @@ class InteractionEngine:
         return delta
 
     def _event_urge_boost(self, evt: Dict) -> float:
-        """事件对 urge 的加成。参照 Lumi_Nox 补全日常事件 boost。"""
+        """事件对 urge 的加成。按生存循环惯例 补全日常事件 boost。"""
         etype = evt.get("type", "")
         intensity = evt.get("intensity", 0.5)
         boosts = {

@@ -20,15 +20,28 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 工具名关键词
+# 工具名关键词（无 use 字段时按名字兜底）
 _PICK_KW = ("镐", "pick")
 _AXE_KW = ("斧", "axe")
-_ROD_KW = ("钓竿", "钓竿", "fishing")
+_ROD_KW = ("钓竿", "鱼竿", "fishing")
 _SWORD_KW = ("剑", "sword", "刀")
+# 战斗武器 use 类型
+_MELEE_USE = ("melee",)
+_RANGED_USE = ("ranged",)
+_MAGIC_USE = ("magic",)
+_SUMMON_USE = ("summon",)
+_ALL_WEAPON_USE = _MELEE_USE + _RANGED_USE + _MAGIC_USE + _SUMMON_USE
 
 # 各生活动作节律（秒）
 CHOP_INTERVAL = 45.0
 FISH_INTERVAL = 90.0
+
+
+def _looks_like_weapon(name: str) -> bool:
+    """名字像武器（法杖/弓/枪/弩/鞭等，用于无 use 字段时兜底）。"""
+    kws = ("剑", "刀", "匕首", "法杖", "魔杖", "弓", "弩", "枪", "手枪", "步枪",
+           "鞭", "斧刃", "镐刃", "锤", "尖", "矛", "枪刃", "棒", "杖")
+    return any(k in name for k in kws)
 
 
 class LifeEngine:
@@ -40,26 +53,61 @@ class LifeEngine:
     # ---------------- 工具选择 ----------------
 
     async def select_tool(self, kind: str) -> bool:
-        """选中合适工具。kind: pick/axe/rod/sword。返回是否选到。"""
+        """选中合适工具/武器。kind:
+        - pick/axe/rod：挖矿/砍树/钓鱼
+        - weapon：战斗武器（近战/远程/魔法/召唤中伤害最高者）
+        - melee/ranged/magic/summon：指定武器类型
+        返回是否选到。
+        """
         inv = self.agent.get_inventory_sync()
-        kws = {"pick": _PICK_KW, "axe": _AXE_KW,
-               "rod": _ROD_KW, "sword": _SWORD_KW}.get(kind, _SWORD_KW)
-        # 先看手持栏
-        for it in (inv.get("hotbar", []) or []):
+        items = (inv.get("hotbar", []) or []) + (inv.get("inventory", []) or [])
+
+        # 工具类（挖矿/砍树/钓鱼）
+        if kind in ("pick", "axe", "rod"):
+            kws = {"pick": _PICK_KW, "axe": _AXE_KW,
+                   "rod": _ROD_KW}.get(kind, ())
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                slot = it.get("inv_slot")
+                if slot is None:
+                    continue
+                name = str(it.get("name", "") or "")
+                if any(k in name for k in kws):
+                    await self.agent.mod.select_item(slot)
+                    return True
+            return False
+
+        # 战斗武器：按类型挑伤害最高
+        weapon_uses = {
+            "weapon": _ALL_WEAPON_USE,
+            "melee": _MELEE_USE, "ranged": _RANGED_USE,
+            "magic": _MAGIC_USE, "summon": _SUMMON_USE,
+        }.get(kind, _ALL_WEAPON_USE)
+        best_slot, best_dmg = None, 0
+        for it in items:
             if not isinstance(it, dict):
                 continue
-            name = str(it.get("name", "") or "")
-            if any(k in name for k in kws) and it.get("inv_slot") is not None:
-                await self.agent.mod.select_item(it["inv_slot"])
-                return True
-        # 再看主背包
-        for it in (inv.get("inventory", []) or []):
-            if not isinstance(it, dict):
+            slot = it.get("inv_slot")
+            if slot is None:
                 continue
-            name = str(it.get("name", "") or "")
-            if any(k in name for k in kws) and it.get("inv_slot") is not None:
-                await self.agent.mod.select_item(it["inv_slot"])
-                return True
+            use = str(it.get("use", "") or "")
+            if use:
+                # 有 use 字段：按武器类型匹配（法杖/弓/枪/剑都是 weapon 类）
+                if use not in weapon_uses:
+                    continue
+            else:
+                # 无 use 字段：按名字猜是不是武器
+                name = str(it.get("name", "") or "")
+                if not _looks_like_weapon(name):
+                    continue
+            dmg = int(it.get("damage", 0) or 0)
+            if dmg > best_dmg:
+                best_dmg = dmg
+                best_slot = slot
+        if best_slot is not None:
+            await self.agent.mod.select_item(best_slot)
+            return True
         return False
 
     # ---------------- 砍树 ----------------
@@ -121,50 +169,69 @@ class LifeEngine:
     # ---------------- 钓鱼 ----------------
 
     async def fish(self, attempts: int = 3) -> bool:
-        """在水边钓鱼：找水域 → 走到岸边 → 甩竿 → 等待 → 收杆。"""
+        """在水边钓鱼：选钓竿 → 感知生物群系找对应水域 → 岸边甩竿 → 等待 → 收杆。
+
+        泰拉瑞亚钓鱼分三类水域，出的鱼不同：
+        - 地表层水域：普通鱼（鲈鱼等）
+        - 地下/洞穴层水域：岩层鱼（蝙蝠鱼等）
+        - 特殊生物群系水域：丛林/雪地/腐化/神圣/地狱 特有鱼
+        鱼饵（蚯蚓/萤火虫/龙虾）是消耗品，use_item 朝水会自动消耗背包鱼饵。
+        """
         # 选钓竿
         if not await self.select_tool("rod"):
             self.agent.log("没有钓竿，钓不了鱼~", "warn")
             return False
 
+        # 感知当前生物群系（决定钓什么水域的鱼）
+        try:
+            st = self.agent.get_state()
+            biome = str(st.get("biome", "") or "")
+        except Exception:
+            biome = ""
+        # 当前已在地下/特殊群系 → 就地钓（更容易钓到对应鱼）
+        prefer_here = any(k in biome for k in ("地下", "洞穴", "地狱", "丛林", "雪地", "腐化", "猩红", "神圣"))
+
         water = await self.agent.mod.find_water(radius=30)
+        if not water:
+            # 特殊群系下没水 → 放宽找水范围
+            water = await self.agent.mod.find_water(radius=60)
         if not water:
             self.agent.log("附近没有水域，找不到钓鱼的地方~", "warn")
             return False
 
         spot = water[0]
         wx, wy = int(spot.get("x", 0)), int(spot.get("y", 0))
-        # 走到水面旁的岸边（水面格上方一格是空气，玩家站水面旁）
+        # 走到水面旁的岸边
         shore_x = wx + 2  # 站水面格旁边
         try:
             await self.agent.navigate_to(shore_x, wy, timeout=15)
         except Exception:
             pass
 
-        self.agent.log("找个水边甩一竿~", "life")
+        where = biome or "普通水域"
+        self.agent.log(f"找个{where}水边甩一竿~", "life")
         caught = False
         for _ in range(attempts):
             if self.agent.executor and self.agent.executor.should_stop():
                 break
-            # 甩竿（use_item 朝水面）
+            # 甩竿（use_item 朝水面，自动消耗背包鱼饵）
             try:
                 await self.agent.mod.use_item(wx, wy)
             except Exception:
                 pass
-            # 等鱼上钩（模拟甩竿等待）
+            # 等鱼上钩
             await asyncio.sleep(2.5)
-            # 收杆（再点一次）
+            # 收杆
             try:
                 await self.agent.mod.use_item(wx, wy)
             except Exception:
                 pass
             caught = True
             await asyncio.sleep(1.0)
-            # 看看背包有没有新鱼（简化：有背包变化就算有收获）
             if self.agent.executor and self.agent.executor.should_stop():
                 break
         if caught:
-            self.agent.log("钓了一会儿鱼~", "life")
+            self.agent.log(f"在{where}钓了一会儿鱼~", "life")
             try:
                 await self.agent.send_chat("钓到鱼了喵～")
             except Exception:

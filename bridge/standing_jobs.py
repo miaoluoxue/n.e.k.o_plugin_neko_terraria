@@ -20,7 +20,7 @@ from ..polish.human_timing import HumanTiming
 
 logger = logging.getLogger(__name__)
 
-# 跟随参数 → 迟滞带跟随（hysteresis），参照 Lumi_Nox bridge.py
+# 跟随参数 → 迟滞带跟随（hysteresis），按生存循环惯例 bridge.py
 # 防止在边界反复横跳：走到 STOP 以内才停，走远到 TRIGGER 才追
 FOLLOW_TRIGGER_DIST = 60   # 距离超过这个就追上去（大范围跟随）
 FOLLOW_STOP_DIST = 15      # 距离小于这个就停下（大范围跟随）
@@ -105,7 +105,7 @@ class StandingJobs:
         except Exception:
             pass
 
-    # ---------------- 跟着我：迟滞带跟随（参照 Lumi_Nox bridge.py） ----------------
+    # ---------------- 跟着我：迟滞带跟随（按生存循环惯例 bridge.py） ----------------
     # 原理：
     #   - 距离 > trigger_dist(默认60格) → 开始追
     #   - 距离 < stop_dist(默认15格)    → 停下
@@ -191,7 +191,7 @@ class StandingJobs:
             # 持续追
             task.beat(f"离主人 {int(dist)} 格，追上去")
             try:
-                # v0.8 实时跟随（LumiBridge 代际接管）：fire-and-forget 流式导航，
+                # v0.8 实时跟随（代际接管）：fire-and-forget 流式导航，
                 # 每轮（0.6s）更新目标——主人走动 AI 立刻追，不再阻塞等 15 秒。
                 # C# 侧路径代际（navGen）保证新导航接管时旧任务不误清路径。
                 await self.agent.mod.navigate_stream_fire(ox, oy)

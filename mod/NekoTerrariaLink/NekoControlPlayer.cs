@@ -30,7 +30,7 @@ namespace NekoTerrariaLink
         internal List<NekoTerrariaLink.NavPoint> navPath;  // A* 导航路径（ModPlayer 逐帧推进）
         public int navIdx;
         public int navGen;   // 路径代际：fire-and-forget 导航防旧任务误清新路径
-        public int digTargetX = -1, digTargetY = -1;   // 原生物品挖掘目标（LumiBridge PreItemCheck）
+        public int digTargetX = -1, digTargetY = -1;   // 原生物品挖掘目标（挖掘目标修正）
 
         // ── 导航控制注入 ──
         // 联机模式下移动由服务器结算：客户端通过 NetMessage.SendData(13)（control 包）
@@ -67,7 +67,7 @@ namespace NekoTerrariaLink
             }
         }
 
-        /// <summary>PostUpdateRunSpeeds（LumiBridge 失焦方案）：ResetControls/hasFocus 之后、
+        /// <summary>PostUpdateRunSpeeds（失焦方案）：ResetControls/hasFocus 之后、
         /// HorizontalMovement 之前注入 control——原生物理（加速度/翅膀/坐骑），direction 自动，
         /// 焦点无关。导航路径 + move 命令都走这里。</summary>
         public override void PostUpdateRunSpeeds()
@@ -94,7 +94,7 @@ namespace NekoTerrariaLink
                 if (dx < 0) p.controlLeft = true;
                 else if (dx > 0) p.controlRight = true;
 
-                // 跳跃：路径点编码 Jump 高度 → 帧表精确按帧（LumiBridge 移植）
+                // 跳跃：路径点编码 Jump 高度 → 帧表精确按帧（mod 原生能力）
                 if (dy < -2 && _jumpFrames <= 0 && g.Jump > 0)
                 {
                     var tbl = JumpFrameTable();
@@ -171,7 +171,7 @@ namespace NekoTerrariaLink
             NetMessage.SendData(MessageID.PlayerControls, -1, -1, null, p.whoAmI);
         }
 
-        /// <summary>跳跃帧表：跳 h 格需要按住 jump 几帧（移植 LumiBridge BuildJumpFrameTable）。
+        /// <summary>跳跃帧表：跳 h 格需要按住 jump 几帧（按帧表）。
         /// 模拟动力段（jumpSpeed×jumpHeight 帧）+ 惯性滑行 + 重力，返回"帧数→高度"映射。</summary>
         private int[] JumpFrameTable()
         {
@@ -204,7 +204,7 @@ namespace NekoTerrariaLink
         private int _jumpFrames;
         private int[] _jumpTable;
 
-        /// <summary>PreItemCheck（LumiBridge 移植）：修正挖掘/放置光标到目标 tile，
+        /// <summary>PreItemCheck（mod 原生能力）：修正挖掘/放置光标到目标 tile，
         /// 配合 controlUseItem 使用原生物品（镐子动画/消耗/工具属性）。</summary>
         public override bool PreItemCheck()
         {
