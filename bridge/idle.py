@@ -151,6 +151,18 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
             agent.log(f"空闲挖矿异常: {e}", "warn")
         return
 
+    # ── P1.5 周期捡掉落物（探索的奖励：掉落物/战利品主动收集） ──
+    if ctx["cycle"] % 15 == 0 and dist < 40:
+        try:
+            collected = await agent.mod.collect_items(radius=500)
+            if collected > 0 and ctx["cycle"] % 60 == 0:
+                agent.log(f"捡了 {collected} 个掉落物", "item")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return
+
     # ── P2 照明：低亮度 → 掏火把照亮 ──
     if ctx["cycle"] % LIGHT_CHECK_INTERVAL == 0:
         b = st.get("brightness", 1.0)
