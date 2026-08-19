@@ -107,9 +107,10 @@ class SceneClassifier:
             if "guard" in kinds:
                 return "combat"
 
-        # 从速度判断赶路
-        vel = state.get("velocity", 0)
-        if isinstance(vel, (int, float)) and abs(vel) > 3:
+        # 从速度判断赶路（#93: mod 状态键是 velocity_x/velocity_y，velocity 不存在）
+        vx = state.get("velocity_x", 0) or 0
+        vy = state.get("velocity_y", 0) or 0
+        if abs(vx) > 3 or abs(vy) > 3:
             return "travel"
 
         if state.get("is_building", False):
@@ -470,7 +471,12 @@ class InteractionEngine:
         - blind：插件直出短句（危险场景），emergency 优先级，低延迟
         - 静默窗：主人刚说完话（20s 内）非紧急主动开口降级为 read 上下文
         """
-        if not text or time.time() < self._speech_cooldown_until:
+        if not text:
+            return
+        # #95: read 是"上下文数据"（任务进度/画面感知/目标状态），不应被说话冷却拦截——
+        # 否则猫娘正在干活时所有 read 感知全被吞，宿主 LLM 看不到进行中的事。
+        # blind 是紧急短句（低延迟）也不受冷却限制。只有 respond（主动开口）受冷却约束。
+        if behavior == "respond" and time.time() < self._speech_cooldown_until:
             return
 
         # v0.7 静默窗：主人刚说话，非紧急不打扰（blind 危险短句例外）

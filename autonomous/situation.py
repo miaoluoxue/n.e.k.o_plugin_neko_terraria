@@ -103,8 +103,12 @@ class SituationEngine:
 
     async def _tick(self) -> None:
         brain = self.brain
-        if brain and brain.occupied():
-            return  # 有任务/战斗时不打扰
+        # #94: 只在前台任务忙时让路——长期任务（跟随/挖矿）不阻塞处境层，
+        # 否则猫娘一跟随就永久失去处境感知/主动说话（陪伴感核心）。
+        if brain:
+            ex = getattr(self.agent, "executor", None)
+            if ex and ex.busy():
+                return
 
         state = {}
         try:

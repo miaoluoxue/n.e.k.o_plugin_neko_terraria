@@ -139,7 +139,11 @@ class AutonomousBrain:
         interval = self.cfg.get("state_tick_interval_seconds", 1.0)
         while self.running:
             try:
-                self.state.tick(has_stimulus=self.occupied())
+                # 刺激源只看前台任务——长期任务（跟随/挖矿）是常态陪伴，不算"刺激"；
+                # 否则跟随中 boredom 永远下降，_llm_think 永不触发，自主思考/情感交互全停。
+                ex = getattr(self.agent, "executor", None)
+                has_stimulus = bool(ex and ex.busy())
+                self.state.tick(has_stimulus=has_stimulus)
                 # v0.7: Heart 依恋值——主人同屏陪伴增长 / 冷落衰减（每 30s 一次冷落检查）
                 heart = getattr(self, "heart", None)
                 if heart:
@@ -168,7 +172,9 @@ class AutonomousBrain:
                     await asyncio.sleep(interval)
                     continue
                 # 有前台任务在执行时其余自主行为让位（避免抢控制权）
-                if self.occupied():
+                # 长期任务（跟随/挖矿）不阻塞自主行为——否则跟随中猫娘不会自己打架/挖矿
+                ex = getattr(self.agent, "executor", None)
+                if ex and ex.busy():
                     await asyncio.sleep(interval)
                     continue
                 drive = self.motivation.update(state, self.state.boredom)
@@ -266,13 +272,17 @@ class AutonomousBrain:
 
     async def _act_on_drive(self, drive: str, state: Dict[str, Any]) -> None:
         await asyncio.sleep(self.timing.reaction_delay())
-        if self.occupied():
+        # 只被前台任务阻塞——长期任务（跟随/挖矿）不拦截自主行为
+        ex = getattr(self.agent, "executor", None)
+        if ex and ex.busy():
             return
         if self.attention.should_drift():
             return
 
         players = state.get("nearby_players", [])
-        if players and drive != "combat":
+        # #96: 只有社交驱动才跟随主人——否则有主人在场时 gather/explore/comfort
+        # 全被 follow_player 抢占（前台任务占用 executor），挖矿/探索自主动机永不执行。
+        if players and drive == "social":
             ppos = (players[0]["tile_x"], players[0]["tile_y"])
             await self.agent.follow_player(ppos)
             if self.occupied():
@@ -285,7 +295,7 @@ class AutonomousBrain:
             finally:
                 self._busy = False
         elif drive == "comfort":
-            hp = state.get("life", 100)
+            hp = state.get("hp", 100)
             max_hp = state.get("max_life", 100) or 100
             if hp < max_hp * 0.5:
                 if await self.agent.heal_self():
@@ -337,8 +347,9 @@ class AutonomousBrain:
                 if not self.running:
                     break
 
-                # 有任务在执行、有主人在交互 → 不打扰
-                if self.occupied():
+                # 有前台任务在执行 → 不打扰（长期任务/跟随是常态，不阻塞自主思考）
+                ex = getattr(self.agent, "executor", None)
+                if ex and ex.busy():
                     continue
 
                 # 无聊度太低也没必要
