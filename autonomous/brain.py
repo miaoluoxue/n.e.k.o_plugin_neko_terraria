@@ -303,8 +303,11 @@ class AutonomousBrain:
                     near_owner = True
                     break
             if not near_owner:
+                # #15: target 不能是 "nearby"（会落到 mine_target("nearby") 挖空气）——
+                # 改为随机方向探索，或地下。
                 await self.agent.send_chat("有点无聊，我去周围转转~")
-                await self.agent.submit_goal(Goal(goal_type="explore", target="nearby", reason="无聊探索"))
+                tgt = random.choice(["left", "right", "地下"])
+                await self.agent.submit_goal(Goal(goal_type="explore", target=tgt, reason="无聊探索"))
         elif drive == "social" and players and random.random() < 0.2:
             await self.agent.send_chat("主人在这呀，我跟着你~")
 

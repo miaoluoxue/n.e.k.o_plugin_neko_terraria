@@ -8,7 +8,7 @@
 
 import time
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 

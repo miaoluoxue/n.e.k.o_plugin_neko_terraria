@@ -74,8 +74,9 @@ class Connection:
     async def request_mod(self, cmd: dict, timeout: float = 3.0) -> Optional[dict]:
         """向 mod 接口发送 JSON 命令并等待回执（独立读循环按 req_id 分发）。
 
-        协议一次一条命令：发送 + 等待在锁内串行，避免并发写乱序。
-        低优大请求先等一拍让高优插队（A6）。
+        #5: 锁只保护【发送写操作】——发送完立即释放，响应等待在锁外并发进行。
+        这样一条大请求（enum_items/get_recipes）在等待响应期间，
+        其他命令（move/navigate/战斗/chat）仍能立刻发送，不再串行化阻塞。
         """
         if not self._mod_writer:
             return None
@@ -100,15 +101,22 @@ class Connection:
                 f"[conn] request_mod req_id={req_id} cmd={cmd.get('cmd')} "
                 f"loop_id={id(loop)} reader_id={id(self._mod_reader)}"
             )
-            await self._send_mod_raw(cmd)
-            try:
-                resp = await asyncio.wait_for(fut, timeout=timeout)
-                return resp
-            except asyncio.TimeoutError:
-                log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
-                return None
-            finally:
-                self._pending.pop(req_id, None)
+            sent = await self._send_mod_raw(cmd)
+
+        # 发送失败：立即返回，不让命令空等 timeout（#5 次生问题）
+        if not sent:
+            self._pending.pop(req_id, None)
+            return None
+
+        # 锁已释放，等待响应（独立读循环按 req_id 分发）
+        try:
+            resp = await asyncio.wait_for(fut, timeout=timeout)
+            return resp
+        except asyncio.TimeoutError:
+            log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
+            return None
+        finally:
+            self._pending.pop(req_id, None)
 
     # ===== 9877 Mod 接口通道 =====
 
@@ -184,19 +192,23 @@ class Connection:
             except Exception:
                 pass
 
-    async def _send_mod_raw(self, cmd: dict) -> None:
+    async def _send_mod_raw(self, cmd: dict) -> bool:
+        """发送一条命令。返回 True=写入成功，False=连接错误/未连接。"""
         if not self._mod_writer:
             log.warning("[conn] _send_mod_raw 失败: _mod_writer 为 None")
-            return
+            return False
         data = (json.dumps(cmd) + "\n").encode("utf-8")
         try:
             self._mod_writer.write(data)
             await self._mod_writer.drain()
             log.info(f"[conn] 已发送: {cmd.get('cmd')} req_id={cmd.get('req_id')}")
+            return True
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             log.warning(f"[conn] _send_mod_raw 连接错误: {e}")
+            return False
         except Exception as e:
             log.error(f"[conn] _send_mod_raw 异常: {type(e).__name__}: {e}")
+            return False
 
     # ===== 独立读循环（替代请求内读流） =====
 

@@ -107,7 +107,13 @@ class TaskExecutor:
         """执行一个任务。coro_fn 接收本 TaskInfo，可用 should_stop() 协作式退出。"""
         async with self._lock:
             if not self.can_start(source):
+                # #7: busy 拒绝也要发 interrupted 通知——否则 fire-and-forget 的
+                # LLM 工具（llm_mine/llm_task/llm_chain）会永久留下"进行中"的假任务，
+                # brain._on_executor_interrupted 永不触发。
                 cur = self._current.name if self._current else ""
+                self._log(f"任务被拒（忙）：{name}，当前「{cur}」", "warn")
+                await self.notify(
+                    "interrupted", name=name, reason=f"busy:当前正在做「{cur}」")
                 return {"ok": False, "status": "busy", "output": f"正忙着「{cur}」，这条先不接"}
             if self._current is not None:
                 await self.cancel_current(f"被{source}的「{name}」接管")

@@ -155,13 +155,21 @@ class TaskBrain:
             item = s.get("item", "")
             amt = int(s.get("amount", 1) or 1)
 
-            if action in ("mine", "gather"):
-                p.goals.append(Goal(goal_type="gather", target=item, amount=amt,
+            if action == "mine":
+                # 真挖矿：goal_type 用 "mine"，走 task_chain 默认挖矿流程（find_ore→dig→计数）
+                p.goals.append(Goal(goal_type="mine", target=item, amount=amt,
                                     reason=goal_text,
                                     report_fail=f"挖 {item} 没成功，主人"))
                 p.outline.append(f"挖{item}x{amt}")
-            elif action == "craft":
+            elif action == "gather":
+                # 纯收集掉落物：goal_type 用 "gather"（task_chain 的 gather 分支）
                 p.goals.append(Goal(goal_type="gather", target=item, amount=amt,
+                                    reason=goal_text,
+                                    report_fail=f"收集 {item} 没成功，主人"))
+                p.outline.append(f"收集{item}x{amt}")
+            elif action == "craft":
+                # 合成：goal_type 用 "craft" + craft_first，走 task_chain 合成流程（mod.craft）
+                p.goals.append(Goal(goal_type="craft", target=item, amount=amt,
                                     craft_first=True, reason=goal_text,
                                     report_fail=f"合成 {item} 失败了"))
                 p.outline.append(f"合成{item}x{amt}")
@@ -171,12 +179,20 @@ class TaskBrain:
                                     report_fail=f"没能取到 {item}"))
                 p.outline.append(f"取{item}x{amt}")
             elif action in ("climb", "goto"):
-                tgt = f"{s.get('x', 0)},{s.get('y', 0)}"
+                # #4: 步骤 schema 只有 {action,item,amount}，没有 x/y——
+                # 有坐标才用坐标，否则把目标名（地下/左/右/某物）交给 task_chain 按方向处理，
+                # 绝不回退到 (0,0)。
+                x, y = s.get("x"), s.get("y")
+                if x is not None and y is not None:
+                    tgt = f"{x},{y}"
+                else:
+                    tgt = item or "目标"
                 p.goals.append(Goal(goal_type=action, target=tgt, reason=goal_text,
                                     report_fail=f"我到不了 ({tgt})"))
                 p.outline.append(("爬到" if action == "climb" else "走到") + f"({tgt})")
             elif action == "give":
-                p.goals.append(Goal(goal_type="gather", target=item, amount=amt,
+                # 给主人：goal_type 用 "give"，走 task_chain 的 give 分支（equip.give_to_player）
+                p.goals.append(Goal(goal_type="give", target=item, amount=amt,
                                     deliver_to_player=True, reason=goal_text,
                                     report_fail=f"没能把 {item} 给你"))
                 p.outline.append(f"给主人{item}x{amt}")

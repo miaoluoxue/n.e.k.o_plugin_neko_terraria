@@ -174,16 +174,21 @@ class TaskChain:
         if goal.goal_type == "social":
             return True
 
-        # 爬升/移动：target 形如 "x,y"，走分段规划（中途平台多次钩锁）
+        # 爬升/移动：target 形如 "x,y" 走坐标；否则按目标名（方向词/某物）处理
         if goal.goal_type in ("climb", "goto"):
-            try:
-                sx, sy = goal.target.split(",")
-                tx, ty = int(sx.strip()), int(sy.strip())
-            except (ValueError, AttributeError):
-                return False
-            if goal.goal_type == "climb":
-                return await self.agent.climb_to(tx, ty)
-            return await self.agent.navigate_to(tx, ty)
+            tgt = goal.target or ""
+            if "," in tgt:
+                try:
+                    sx, sy = tgt.split(",")
+                    tx, ty = int(sx.strip()), int(sy.strip())
+                except (ValueError, AttributeError):
+                    tx = ty = None
+                if tx is not None and ty is not None:
+                    if goal.goal_type == "climb":
+                        return await self.agent.climb_to(tx, ty)
+                    return await self.agent.navigate_to(tx, ty)
+            # #4: 非坐标目标 → 方向词走 explore 语义，其他尝试找物
+            return await self._goto_by_name(goal, tgt)
 
         # 去箱子取物：先找到含该物的最近箱子，再取
         if goal.goal_type == "fetch":
@@ -217,6 +222,62 @@ class TaskChain:
         elif goal.equip_self:
             await self.equip.auto_equip()
         return True
+
+    # ---------------- 按目标名移动（#4 goto 无坐标时） ----------------
+
+    async def _goto_by_name(self, goal: Goal, tgt: str) -> bool:
+        """goto/climb 目标不是坐标时：方向词走 explore，其他找物导航。"""
+        try:
+            st = self.agent.get_state()
+            sx = int(st.get("tile_x", 0) or 0)
+            sy = int(st.get("tile_y", 0) or 0)
+        except Exception:
+            sx, sy = 0, 0
+
+        t = (tgt or "").strip()
+        # 方向词
+        if t in ("左", "左边", "left", "west"):
+            tx = sx + 100
+            return bool(await self.agent.navigate_to(tx, sy, timeout=30))
+        if t in ("右", "右边", "right", "east"):
+            tx = sx + 100
+            return bool(await self.agent.navigate_to(tx, sy, timeout=30))
+        if t in ("地下", "下方", "down", "underground"):
+            # 复用探索的下挖逻辑
+            return await self._explore(Goal(goal_type="explore", target="地下",
+                                            reason=goal.reason))
+        if t in ("上方", "上面", "up"):
+            ty = sy - 30
+            return bool(await self.agent.navigate_to(sx, ty, timeout=30))
+        # 目标物：找最近的该物品箱子/矿点导航过去
+        try:
+            ores = await self.agent.mod.find_ore(radius=60)
+            if ores:
+                # 尽量匹配目标物对应的矿（tile 类型），匹配不到就取最近的矿
+                from .item_npc_dict import tile_type_of
+                want = tile_type_of(t)
+                pick = None
+                for o in ores:
+                    if want and int(o.get("type", 0) or 0) == want:
+                        pick = o
+                        break
+                if pick is None and not want:
+                    pick = ores[0]
+                if pick is not None:
+                    return bool(await self.agent.navigate_to(
+                        pick["x"], pick["y"], timeout=30))
+        except Exception:
+            pass
+        # 兜底：向最近的玩家/出生方向挪动，至少不是 (0,0)
+        try:
+            players = st.get("nearby_players", []) or []
+            if players:
+                px = int(players[0].get("tile_x", sx) or sx)
+                py = int(players[0].get("tile_y", sy) or sy)
+                return bool(await self.agent.navigate_to(px, py, timeout=30))
+        except Exception:
+            pass
+        return False
 
     # ---------------- 探索（A3 诚实化） ----------------
 
@@ -255,15 +316,16 @@ class TaskChain:
                 mx = int(st.get("tile_x", 0) or 0)
                 my = int(st.get("tile_y", 0) or 0)
                 # 挖脚下 3 格（break_tile 由 C# 自动切镐；挖不动就停）
+                # #15: break 必须在 if 内——否则 dy=2/3 永不尝试，只挖 1 格就宣布完成
                 moved = False
                 for dy in range(1, 4):
                     try:
                         if await self.mod.break_tile(mx, my + dy):
                             down += 1
                             moved = True
-                        break
+                            break  # 挖通这一格，进入下一轮继续下挖
                     except Exception:
-                        break
+                        break  # 该格异常：停止尝试
                 if not moved:
                     break
                 await asyncio.sleep(0.6)

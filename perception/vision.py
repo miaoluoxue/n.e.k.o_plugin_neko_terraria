@@ -100,6 +100,8 @@ class VisualPerception:
         try:
             raw = await self._llm_vision(b64, VISION_ANALYSIS_PROMPT)
         except Exception:
+            # #10 附带问题：异常也要刷新节流时间，否则下一帧立刻重试，绕过 _min_interval
+            self._last_analysis_ts = time.monotonic()
             return
 
         self._last_analysis_ts = time.monotonic()
@@ -112,8 +114,10 @@ class VisualPerception:
         if self.agent:
             await self._cross_validate(report)
 
-        self._last_report = report
+        # #10: 必须先 emit（用旧的 _last_report 做变化检测）再赋值，
+        # 否则 _emit_events 里 prev_action/prev_scene 读到的就是 report 自身，变化永不触发。
         self._emit_events(report)
+        self._last_report = report
 
     @staticmethod
     def _parse_vision_response(raw: str) -> Optional[Dict[str, Any]]:

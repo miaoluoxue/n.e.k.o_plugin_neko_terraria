@@ -16,7 +16,9 @@ from ..polish.imperfections import ImperfectionInjector
 # 事件去重窗口（秒）
 EVENT_DEDUP_WINDOW: float = 60.0
 # v0.7 治理：事件最大存活时间（超过即丢弃——"小心！"晚播不如不播）
-EVENT_MAX_AGE: float = 8.0
+# #13: 场景 tick 间隔最大 15s（recovery）+ 人性化抖动，8s 会导致 idle/follow/travel
+# 场景里注入的事件大部分过期丢弃。提到 30s，覆盖最慢场景仍有余量。
+EVENT_MAX_AGE: float = 30.0
 # v0.7 治理：主人刚说完话的静默窗（秒）——窗内不主动开口
 OWNER_SPEECH_QUIET_WINDOW: float = 20.0
 
@@ -411,13 +413,9 @@ class InteractionEngine:
         # 2. 情绪衰减
         self.mood.decay_all()
 
-        # 3. 主人追踪（含背包变化好奇）
-        self.owner.update(state)
-        try:
-            inv = self.agent.get_inventory_sync()
-            self.owner.update_inventory(inv)
-        except Exception:
-            pass
+        # 3. 主人追踪（#12: 主人 = nearby_players 里最近玩家，不是猫娘自己。
+        #    主人背包 mod 不返回，不再喂猫娘背包，避免"主人背包多了矿"的假话。）
+        self.owner.update(self._extract_owner_state(state))
 
         # 4. 处理注入事件（先于 urge 计算，紧急事件走 immediate_respond 直推）
         await self._process_events()
@@ -516,6 +514,39 @@ class InteractionEngine:
             return self.agent.get_state()
         except Exception:
             return {}
+
+    def _extract_owner_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """#12: 从游戏状态里提取"主人"（最近的非自身玩家）的状态。
+
+        OwnerTracker 应追踪主人的位置/行为，而不是猫娘自己的（agent.get_state
+        返回的是猫娘；主人数据在 state['nearby_players']）。附近无玩家返回空。
+        """
+        if not state:
+            return {}
+        me_x = int(state.get("tile_x", 0) or 0)
+        me_y = int(state.get("tile_y", 0) or 0)
+        my_name = ""
+        try:
+            my_name = self.agent._character_name()
+        except Exception:
+            pass
+        best: Optional[Dict[str, Any]] = None
+        best_d = float("inf")
+        for p in (state.get("nearby_players", []) or []):
+            if not isinstance(p, dict):
+                continue
+            name = p.get("name", "")
+            if name and my_name and name == my_name:
+                continue  # 过滤猫娘自己
+            x = int(p.get("tile_x", 0) or 0)
+            y = int(p.get("tile_y", 0) or 0)
+            if x == 0 and y == 0:
+                continue  # 残留槽位
+            d = (x - me_x) ** 2 + (y - me_y) ** 2
+            if d < best_d:
+                best_d = d
+                best = {"tile_x": x, "tile_y": y}
+        return best or {}
 
     def _get_longterm_kinds(self) -> List[str]:
         try:
@@ -676,15 +707,33 @@ class InteractionEngine:
         """处理积压的事件（场景内独立处理，不进入 urge 计算流）。
 
         v0.7 治理：超过 EVENT_MAX_AGE 的事件直接丢弃（"小心！"晚播不如不播）。
+        #9：先冲刷超时的紧急缓冲（否则连续受击后一直安全，缓冲里的描述永远不播）。
+        #13：EVENT_MAX_AGE 已放大到覆盖最大场景 tick 间隔，避免事件在 idle/follow 等慢场景里全部过期。
         """
         try:
-            for _ in range(min(5, self._event_queue.qsize())):
+            await self._flush_emergency_buffer()
+            for _ in range(min(10, self._event_queue.qsize())):
                 evt = self._event_queue.get_nowait()
                 if time.time() - evt.get("ts", 0.0) > EVENT_MAX_AGE:
                     continue
                 await self._handle_event(evt)
         except asyncio.QueueEmpty:
             pass
+
+    async def _flush_emergency_buffer(self) -> None:
+        """#9: 紧急事件缓冲超时冲刷——连续危险后不再有新事件时，把攒下的描述播出去。"""
+        if not hasattr(self, "_emergency_buffer") or not self._emergency_buffer:
+            return
+        now = time.time()
+        if now - self._last_emergency < 10:
+            return
+        merged = "、".join(self._emergency_buffer)
+        self._emergency_buffer = []
+        self.mood.trigger("fear", 0.5)
+        self._danger_desc = merged
+        self._danger_ts = time.time()
+        self._danger_task = self._get_current_task_name() or ""
+        await self.push_speech(f"唔…{merged}，好疼", behavior="blind")
 
     async def _handle_event(self, evt: Dict) -> None:
         """事件分类处理：紧急强制回应，日常只 boost urge。"""

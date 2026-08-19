@@ -617,6 +617,23 @@ namespace NekoTerrariaLink
         private void SendCraft(NetworkStream s, long reqId, int n) =>
             Send(s, new Dict { ["req_id"] = reqId, ["crafted"] = n });
 
+        // #6: 把改世界/玩家/物品的命令投到主线程执行，避免 TCP 后台线程
+        // 操作 Terraria 主线程数据（WorldGen/QuickSpawnItem/player.armor 等）导致崩溃。
+        private void RunOnMain(NetworkStream s, long reqId, Func<bool> fn)
+        {
+            Main.QueueMainThreadAction(() =>
+            {
+                try
+                {
+                    SendAck(s, reqId, fn());
+                }
+                catch
+                {
+                    SendAck(s, reqId, false);
+                }
+            });
+        }
+
 
 
 
@@ -726,25 +743,27 @@ namespace NekoTerrariaLink
 
                 switch (type)
                 {
+                    // #6: 只改 ModPlayer 字段（move/hook）后台线程安全，保留原样；
+                    // 操作世界/玩家/物品/箱子的命令必须投主线程。
                     case "move": SendAck(stream, reqId, Move(cmd)); break;
-                    case "place_tile": SendAck(stream, reqId, PlaceTile(cmd)); break;
-                    case "break_tile": SendAck(stream, reqId, BreakTile(cmd)); break;
+                    case "place_tile": RunOnMain(stream, reqId, () => PlaceTile(cmd)); break;
+                    case "break_tile": RunOnMain(stream, reqId, () => BreakTile(cmd)); break;
                     case "hook": SendAck(stream, reqId, Hook(cmd)); break;
-                    case "use_item": SendAck(stream, reqId, UseItem(cmd)); break;
-                    case "select_item": SendAck(stream, reqId, SelectItem(cmd)); break;
+                    case "use_item": RunOnMain(stream, reqId, () => UseItem(cmd)); break;
+                    case "select_item": RunOnMain(stream, reqId, () => SelectItem(cmd)); break;
                     case "craft": CraftAsync(stream, reqId, cmd); break;
-                    case "equip": SendAck(stream, reqId, Equip(cmd)); break;
-                    case "give_item": SendAck(stream, reqId, GiveItem(cmd)); break;
-                    case "drop_item": SendAck(stream, reqId, DropItem(cmd)); break;
-                    case "use_item_slot": SendAck(stream, reqId, UseItemSlot(cmd)); break;
-                    case "dig_tile": SendAck(stream, reqId, DigTile(cmd)); break;
+                    case "equip": RunOnMain(stream, reqId, () => Equip(cmd)); break;
+                    case "give_item": RunOnMain(stream, reqId, () => GiveItem(cmd)); break;
+                    case "drop_item": RunOnMain(stream, reqId, () => DropItem(cmd)); break;
+                    case "use_item_slot": RunOnMain(stream, reqId, () => UseItemSlot(cmd)); break;
+                    case "dig_tile": RunOnMain(stream, reqId, () => DigTile(cmd)); break;
                     case "navigate_to": NavigateTo(stream, cmd, reqId); break;
                     case "navigate_stream": NavigateStream(stream, cmd, reqId); break;
                     case "send_chat": SendAck(stream, reqId, SendChatMessage(cmd)); break;
                     case "get_inventory": SendInventory(stream, reqId); break;
-                    case "enum_chests": SendChests(stream, reqId); break;
-                    case "store_item": SendAck(stream, reqId, StoreItem(cmd)); break;
-                    case "take_chest": SendAck(stream, reqId, TakeFromChest(cmd)); break;
+                    case "enum_chests": Main.QueueMainThreadAction(() => SendChests(stream, reqId)); break;
+                    case "store_item": RunOnMain(stream, reqId, () => StoreItem(cmd)); break;
+                    case "take_chest": RunOnMain(stream, reqId, () => TakeFromChest(cmd)); break;
                     case "get_recipes": RunInBackground(() => SendRecipes(stream, reqId, cmd.GetValue("cat")), "get_recipes"); break;
                     case "get_state": SendState(stream, reqId, cmd.GetValue("player_name")); break;
                     case "enum_items": RunInBackground(() => SendItemRegistry(stream, reqId), "enum_items"); break;
@@ -753,9 +772,9 @@ namespace NekoTerrariaLink
                     case "find_ore": SendOrePositions(stream, reqId, cmd); break;
                     case "get_server_info": SendServerInfo(stream, reqId); break;
                     case "join_server": SendAck(stream, reqId, JoinServer(cmd)); break;
-                    case "select_character": SendAck(stream, reqId, SelectCharacter(cmd)); break;
-                    case "damage_npc": SendAck(stream, reqId, DamageNpc(cmd)); break;
-                    case "warp": SendAck(stream, reqId, Warp(cmd)); break;
+                    case "select_character": RunOnMain(stream, reqId, () => SelectCharacter(cmd)); break;
+                    case "damage_npc": RunOnMain(stream, reqId, () => DamageNpc(cmd)); break;
+                    case "warp": RunOnMain(stream, reqId, () => Warp(cmd)); break;
                     case "get_network_info": SendNetworkInfo(stream, reqId); break;
                     case "join_status": SendJoinStatus(stream, reqId); break;
                     case "screenshot": SendScreenshot(stream, reqId); break;
@@ -1120,6 +1139,13 @@ namespace NekoTerrariaLink
             int stuckCounter = 0, lastPx = 0, lastPy = 0;
             while (steps < maxSteps)
             {
+                // #8: 被新导航接管（代际变化）→ 立即退出本线程，不再发 nav_* 事件。
+                // 否则僵尸监控线程会在后续 20s 内继续推 nav_moving/stuck/arrived，
+                // 导致 Python 侧 navigate_async 跨导航互相误判到达/超时，且 TCP 事件风暴。
+                if (ctrl.navGen != myGen)
+                {
+                    return;
+                }
                 int px = (int)(player.Center.X / 16), py = (int)(player.Bottom.Y / 16);
                 // 路径走完（ModPlayer 置空）且贴近目标 → 到达（须为本人路径，代际未变）
                 if (ctrl.navGen == myGen && ctrl.navPath == null && Math.Abs(px - tx) <= 1 && Math.Abs(py - tyFeet) <= 2)

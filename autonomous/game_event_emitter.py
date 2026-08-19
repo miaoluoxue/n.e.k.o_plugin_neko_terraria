@@ -261,11 +261,17 @@ class GameEventEmitter:
     def _check_danger_events(self, cur: Dict, prev: Dict, now: float) -> None:
         cur_hp = cur.get("hp", 100)
         max_hp = cur.get("max_life", 100) or 100
-        is_in_water = cur.get("in_water", False)
-        is_in_lava = cur.get("in_lava", False)
-        breath = cur.get("breath", 200)
-        on_ground = cur.get("on_ground", True)
-        fall_speed = cur.get("fall_speed", 0)
+        # #11: mod get_state 不返回 in_water/in_lava/breath/on_ground/fall_speed——
+        # 用真实键推导：grounded / velocity_y / movement_state / buffs。
+        # 浸水：movement_state 含 swim / 或 buff 含"潮湿/溺水"（原版无，退化为 false）
+        is_in_water = "swim" in str(cur.get("movement_state", "") or "").lower()
+        is_in_lava = any("lava" in str(b).lower() or "岩浆" in str(b)
+                         for b in (cur.get("buffs", []) or []))
+        breath = 200  # mod 不上报呼吸值，溺水检测退化（保留变量避免下游判断崩）
+        on_ground = bool(cur.get("grounded", True))
+        # 坠落：非地面且向下速度大（velocity_y>0 向下，像素/秒，>10*16≈160 算坠落）
+        vel_y = float(cur.get("velocity_y", 0) or 0)
+        fall_speed = max(0, vel_y)
         cooldown_ok = now - self._last_danger_time > self._danger_cooldown
         hp_ratio = cur_hp / max(max_hp, 1)
 
@@ -329,12 +335,12 @@ class GameEventEmitter:
                 EventType.IN_LAVA, intensity=0.85,
                 description="啊啊啊掉进岩浆了！好烫好烫！！")
 
-        # ── 坠落 ──
-        if not on_ground and fall_speed > 10 and cur_hp > 0 and self.interaction and cooldown_ok:
+        # ── 坠落（#11: fall_speed 阈值按像素速度，>160px/s 视为坠落） ──
+        if not on_ground and fall_speed > 160 and cur_hp > 0 and self.interaction and cooldown_ok:
             self._last_danger_time = now
             self._inject(
                 EventType.FALLING, intensity=0.55,
-                description=f"哇啊啊正在坠落！（速度{fall_speed}）要摔了！")
+                description=f"哇啊啊正在坠落！（速度{fall_speed:.0f}px/s）要摔了！")
 
     def _check_social_events(self, cur: Dict, prev: Dict, now: float) -> None:
         if now - self._last_social_time < self._social_cooldown:

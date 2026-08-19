@@ -164,7 +164,8 @@ async def _mine_job(agent, st: Dict[str, Any], mx: int, my: int) -> None:
         if iid < 0:
             continue
         try:
-            ores = await agent.mod.find_ore(radius=40, tile_type=iid)
+            from .item_npc_dict import tile_type_of
+            ores = await agent.mod.find_ore(radius=40, tile_type=tile_type_of(ore, iid))
         except Exception:
             ores = []
         if not ores:

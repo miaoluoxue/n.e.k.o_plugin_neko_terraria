@@ -54,7 +54,7 @@ class MiningEngine:
                     state = self.agent.get_state()
                 except Exception:
                     pass
-            mine = await self._find_target(state, iid)
+            mine = await self._find_target(state, iid, target_item)
             if mine is None:
                 return iid, mined  # 附近没有目标矿，诚实返回
             tx, ty = int(mine.get("x", 0)), int(mine.get("y", 0))
@@ -79,10 +79,17 @@ class MiningEngine:
                     break  # 连续挖不到：换下一个矿或直接返回
         return iid, mined
 
-    async def _find_target(self, state: Optional[Dict[str, Any]], iid: int) -> Optional[Dict[str, Any]]:
-        """找最近可挖矿点（含距离过滤）。"""
+    async def _find_target(self, state: Optional[Dict[str, Any]],
+                           iid: int, target_item: str = "") -> Optional[Dict[str, Any]]:
+        """找最近可挖矿点（含距离过滤）。
+
+        #14: tile_type 必须用 TileID（矿石方块类型），不是物品 ID——
+        C# find_ore 拿 tile_type 与 Main.tile[].TileType 比较（铁矿 TileID=7 ≠ ItemID=11）。
+        """
+        from .item_npc_dict import tile_type_of
+        tile = tile_type_of(target_item, iid)
         try:
-            ores = await self.mod.find_ore(radius=30, tile_type=iid if iid < 250 else 0)
+            ores = await self.mod.find_ore(radius=30, tile_type=tile)
         except Exception:
             ores = []
         if not ores:

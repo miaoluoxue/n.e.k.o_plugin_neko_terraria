@@ -65,6 +65,19 @@ class TaskCoordinator:
         if source == SRC_OWNER and inq_mgr and inq_mgr.has_pending:
             answered = inq_mgr.match_answer(text)
             if answered:
+                # #16: 语义确认询问存了 pending_intent —— 主人确认（非 hold）就执行原意图，
+                # 不再只回一句"好的主人~"就丢掉指令。
+                pending = None
+                if isinstance(getattr(answered, "context", None), dict):
+                    pending = answered.context.get("pending_intent")
+                hold = "hold" in (answered.answer or "")
+                if pending is not None and not hold:
+                    try:
+                        self.agent.log(
+                            f"主人确认了语义询问 → 执行原意图 mode={pending.mode}", "task")
+                        return await self._dispatch_result(pending, source, text)
+                    except Exception:
+                        pass
                 await self._announce_inquiry_answered(answered)
                 return {"ok": True, "status": "inquiry_answered",
                         "question": answered.question, "answer": answered.answer,
@@ -120,19 +133,27 @@ class TaskCoordinator:
                     "output": result.pre_reply,
                     "intent": result.to_dict()}
 
-        # 分发（兼容旧 Intent 接口字段）
+        return await self._dispatch_result(result, source, text)
+
+    async def _dispatch_result(self, result, source: str,
+                               raw_text: str = "") -> Dict[str, Any]:
+        """按 mode 分发一个 IntentResult（#16：语义确认后复用同一分发）。"""
         if result.mode == "stop":
-            self.agent.log(f"[coordinator.handle] 🛑 执行 stop", "info")
+            self.agent.log(f"[coordinator] 🛑 执行 stop", "info")
             return await self._do_stop(result)
         if result.mode == "longterm":
-            self.agent.log(f"[coordinator.handle] ⏳ 执行 longterm", "info")
+            self.agent.log(f"[coordinator] ⏳ 执行 longterm", "info")
             return await self._do_longterm(result)
         if result.mode == "finite":
-            self.agent.log(f"[coordinator.handle] 📝 执行 finite", "info")
+            self.agent.log(f"[coordinator] 📝 执行 finite", "info")
             return await self._do_finite(result, source)
-
+        if result.mode == "chat":
+            await self._do_chat(raw_text or result.raw, result)
+            return {"ok": True, "status": "chat", "mode": "chat",
+                    "output": result.pre_reply,
+                    "intent": result.to_dict()}
         # 认不出来：根据置信度决定是反问还是拒绝
-        return await self._handle_unknown(text, result)
+        return await self._handle_unknown(raw_text or result.raw, result)
 
     # ---------------- 闲聊处理 ----------------
 
@@ -354,10 +375,11 @@ class TaskCoordinator:
         if result.source == "semantic" and confidence >= 0.7:
             inq_mgr = getattr(self.agent, "inquiry", None)
             if inq_mgr and not inq_mgr.has_pending:
-                # 反问确认
+                # 反问确认（#16: 把待执行意图存进 context，主人确认后由 handle 执行）
                 inq = inq_mgr.ask(
                     f"喵～是不是像之前那样，{result.reason}呀？",
                     options=["是的", "不是"],
+                    context={"pending_intent": result},
                     timeout=30.0
                 )
                 if inq:
