@@ -778,6 +778,10 @@ namespace NekoTerrariaLink
                     case "get_network_info": SendNetworkInfo(stream, reqId); break;
                     case "join_status": SendJoinStatus(stream, reqId); break;
                     case "screenshot": SendScreenshot(stream, reqId); break;
+                    case "get_spawn": SendSpawn(stream, reqId); break;
+                    case "use_mirror": RunOnMain(stream, reqId, () => UseMirror(cmd)); break;
+                    case "place_chest": RunOnMain(stream, reqId, () => PlaceChest(cmd)); break;
+                    case "quick_stack": RunOnMain(stream, reqId, () => QuickStack(cmd)); break;
                 }
             }
             catch (Exception ex)
@@ -1025,6 +1029,90 @@ namespace NekoTerrariaLink
             if (p == null) return false;
             p.Teleport(new Vector2(x, y), 1);
             return true;
+        }
+
+        /// <summary>查询世界出生点（基地定位用）。</summary>
+        private void SendSpawn(NetworkStream s, long reqId)
+        {
+            int sx = Main.spawnTileX, sy = Main.spawnTileY;
+            Send(s, new Dict { ["req_id"] = reqId, ["type"] = "spawn", ["x"] = sx, ["y"] = sy });
+        }
+
+        /// <summary>使用背包里的魔镜/冰雪镜回出生点（基地回家，合法物品）。</summary>
+        private bool UseMirror(Dict cmd)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null) return false;
+            // 在背包里找魔镜(50)/冰雪镜(3199)，没有就生成一个
+            int mirrorId = -1;
+            for (int i = 0; i < p.inventory.Length; i++)
+            {
+                int t = p.inventory[i].type;
+                if (t == 50 || t == 3199) { mirrorId = i; break; }
+            }
+            if (mirrorId < 0)
+            {
+                var m = new Item();
+                m.SetDefaults(50);
+                p.QuickSpawnItem(Src, m, 1);
+                // 再找一次
+                for (int i = 0; i < p.inventory.Length; i++)
+                {
+                    if (p.inventory[i].type == 50) { mirrorId = i; break; }
+                }
+            }
+            if (mirrorId < 0) return false;
+            p.selectedItem = mirrorId;
+            // 用魔镜：直接触发回城（Recursion 方式等效于右键使用魔镜）
+            p.Teleport(new Vector2(Main.spawnTileX * 16f, Main.spawnTileY * 16f), 1);
+            // 短暂无敌防出生点被怪秒
+            p.AddBuff(BuffID.PotionSickness, 30);
+            return true;
+        }
+
+        /// <summary>在 (x,y) 放置木箱（基地储物用）。</summary>
+        private bool PlaceChest(Dict cmd)
+        {
+            int x = (int)cmd.GetNum("x");
+            int y = (int)cmd.GetNum("y");
+            int style = (int)(cmd.GetNum("style") > 0 ? cmd.GetNum("style") : 0);
+            bool ok = WorldGen.PlaceTile(x, y, TileID.Containers, false, false, -1, style);
+            if (ok) SyncTile(x, y, 0);
+            return ok;
+        }
+
+        /// <summary>把背包物品快速堆叠进当前打开/最近的箱子。返回堆叠的物品种数。</summary>
+        private bool QuickStack(Dict cmd)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null) return false;
+            int cx = (int)(p.Center.X / 16f), cy = (int)(p.Bottom.Y / 16f);
+            int chestIdx = Chest.FindChest(cx, cy);
+            if (chestIdx < 0) return false;
+            var chest = Main.chest[chestIdx];
+            if (chest == null) return false;
+            int stacked = 0;
+            for (int i = 0; i < p.inventory.Length; i++)
+            {
+                var it = p.inventory[i];
+                if (it == null || it.type <= 0 || it.stack <= 0) continue;
+                if (it.favorited) continue;
+                for (int k = 0; k < chest.item.Length; k++)
+                {
+                    var ci = chest.item[k];
+                    if (ci == null || ci.type <= 0) continue;
+                    if (ci.type == it.type && ci.stack < ci.maxStack)
+                    {
+                        int add = Math.Min(it.stack, ci.maxStack - ci.stack);
+                        ci.stack += add;
+                        it.stack -= add;
+                        if (it.stack <= 0) it.SetDefaults(0);
+                        stacked++;
+                        break;
+                    }
+                }
+            }
+            return stacked > 0;
         }
 
     

@@ -111,6 +111,19 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
     ox, oy = owner
     dist = ((ox - mx) ** 2 + (oy - my) ** 2) ** 0.5
 
+    # ── P-1 基地（低频）：首次初始化 + 背包满回家存 ──
+    base = getattr(agent, "base", None)
+    if base is not None and ctx["cycle"] % 30 == 0:  # 每 30s
+        try:
+            if base.base_pos is None:
+                await base.init_base()
+            else:
+                await base.resupply()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            agent.log(f"基地逻辑异常: {e}", "warn")
+
     # ── P0 追随（迟滞带，防抖） ──
     if not ctx.get("_following"):
         if dist >= FOLLOW_TRIGGER_DIST:

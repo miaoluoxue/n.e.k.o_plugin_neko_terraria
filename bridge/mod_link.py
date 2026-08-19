@@ -111,6 +111,31 @@ class ModLink:
             "item_id": item_id, "stack": stack})
         return bool(resp and resp.get("ok"))
 
+    # ── v0.5 基地系统能力（对应 Lumi init_base/go_home_and_resupply） ──
+
+    async def get_spawn(self) -> Optional[tuple]:
+        """查询世界出生点坐标 (tile_x, tile_y)。"""
+        resp = await self.conn.request_mod({"cmd": "get_spawn"}, timeout=3.0)
+        if resp and resp.get("x") is not None:
+            return int(resp.get("x", 0)), int(resp.get("y", 0))
+        return None
+
+    async def use_mirror(self) -> bool:
+        """使用魔镜/冰雪镜回出生点（合法物品，没有就生成一个）。"""
+        resp = await self.conn.request_mod({"cmd": "use_mirror"}, timeout=5.0)
+        return bool(resp and resp.get("ok"))
+
+    async def place_chest(self, x: int, y: int, style: int = 0) -> bool:
+        """在 (x,y) 放置木箱。"""
+        resp = await self.conn.request_mod({
+            "cmd": "place_chest", "x": x, "y": y, "style": style}, timeout=3.0)
+        return bool(resp and resp.get("ok"))
+
+    async def quick_stack(self) -> int:
+        """把背包物品快速堆叠进最近的箱子。返回堆叠的物品种数。"""
+        resp = await self.conn.request_mod({"cmd": "quick_stack"}, timeout=3.0)
+        return int(resp.get("ok", 0) or 0) if resp else 0
+
     async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
         resp = await self.conn.request_mod(
             {"cmd": "navigate_to", "x": x, "y": y, "timeout": timeout},
