@@ -38,14 +38,18 @@ class LifecycleMixin:
         self._service = TerrariaService(self, push_message=self.push_message)
 
     async def _load_config(self) -> None:
-        # plugin.toml [neko_terraria] 段优先级最高（覆盖已加载的 DEFAULTS + user_config）
-        # _config 与 agent.cfg / brain.cfg 共享同一引用，修改自动生效，无需手动 sync
-        # ★ 宿主 config.dump 是同步阻塞（timeout 参数无效），曾导致 _boot 卡死 11 分钟，
-        # 感知/情感系统全部未启动——to_thread 移出事件循环 + wait_for 强制超时
+        # plugin.toml [neko_terraria] 段覆盖默认配置。
+        # ★ 宿主的 config.dump 是同步阻塞且会**永久锁死线程**（timeout 参数无效，
+        #   线程无法取消）——曾导致 _boot 卡死 11 分钟、感知/情感/大脑全不启动。
+        #   彻底修复：不再调用 dump（宿主的 dump 线程锁无法安全绕过）。
+        #   _config 已在 __init__ 由 config_store.load_user_config() 填好
+        #   （DEFAULTS + 用户配置），plugin.toml 段覆盖属可选增强，跳过不影响功能。
         try:
-            cfg = await asyncio.wait_for(
-                asyncio.to_thread(self.config.dump, timeout=5.0), timeout=6.0)
-            neko = cfg.get("neko_terraria") if isinstance(cfg, dict) else None
+            # 尝试非阻塞读取宿主配置（若提供）；绝不碰 dump（会锁线程）
+            get_cfg = getattr(self.config, "get", None)
+            if get_cfg is None:
+                return
+            neko = get_cfg("neko_terraria") or {}
             if isinstance(neko, dict):
                 for key in ("mod_host", "mod_port", "server_host", "server_port",
                             "server_password", "game_path", "character_name",
