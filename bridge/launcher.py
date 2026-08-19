@@ -96,13 +96,8 @@ class GameLauncher:
             self.cfg["tmodloader_dir"] = str(Path(game_path).parent)
             return
 
-        steam_paths = [
-            r"E:\SteamLibrary",
-            r"D:\Steam",
-            r"C:\Program Files (x86)\Steam",
-        ]
-        for sp in steam_paths:
-            tml_dll = Path(sp) / "steamapps/common/tModLoader/tModLoader.dll"
+        # 动态检测：先读 Steam 注册表拿真实安装路径，再回退常见目录
+        for tml_dll in self._candidate_tml_dlls():
             if tml_dll.exists():
                 self.cfg["tmodloader_path"] = str(tml_dll)
                 self.cfg["tmodloader_dir"] = str(tml_dll.parent)
@@ -110,8 +105,50 @@ class GameLauncher:
         self.cfg["tmodloader_path"] = ""
         self.cfg["tmodloader_dir"] = ""
 
+    @staticmethod
+    def _steam_paths_from_registry() -> list:
+        """从注册表读 Steam 实际安装路径（HKLM/HKCU 两个位置，兼容 x86/x64）。"""
+        import winreg
+        out = []
+        for hive, subkey in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as k:
+                    sp, _ = winreg.QueryValueEx(k, "SteamPath")
+                    if sp and os.path.isdir(sp):
+                        out.append(sp)
+            except OSError:
+                continue
+        return out
+
+    @classmethod
+    def _candidate_tml_dlls(cls) -> list:
+        """生成 tModLoader.dll 候选路径：注册表 Steam 路径优先，再回退常见目录。"""
+        cands = []
+        for sp in cls._steam_paths_from_registry():
+            cands.append(Path(sp) / "steamapps/common/tModLoader/tModLoader.dll")
+        # 常见 Steam 目录兜底（可能 Steam 装在非注册表路径的移动盘）
+        for sp in (
+            r"D:\SteamLibrary",
+            r"E:\SteamLibrary",
+            r"D:\Steam",
+            r"C:\Program Files (x86)\Steam",
+            r"C:\Program Files\Steam",
+        ):
+            cands.append(Path(sp) / "steamapps/common/tModLoader/tModLoader.dll")
+        return cands
+
     def _dotnet_path(self) -> str:
-        for p in [r"C:\Program Files\dotnet\dotnet.exe", "dotnet"]:
+        import shutil
+        # PATH 里的 dotnet 优先（用户装了 dotnet 一般就在 PATH）
+        found = shutil.which("dotnet")
+        if found:
+            return found
+        for p in (r"C:\Program Files\dotnet\dotnet.exe",
+                  r"C:\Program Files (x86)\dotnet\dotnet.exe"):
             if os.path.exists(p):
                 return p
         return "dotnet"
