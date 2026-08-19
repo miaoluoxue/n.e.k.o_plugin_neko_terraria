@@ -254,7 +254,8 @@ class TerrariaService:
         if behavior in ("system", "deep_context"):
             behavior = "read"
         try:
-            await self.push(
+            # SDK push_message 是同步方法，不能 await
+            self.push(
                 parts=[{"type": "text", "text": content}],
                 ai_behavior=behavior)
         except Exception:

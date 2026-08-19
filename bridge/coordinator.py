@@ -176,7 +176,7 @@ class TaskCoordinator:
                 style = inter.mood.primary_style()
                 if style:
                     mood_note = f"\n你此刻的心情：{json.dumps(style, ensure_ascii=False)}"
-            await push(
+            push(
                 parts=[{"type": "text", "text": (
                     f"[主人找你聊天] 主人说：『{text}』{mood_note}"
                     f"\n{anchor}\n"

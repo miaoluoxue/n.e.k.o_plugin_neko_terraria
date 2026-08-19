@@ -627,25 +627,22 @@ class TerrariaAgent:
             self.log(f"发送聊天失败: {e}", "warn")
 
     async def speak(self, text: str, ai_behavior: str = "respond") -> None:
-        """播报一句话（A5）：优先走宿主 LLM 语气回复，不可用时游戏内聊天兜底，保证不静默。
+        """播报一句话：推给宿主对话 LLM（respond → 语音合成让主人听到）。
 
-        - ai_behavior="respond"：猫娘语气回复（主人听的到）
-        - ai_behavior="read"：静默通知（不打断主人，只给 LLM 知道）
+        - ai_behavior="respond"：猫娘语气回复（触发语音）
+        - ai_behavior="read"：静默上下文（不打断主人，只给 LLM 知道）
+
+        SDK 的 push_message 是同步方法（返回 PushMessageResult），不能 await。
+        失败时静默（不打游戏内聊天——语音由宿主 LLM 负责，游戏内聊天不可取）。
         """
         plugin = getattr(self, "plugin", None)
         push = getattr(plugin, "push_message", None)
-        if push:
-            try:
-                await push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
-                return
-            except Exception:
-                pass
-        # 兜底：游戏内聊天直接说（不带 LLM 语气，但保证有声音）
-        if ai_behavior != "read":
-            try:
-                await self.send_chat(text)
-            except Exception:
-                pass
+        if not push:
+            return
+        try:
+            push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
+        except Exception:
+            pass
 
     def get_state(self) -> Dict[str, Any]:
         return self._state

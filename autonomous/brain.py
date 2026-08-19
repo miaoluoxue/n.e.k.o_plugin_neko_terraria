@@ -383,7 +383,7 @@ class AutonomousBrain:
 
                     push = getattr(self.plugin, "push_message", None)
                     if push:
-                        await push(parts=[{"type": "text", "text": prompt}], ai_behavior="respond")
+                        push(parts=[{"type": "text", "text": prompt}], ai_behavior="respond")
                         self.plugin.logger.info(f"[brain] LLM 自主思考已推送，boredom={self.state.boredom:.2f}")
                     else:
                         # 无 LLM 通道：规则兜底
@@ -433,8 +433,10 @@ class AutonomousBrain:
                 # 先推一条消息给 LLM 知会
                 push = getattr(self.plugin, "push_message", None)
                 if push:
-                    await push(
-                        content=f"我复活了！检测到 {name} 在附近({int(dist)}格)，我马上回去～", ai_behavior="read"
+                    push(
+                        parts=[{"type": "text",
+                                "text": f"我复活了！检测到 {name} 在附近({int(dist)}格)，我马上回去～"}],
+                        ai_behavior="read",
                     )
 
                 await self.agent.navigate_to(ox, oy, timeout=30)

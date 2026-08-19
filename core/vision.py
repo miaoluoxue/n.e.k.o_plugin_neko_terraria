@@ -28,7 +28,8 @@ class VisionBridge:
                 img_bytes = self._compress_for_wire(img_bytes)
                 if not img_bytes:
                     return
-                await self.push(
+                # SDK push_message 是同步方法，不能 await
+                self.push(
                     parts=[{"type": "image", "data": img_bytes,
                             "mime": "image/jpeg"}],
                     ai_behavior="read")

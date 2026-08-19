@@ -503,10 +503,11 @@ class InteractionEngine:
                     text, intensity=self.imperfections.intensity)
             except Exception:
                 pass
+        # 走 agent.speak：优先宿主 push_message（LLM 人设润色），
+        # 失败/不可用时 respond 降级为游戏内聊天（send_chat）——保证不静默。
+        # 这是"情感交互有声音"的兜底关键：宿主没接 push_message 时猫娘也会开口。
         try:
-            await self.plugin.push_message(
-                parts=[{"type": "text", "text": text}],
-                ai_behavior=behavior)
+            await self.agent.speak(text, ai_behavior=behavior)
             self._last_speech_ts = time.time()
             self._urge = 0.0  # 说过话了，冲动值清零
             self._speech_cooldown_until = time.time() + self.timing.reaction_delay()

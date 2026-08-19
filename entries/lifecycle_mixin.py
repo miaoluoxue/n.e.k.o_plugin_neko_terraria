@@ -358,7 +358,8 @@ class LifecycleMixin:
 
                 # v0.7: 常驻场景上下文注入（read 模式不打扰，供主 LLM 人设感知）
                 try:
-                    await self.push_message(
+                    # SDK push_message 是同步方法，不能 await
+                    self.push_message(
                         parts=[{"type": "text", "text": (
                             "[场景] 猫娘在泰拉瑞亚世界里陪主人玩：她在游戏里有一个身体"
                             "（会疼、会累、会害怕、会冷），能看到主人的画面动态，"
@@ -375,7 +376,7 @@ class LifecycleMixin:
                 self.logger.error(f"[boot] 堆栈跟踪:\n{traceback.format_exc()}")
                 # 如果是 asyncio 任务内部的异常，也要让宿主感知
                 try:
-                    await self.push_message(
+                    self.push_message(
                         parts=[{"type": "text",
                                 "text": f"[系统] neko_terraria 启动失败: {e}"}],
                         visibility=["hud"], ai_behavior="blind")
