@@ -49,7 +49,7 @@ class LifecycleMixin:
             if isinstance(neko, dict):
                 for key in ("mod_host", "mod_port", "server_host", "server_port",
                             "server_password", "game_path", "character_name",
-                            "window_hidden", "state_tick_interval_seconds",
+                            "state_tick_interval_seconds",
                             "fast_think_interval_seconds", "deep_think_min_seconds",
                             "deep_think_max_seconds",
                             "context_push_interval_seconds", "context_deep_push_interval_seconds",

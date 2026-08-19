@@ -28,7 +28,6 @@ class UiActionsMixin:
         connection = {
             "game_path": cfg["game_path"],
             "character_name": cfg["character_name"],
-            "window_hidden": cfg["window_hidden"],
             "server_host": cfg["server_host"],
             "server_port": cfg["server_port"],
             "server_password": cfg["server_password"],
@@ -219,7 +218,6 @@ class UiActionsMixin:
             "properties": {
                 "game_path": {"type": "string"},
                 "character_name": {"type": "string"},
-                "window_hidden": {"type": "boolean"},
                 "server_host": {"type": "string"},
                 "server_port": {"type": "integer"},
                 "server_password": {"type": "string"},
@@ -244,7 +242,7 @@ class UiActionsMixin:
         from ..core.config_store import save_user_config
 
         patch = {}
-        for key in ("game_path", "character_name", "window_hidden",
+        for key in ("game_path", "character_name",
                      "server_host", "server_port", "server_password",
                      "mod_host", "mod_port",
                      "llm_main_provider", "llm_main_model", "llm_main_api_key", "llm_main_base_url",

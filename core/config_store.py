@@ -41,7 +41,7 @@ _MOD_FILE: str = "NekoTerrariaLink.tmod"
 _USER_KEYS: tuple[str, ...] = (
     "mod_host", "mod_port",
     "server_host", "server_port", "server_password",
-    "game_path", "character_name", "window_hidden",
+    "game_path", "character_name",
     # ── LLM 配置（双 LLM 架构） ──
     "llm_main_provider", "llm_main_model", "llm_main_api_key", "llm_main_base_url",
     "llm_intent_provider", "llm_intent_model", "llm_intent_api_key", "llm_intent_base_url",
@@ -68,7 +68,6 @@ DEFAULTS: Dict[str, Any] = {
     "server_password": "",
     "game_path": "",
     "character_name": "Neko",
-    "window_hidden": False,
     # ── 双 LLM 配置（主 LLM + 意图 LLM） ──
     "llm_main_provider": "",
     "llm_main_model": "",

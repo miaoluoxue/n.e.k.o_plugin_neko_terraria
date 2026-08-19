@@ -690,14 +690,9 @@ body::after {
   </div>
   <div class="field">
     <label>AI 角色名</label>
-    <input type="text" id="characterName" value="AI-Neko">
+    <input type="text" id="characterName" placeholder="如 Neko">
     <div class="hint">需先在游戏里创建好这个角色</div>
   </div>
-  <div class="check-row">
-    <input type="checkbox" id="windowHidden" checked>
-    <span>隐藏 AI 游戏窗口</span>
-  </div>
-
   <div class="section-title" style="margin-bottom:14px;">🌐 加入你的服务器</div>
   <div class="field">
     <label>服务器 IP</label>
@@ -866,6 +861,9 @@ async function refreshState() {
     const r = await callEntry('get_dashboard_state', {});
     if (r && typeof r === 'object' && !Array.isArray(r)) state = r;
     render();
+    // 设置抽屉开着时，同步刷新配置输入框（否则保存后/启动后 UI 显示硬编码旧值）
+    const drawer = document.getElementById('drawer');
+    if (drawer && drawer.classList.contains('show')) loadConfig();
   } catch (e) {
     console.error('刷新状态失败:', e);
   }
@@ -984,8 +982,7 @@ async function disconnect() {
 function loadConfig() {
   const c = state.connection || {};
   document.getElementById('gamePath').value = c.game_path || '';
-  document.getElementById('characterName').value = c.character_name || 'AI-Neko';
-  document.getElementById('windowHidden').checked = c.window_hidden !== false;
+  document.getElementById('characterName').value = c.character_name || 'Neko';
   document.getElementById('serverHost').value = c.server_host || '127.0.0.1';
   document.getElementById('serverPort').value = c.server_port || 7777;
   document.getElementById('serverPassword').value = c.server_password || '';
@@ -1006,7 +1003,6 @@ async function saveConfig() {
   const params = {
     game_path: document.getElementById('gamePath').value,
     character_name: document.getElementById('characterName').value,
-    window_hidden: document.getElementById('windowHidden').checked,
     server_host: document.getElementById('serverHost').value,
     server_port: parseInt(document.getElementById('serverPort').value),
     server_password: document.getElementById('serverPassword').value,
