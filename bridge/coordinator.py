@@ -310,9 +310,9 @@ class TaskCoordinator:
         amount = it.amount
         kind_map = {
             "mine":    ("mine",   "挖掘"),
-            "chop":    ("gather", "砍伐"),
+            "chop":    ("chop",   "砍伐"),
             "dig":     ("mine",   "挖掘"),
-            "fish":    ("gather", "钓鱼"),
+            "fish":    ("fish",   "钓鱼"),
             "hunt":    ("goto",   "猎杀"),
             "collect": ("gather", "收集"),
             "place":   ("goto",   "放置"),

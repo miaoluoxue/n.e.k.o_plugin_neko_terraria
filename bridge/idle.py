@@ -163,6 +163,17 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
             pass
         return
 
+    # ── P1.6 陪伴式生活小动作：砍树/钓鱼（什么任务用什么工具） ──
+    life = getattr(agent, "life", None)
+    if life is not None and ctx["cycle"] % 30 == 0 and dist < 30:
+        try:
+            await life.do_something()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            agent.log(f"生活小动作异常: {e}", "warn")
+        return
+
     # ── P2 照明：低亮度 → 掏火把照亮 ──
     if ctx["cycle"] % LIGHT_CHECK_INTERVAL == 0:
         b = st.get("brightness", 1.0)

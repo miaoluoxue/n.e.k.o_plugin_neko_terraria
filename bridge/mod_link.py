@@ -136,6 +136,40 @@ class ModLink:
         resp = await self.conn.request_mod({"cmd": "quick_stack"}, timeout=3.0)
         return int(resp.get("ok", 0) or 0) if resp else 0
 
+    # ── v0.5 砍树 / 钓鱼（陪伴式交互：什么任务用什么工具） ──
+
+    async def find_trees(self, radius: int = 30) -> List[Dict[str, Any]]:
+        """扫描附近树木，返回按距离排序的树根坐标列表。"""
+        resp = await self.conn.request_mod(
+            {"cmd": "find_trees", "radius": radius}, timeout=5.0)
+        return resp.get("trees", []) if resp else []
+
+    async def chop_trees(self, x: int, y: int) -> bool:
+        """砍掉指定位置的一棵树（整列 kill）。"""
+        resp = await self.conn.request_mod(
+            {"cmd": "chop_trees", "x": x, "y": y}, timeout=5.0)
+        return bool(resp and resp.get("ok"))
+
+    async def find_water(self, radius: int = 30) -> List[Dict[str, Any]]:
+        """扫描附近水域（钓鱼用），返回按距离排序的水面格坐标。"""
+        resp = await self.conn.request_mod(
+            {"cmd": "find_water", "radius": radius}, timeout=5.0)
+        return resp.get("water", []) if resp else []
+
+    async def find_fishing_rod(self) -> int:
+        """找背包里的钓竿，返回 inv_slot（-1 = 没有）。"""
+        try:
+            inv = await self.get_inventory()
+        except Exception:
+            return -1
+        for it in (inv.get("inventory", []) or []) + (inv.get("hotbar", []) or []):
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name", "") or "")
+            if "钓竿" in name or "钓竿" in name or "fishing" in name.lower():
+                return int(it.get("inv_slot", -1) or -1)
+        return -1
+
     async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
         resp = await self.conn.request_mod(
             {"cmd": "navigate_to", "x": x, "y": y, "timeout": timeout},

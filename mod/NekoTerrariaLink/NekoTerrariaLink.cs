@@ -782,6 +782,9 @@ namespace NekoTerrariaLink
                     case "use_mirror": RunOnMain(stream, reqId, () => UseMirror(cmd)); break;
                     case "place_chest": RunOnMain(stream, reqId, () => PlaceChest(cmd)); break;
                     case "quick_stack": RunOnMain(stream, reqId, () => QuickStack(cmd)); break;
+                    case "find_trees": SendTreePositions(stream, reqId, cmd); break;
+                    case "chop_trees": RunOnMain(stream, reqId, () => ChopTrees(cmd)); break;
+                    case "find_water": SendWaterPositions(stream, reqId, cmd); break;
                 }
             }
             catch (Exception ex)
@@ -2202,6 +2205,112 @@ namespace NekoTerrariaLink
             ores.Sort((a, b) => (int)a.GetNum("dist").CompareTo((int)b.GetNum("dist")));
             if (ores.Count > 10) ores = ores.GetRange(0, 10);
             Send(s, new Dict { ["req_id"] = reqId, ["type"] = "ore_positions", ["ores"] = ores });
+        }
+
+        /// <summary>扫描附近树木（Lumi find_trees 同款）：返回最近树的树根坐标。</summary>
+        private void SendTreePositions(NetworkStream s, long reqId, Dict cmd)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null)
+            {
+                Send(s, new Dict { ["req_id"] = reqId, ["type"] = "tree_positions", ["trees"] = new List<Dict>() });
+                return;
+            }
+            int cx = (int)(p.Center.X / 16f), cy = (int)(p.Center.Y / 16f);
+            int radius = (int)(cmd.GetNum("radius") > 0 ? cmd.GetNum("radius") : 30);
+            var trees = new List<Dict>();
+            var seenX = new HashSet<int>();
+            for (int x = cx - radius; x <= cx + radius; x++)
+            {
+                if (x < 0 || x >= Main.maxTilesX || seenX.Contains(x)) continue;
+                int baseY = -1;
+                for (int y = cy - 35; y <= cy + 10; y++)
+                {
+                    if (y < 0 || y >= Main.maxTilesY) continue;
+                    var t = Main.tile[x, y];
+                    if (t != null && t.HasTile && (t.TileType == TileID.Trees
+                        || t.TileType == TileID.PalmTree
+                        || t.TileType == TileID.Cactus))
+                        baseY = y;
+                }
+                if (baseY >= 0)
+                {
+                    trees.Add(new Dict { ["x"] = x, ["y"] = baseY,
+                        ["dist"] = Math.Abs(x - cx) });
+                    seenX.Add(x);
+                }
+            }
+            trees.Sort((a, b) => (int)a.GetNum("dist").CompareTo((int)b.GetNum("dist")));
+            if (trees.Count > 8) trees = trees.GetRange(0, 8);
+            Send(s, new Dict { ["req_id"] = reqId, ["type"] = "tree_positions", ["trees"] = trees });
+        }
+
+        /// <summary>砍掉指定的树（整列 kill，含树干/树叶）。返回是否砍到。树类型：树/棕榈/仙人掌。</summary>
+        private bool ChopTrees(Dict cmd)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null) return false;
+            int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
+            int count = 0;
+            for (int dy = -25; dy <= 2; dy++)
+            {
+                int y = ty + dy;
+                if (y < 0 || y >= Main.maxTilesY) continue;
+                var t = Main.tile[tx, y];
+                if (t != null && t.HasTile && (t.TileType == TileID.Trees
+                    || t.TileType == TileID.PalmTree
+                    || t.TileType == TileID.Cactus
+                    || t.TileType == TileID.PalmTree  // 棕榈
+                    || t.TileType == TileID.Cactus))
+                {
+                    WorldGen.KillTile(tx, y, false, false, true);
+                    SyncTile(tx, y, 1);
+                    count++;
+                }
+            }
+            return count > 0;
+        }
+
+        /// <summary>扫描附近的水域（钓鱼用）：返回水面格坐标（有液体水 + 上方空气）。</summary>
+        private void SendWaterPositions(NetworkStream s, long reqId, Dict cmd)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null)
+            {
+                Send(s, new Dict { ["req_id"] = reqId, ["type"] = "water_positions", ["water"] = new List<Dict>() });
+                return;
+            }
+            int cx = (int)(p.Center.X / 16f), cy = (int)(p.Center.Y / 16f);
+            int radius = (int)(cmd.GetNum("radius") > 0 ? cmd.GetNum("radius") : 30);
+            var water = new List<Dict>();
+            var seen = new HashSet<(int, int)>();
+            for (int y = cy - 20; y <= cy + 20; y++)
+            {
+                for (int x = cx - radius; x <= cx + radius; x++)
+                {
+                    if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) continue;
+                    var t = Main.tile[x, y];
+                    if (t == null) continue;
+                    // 有水且上方是空气（水面）
+                    if (t.LiquidAmount > 50 && t.LiquidType == LiquidID.Water)
+                    {
+                        var above = Main.tile[x, y - 1];
+                        if (above != null && !above.HasTile)
+                        {
+                            // 粗略去重（相邻水面格）
+                            var key = (x / 4, y / 4);
+                            if (seen.Add(key))
+                            {
+                                water.Add(new Dict { ["x"] = x, ["y"] = y,
+                                    ["dist"] = Math.Abs(x - cx) + Math.Abs(y - cy) });
+                            }
+                        }
+                    }
+                }
+            }
+            water.Sort((a, b) => (int)a.GetNum("dist").CompareTo((int)b.GetNum("dist")));
+            if (water.Count > 10) water = water.GetRange(0, 10);
+            Send(s, new Dict { ["req_id"] = reqId, ["type"] = "water_positions", ["water"] = water });
         }
 
         private void SendLedges(NetworkStream s, long reqId, Dict cmd)

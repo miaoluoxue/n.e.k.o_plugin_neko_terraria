@@ -161,6 +161,18 @@ class TaskBrain:
                                     reason=goal_text,
                                     report_fail=f"挖 {item} 没成功，主人"))
                 p.outline.append(f"挖{item}x{amt}")
+            elif action == "chop":
+                # 砍树：goal_type 用 "chop"（LifeEngine 真砍树，选斧头）
+                p.goals.append(Goal(goal_type="chop", target=item, amount=amt,
+                                    reason=goal_text,
+                                    report_fail=f"砍 {item} 没成功，主人"))
+                p.outline.append(f"砍{item}x{amt}")
+            elif action == "fish":
+                # 钓鱼：goal_type 用 "fish"（LifeEngine 真钓鱼，选钓竿）
+                p.goals.append(Goal(goal_type="fish", target=item, amount=amt,
+                                    reason=goal_text,
+                                    report_fail=f"钓鱼没成功，主人"))
+                p.outline.append(f"钓鱼x{amt}")
             elif action == "gather":
                 # 纯收集掉落物：goal_type 用 "gather"（task_chain 的 gather 分支）
                 p.goals.append(Goal(goal_type="gather", target=item, amount=amt,

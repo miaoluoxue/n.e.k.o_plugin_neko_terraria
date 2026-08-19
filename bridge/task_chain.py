@@ -170,6 +170,28 @@ class TaskChain:
             except Exception:
                 return False
 
+        # chop：真砍树（什么任务用什么工具 → 斧头）
+        if goal.goal_type == "chop":
+            try:
+                life = getattr(self.agent, "life", None)
+                if life:
+                    amount = goal.amount or 10
+                    got = await life.chop_wood(target=amount)
+                    return got > 0
+                return False
+            except Exception:
+                return False
+
+        # fish：真钓鱼（工具 → 钓竿）
+        if goal.goal_type == "fish":
+            try:
+                life = getattr(self.agent, "life", None)
+                if life:
+                    return await life.fish(attempts=3)
+                return False
+            except Exception:
+                return False
+
         # social 无具体物品目标：交给自主大脑处理，这里放行
         if goal.goal_type == "social":
             return True
