@@ -84,6 +84,10 @@ class TerrariaAgent:
         self._world_info: Dict[str, Any] = {}
         self._log: List[Dict[str, Any]] = []
         self._running = False
+        # 防重入：boot 与 nt_connect 可能同时调 start()，并发会启动两个 tML 进程、
+        # 覆盖 self.process 导致 boot 卡死。只允许一个 start 真正执行。
+        self._start_lock = asyncio.Lock()
+        self._start_task: Optional[asyncio.Task] = None
 
         # ── 死亡/复活状态（按生存循环惯例 bridge._is_dead） ──
         self._is_dead: bool = False
@@ -116,6 +120,26 @@ class TerrariaAgent:
         所有默认值统一由 config_store.DEFAULTS 管理，此处直接从 self.cfg 取，
         不再写死第二份 fallback。
         """
+        # 防重入：boot 和 nt_connect 可能并发调用 start()。
+        # 若已在启动中，返回进行中状态，不重复拉起 tML 进程（否则覆盖
+        # self.process / 卡死 boot）。已运行直接返回 True。
+        if self._running:
+            return True
+        if self._start_task is not None and not self._start_task.done():
+            # 正在启动中：等它完成并返回其结果
+            return await self._start_task
+
+        async def _run() -> bool:
+            async with self._start_lock:
+                if self._running:
+                    return True
+                return await self._start_impl()
+
+        self._start_task = asyncio.create_task(_run())
+        return await self._start_task
+
+    async def _start_impl(self) -> bool:
+        """start() 实际执行体（防重入锁保护）。"""
         server_host: str = self.cfg["server_host"]
         server_port: int = self.cfg["server_port"]
         server_password: str = self.cfg["server_password"]
