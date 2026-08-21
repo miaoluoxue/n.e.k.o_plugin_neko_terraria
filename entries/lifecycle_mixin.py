@@ -313,15 +313,31 @@ class LifecycleMixin:
                 self.logger.info("[boot] LLM 集成完成")
 
                 self.logger.info("[boot] 正在连接游戏 Agent...")
-                ok = await self._agent.start()
+                try:
+                    # 硬超时：即使连接卡死，也继续启动大脑/交互（脑驱动 > 完美连接）
+                    ok = await asyncio.wait_for(self._agent.start(), timeout=45.0)
+                except asyncio.TimeoutError:
+                    ok = False
+                    self.logger.warning("[boot] Agent 连接超时（45s），继续启动大脑（可能游戏未开）")
+                except Exception as e:
+                    ok = False
+                    self.logger.warning(f"[boot] Agent 连接异常: {e}")
                 if not ok:
-                    self.logger.warning("Agent 启动失败，检查 Terraria 服务端/mod 是否运行")
-                    self.logger.warning("  → 请确认: 1) game_path 配置正确 2) tModLoader 可运行 3) mod TCP 端口 9877 可用")
-                    return
-                self.logger.info("[boot] Agent 启动成功")
+                    self.logger.warning("Agent 未就绪，但继续启动大脑/交互（猫娘仍能思考说话）")
+                else:
+                    self.logger.info("[boot] Agent 启动成功")
 
                 # v2.0: brain.start() 内部会拉起交互引擎 + 注册 executor 回调
-                await self._autonomous_brain.start()
+                try:
+                    await asyncio.wait_for(self._autonomous_brain.start(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    self.logger.warning("[boot] 自治大脑启动超时，尝试强制拉起")
+                    try:
+                        await self._autonomous_brain.start()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.logger.warning(f"[boot] 自治大脑启动异常: {e}")
                 self.logger.info("[boot] 自治大脑启动完成")
 
                 # v2.1: 交互引擎暴露给 agent → service/coordinator 可通过 agent._neko_interaction 访问
