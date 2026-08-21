@@ -287,6 +287,12 @@ class TaskCoordinator:
 
     # ---------------- 有限任务 ----------------
     async def _do_finite(self, it, source: str) -> Dict[str, Any]:
+        # explore 特殊处理：直接执行探索，不走 think/plan"能不能做"评估链
+        # （那是给挖矿/合成判断材料用的，explore 没有材料概念，评估会卡在
+        # "有镐子"这种无关检查导致任务不执行）。
+        if it.kind == "explore":
+            return await self._run_explore(it, source)
+
         steps = list(it.steps or [])
         if not steps:
             # LLM 可能没产出 steps：从 kind/target/amount 自动生成
@@ -301,6 +307,28 @@ class TaskCoordinator:
         # 人类化延迟：pre_reply 已发，"好的喵~"说了 → 停顿一下再动手
         await asyncio.sleep(self.timing.command_delay())
         return await self.run_foreground(it.steps, it.reason or it.raw, source)
+
+    async def _run_explore(self, it, source: str) -> Dict[str, Any]:
+        """探索直达：把 explore 步骤直接交给 task_chain 执行（真下挖/真移动），
+        不走 think 评估（避免"有镐子就能做"假通过）。"""
+        try:
+            from .task_chain import Goal
+
+            # 用 agent.executor 跑（可被打断、走汇报回调）
+            target = it.target or "附近"
+            goal = Goal(goal_type="explore", target=target, amount=1,
+                        reason=it.reason or "主人让我探索",
+                        report_fail="探索没成功，主人")
+            async def _work(info):
+                ok = await self.agent.tasks.run_one(goal)
+                return {"ok": ok, "output": "探索回来啦~" if ok else "探索没走成，主人"}
+
+            return await self.executor.run(
+                f"探索{target}", _work, source=source,
+                steps=[f"探索{target}"])
+        except Exception as e:
+            self.agent.log(f"探索执行异常: {e}", "warn")
+            return {"ok": False, "status": "error", "output": f"探索出错：{e}"}
 
     @staticmethod
     def _auto_steps(it: IntentResult) -> List[Dict[str, Any]]:

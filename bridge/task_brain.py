@@ -155,7 +155,16 @@ class TaskBrain:
             item = s.get("item", "")
             amt = int(s.get("amount", 1) or 1)
 
-            if action == "mine":
+            if action == "explore":
+                # 探索：goal_type 用 "explore"，走 task_chain 探索闭环（真下挖/真移动）
+                tgt = item or "地下"
+                if tgt in ("附近", "目标", ""):
+                    tgt = "地下"
+                p.goals.append(Goal(goal_type="explore", target=tgt, amount=amt,
+                                    reason=goal_text,
+                                    report_fail=f"探索没成功，主人"))
+                p.outline.append(f"探索{tgt}")
+            elif action == "mine":
                 # 真挖矿：goal_type 用 "mine"，走 task_chain 默认挖矿流程（find_ore→dig→计数）
                 p.goals.append(Goal(goal_type="mine", target=item, amount=amt,
                                     reason=goal_text,
