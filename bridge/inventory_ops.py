@@ -5,7 +5,7 @@
 再加上世界里的箱子，一共四个来源。
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 class InventoryOps:

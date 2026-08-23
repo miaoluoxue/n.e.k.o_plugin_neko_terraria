@@ -4,7 +4,6 @@
 """
 import asyncio
 import json
-import sys
 import time
 
 
@@ -51,7 +50,7 @@ async def main():
             if not f.done():
                 f.set_result(None)
 
-    rl = asyncio.create_task(read_loop())
+    asyncio.create_task(read_loop())
 
     async def req(cmd, timeout=3.0):
         rid = int(time.time() * 1000) % 100000

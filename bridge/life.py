@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -221,8 +221,6 @@ class LifeEngine:
             biome = str(st.get("biome", "") or "")
         except Exception:
             biome = ""
-        # 当前已在地下/特殊群系 → 就地钓（更容易钓到对应鱼）
-        prefer_here = any(k in biome for k in ("地下", "洞穴", "地狱", "丛林", "雪地", "腐化", "猩红", "神圣"))
 
         water = await self.agent.mod.find_water(radius=30)
         if not water:

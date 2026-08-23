@@ -1,6 +1,6 @@
 """装备管理：自动穿戴、使用、转交（丢地上给玩家）。"""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .mod_link import ModLink
 

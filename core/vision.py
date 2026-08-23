@@ -6,7 +6,7 @@ v2.1: VisionPipeline 容器 —— 截图源(可插拔) → VisionBridge 节流
 
 import asyncio
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional
 
 
 class VisionBridge:
@@ -48,6 +48,7 @@ class VisionBridge:
             return img_bytes
         try:
             from io import BytesIO
+
             from PIL import Image
             img = Image.open(BytesIO(img_bytes))
             if img.mode != "RGB":

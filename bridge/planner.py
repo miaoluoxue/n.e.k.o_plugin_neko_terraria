@@ -1,7 +1,7 @@
 """分段路径规划：把"深坑回地面"等复杂垂直移动拆成逐段可执行的落脚点，每段执行后重评估。"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 
 @dataclass
@@ -24,7 +24,7 @@ class Plan:
     def describe(self) -> str:
         if not self.feasible and not self.legs:
             return self.blocked_reason
-        parts = [f"{i+1}.{l.method}到({l.tx},{l.ty})" for i, l in enumerate(self.legs)]
+        parts = [f"{i+1}.{leg.method}到({leg.tx},{leg.ty})" for i, leg in enumerate(self.legs)]
         s = " → ".join(parts)
         if not self.feasible:
             s += f"，之后{self.blocked_reason}"
@@ -68,7 +68,7 @@ class Planner:
     def _build(self, cx: int, cy: int, tx: int, ty: int,
                ledges: List[Dict[str, int]], cap) -> Plan:
         plan = Plan()
-        px, py = cx, cy
+        py = cy
         stops = ledges + [{"x": tx, "y": ty}]
         budget_dirt = cap.dirt_count()
         budget_rope = cap.rope_count()
@@ -88,7 +88,7 @@ class Planner:
             elif method == "rope":
                 budget_rope -= diff
             plan.legs.append(Leg(stop["x"], stop["y"], method, diff))
-            px, py = stop["x"], stop["y"]
+            py = stop["y"]
 
         if not plan.legs and plan.feasible:
             plan.feasible = False

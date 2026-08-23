@@ -7,7 +7,6 @@ v2.1: 新增 jitter_text() 对 LLM 回复文本做不完美后处理——
 import random
 from dataclasses import dataclass
 
-
 # ── jitter_text 效果常量（无实例状态依赖的方法提取为模块层） ──
 
 STUTTER_CHANCE: float = 0.10

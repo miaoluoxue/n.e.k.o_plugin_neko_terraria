@@ -12,18 +12,17 @@
 - LLM 挂了/超时 → 走 intent.parse() 兜底
 """
 
-import json
-import re
 import asyncio
+import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
-log = logging.getLogger(__name__)
-
-from ..core.context import build_user_context as _build_ctx
 from ..bridge import intent as fallback_intent
+from ..core.context import build_user_context as _build_ctx
 
+log = logging.getLogger(__name__)
 
 # ── LLM 意图解析的 prompt 模板（v2：思维链 + few-shot + 上下文）──
 

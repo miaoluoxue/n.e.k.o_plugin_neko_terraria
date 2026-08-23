@@ -4,9 +4,9 @@ import asyncio
 import ctypes
 import os
 import subprocess
+from ctypes import wintypes
 from pathlib import Path
 from typing import Optional, Set
-from ctypes import wintypes
 
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4   # 显示/恢复但不激活（不抢焦点，避免键盘同时控制 AI 角色）
@@ -155,9 +155,13 @@ class GameLauncher:
 
     async def launch(self) -> bool:
         from ..core.config_store import (
-            RESOURCE_DIR, AI_MODS_DIR, AI_PLAYERS_DIR,
-            load_user_config, clean_human_mods, mute_ai_client,
-            set_unfocused_keep_running, ensure_player_name_matches,
+            AI_MODS_DIR,
+            AI_PLAYERS_DIR,
+            RESOURCE_DIR,
+            clean_human_mods,
+            ensure_player_name_matches,
+            mute_ai_client,
+            set_unfocused_keep_running,
         )
 
         tml_path = self.cfg.get("tmodloader_path", "")

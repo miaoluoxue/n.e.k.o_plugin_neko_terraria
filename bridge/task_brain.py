@@ -10,9 +10,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .reasoner import COST_ASK, Reasoner
 from .task_chain import Goal
 from .world_model import WorldModel
-from .reasoner import Reasoner, COST_ASK
 
 MAX_REPAIR_ROUND = 4     # 补救迭代上限，防止来回打转
 
@@ -76,7 +76,7 @@ class TaskBrain:
             return a
 
         base = await self.world.snapshot()
-        a.thoughts.append(f"先看看现在有什么：" + self._say_inv(base))
+        a.thoughts.append("先看看现在有什么：" + self._say_inv(base))
 
         for round_i in range(MAX_REPAIR_ROUND):
             sim = await self.world.simulate(work, base)
@@ -162,7 +162,7 @@ class TaskBrain:
                     tgt = "地下"
                 p.goals.append(Goal(goal_type="explore", target=tgt, amount=amt,
                                     reason=goal_text,
-                                    report_fail=f"探索没成功，主人"))
+                                    report_fail="探索没成功，主人"))
                 p.outline.append(f"探索{tgt}")
             elif action == "mine":
                 # 真挖矿：goal_type 用 "mine"，走 task_chain 默认挖矿流程（find_ore→dig→计数）
@@ -180,7 +180,7 @@ class TaskBrain:
                 # 钓鱼：goal_type 用 "fish"（LifeEngine 真钓鱼，选钓竿）
                 p.goals.append(Goal(goal_type="fish", target=item, amount=amt,
                                     reason=goal_text,
-                                    report_fail=f"钓鱼没成功，主人"))
+                                    report_fail="钓鱼没成功，主人"))
                 p.outline.append(f"钓鱼x{amt}")
             elif action == "gather":
                 # 纯收集掉落物：goal_type 用 "gather"（task_chain 的 gather 分支）

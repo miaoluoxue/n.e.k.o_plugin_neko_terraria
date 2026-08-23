@@ -12,7 +12,7 @@
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # 天生长期的行为（没有自然终点）
 FOLLOW_WORDS = ("跟着", "跟上", "跟我", "跟随", "别走丢", "一起走")

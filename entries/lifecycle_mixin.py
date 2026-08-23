@@ -25,9 +25,9 @@ class LifecycleMixin:
     _config: Dict[str, Any]
 
     def _init_core_services(self) -> None:
-        from ..core.config_store import load_user_config
-        from ..bridge.agent import TerrariaAgent
         from ..autonomous.brain import AutonomousBrain
+        from ..bridge.agent import TerrariaAgent
+        from ..core.config_store import load_user_config
         from ..core.service import TerrariaService
 
         # 所有默认值统一由 config_store.DEFAULTS 管理

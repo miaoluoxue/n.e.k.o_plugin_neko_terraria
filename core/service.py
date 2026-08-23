@@ -8,12 +8,11 @@
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from ..autonomous.event_bus import get_event_bus
 from ..autonomous.game_event_emitter import GameEventEmitter
-from .context import (build_anchor_msg, build_user_context,
-                      build_full_system_prompt, build_capability_block)
+from .context import build_anchor_msg, build_capability_block, build_full_system_prompt, build_user_context
 
 
 class TerrariaService:
@@ -107,7 +106,7 @@ class TerrariaService:
         if not self._joined:
             self._joined = True
             await self._push(
-                f"[系统] 我正在进入泰拉瑞亚世界，马上就好...",
+                "[系统] 我正在进入泰拉瑞亚世界，马上就好...",
                 "system")
             await self._push_joined_game()
 
@@ -239,7 +238,7 @@ class TerrariaService:
         self._event_emitter.reset()
 
         pos = data.get("position") if isinstance(data, dict) else None
-        text = f"复活了！" + (f" 位置: {pos}" if pos else "")
+        text = "复活了！" + (f" 位置: {pos}" if pos else "")
         await self._push(text, "respond")
         self.plugin.logger.info("[service] 已推送复活事件")
 

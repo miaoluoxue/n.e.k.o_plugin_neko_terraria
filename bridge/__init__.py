@@ -1,17 +1,17 @@
 """neko_terraria 的 Agent 本体：游戏启动、mod 接口、战斗、挖矿、装备、任务链。"""
 
 from .agent import TerrariaAgent
-from .mod_link import ModLink
-from .connection import Connection
 from .combat import CombatEngine
-from .mining import MiningEngine
-from .equipment import EquipmentManager
-from .task_chain import TaskChain
-from .launcher import GameLauncher
-from .executor import TaskExecutor, SRC_OWNER, SRC_AUTO
+from .connection import Connection
 from .coordinator import TaskCoordinator
-from .task_inquiry import TaskInquiry, Inquiry
-from .item_npc_dict import ITEM_IDS, NPC_IDS, item_id, npc_id, item_name
+from .equipment import EquipmentManager
+from .executor import SRC_AUTO, SRC_OWNER, TaskExecutor
+from .item_npc_dict import ITEM_IDS, NPC_IDS, item_id, item_name, npc_id
+from .launcher import GameLauncher
+from .mining import MiningEngine
+from .mod_link import ModLink
+from .task_chain import TaskChain
+from .task_inquiry import Inquiry, TaskInquiry
 
 __all__ = [
     "TerrariaAgent", "ModLink", "Connection", "GameLauncher",

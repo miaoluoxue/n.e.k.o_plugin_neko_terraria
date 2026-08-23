@@ -12,7 +12,6 @@
 
 import asyncio
 import json
-import time
 from typing import Any, Dict, Optional
 
 SITUATION_INTERVAL = 20.0

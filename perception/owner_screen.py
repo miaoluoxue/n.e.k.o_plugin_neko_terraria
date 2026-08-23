@@ -9,8 +9,6 @@ GDI PrintWindow 会黑屏，ImageGrab（屏幕拷贝）对可见窗口可靠。
 
 import base64
 import io
-import os
-import sys
 from typing import Optional, Tuple
 
 _AI_PID_CACHE: Optional[int] = None

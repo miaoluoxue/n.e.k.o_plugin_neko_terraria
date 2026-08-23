@@ -2,16 +2,14 @@
 
 import asyncio
 import json
-import math
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..polish.attention import AttentionDrift
 from ..polish.habits import PersonalHabits
 from ..polish.human_timing import HumanTiming
 from ..polish.imperfections import ImperfectionInjector
-
 
 # 事件去重窗口（秒）
 EVENT_DEDUP_WINDOW: float = 60.0

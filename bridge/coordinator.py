@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import time
+from typing import TYPE_CHECKING, Any, Dict, List
 
-from . import intent as intent_mod                  # 保留旧 intent 作为 fallback
-from .executor import SRC_OWNER, SRC_AUTO
-from ..polish.human_timing import HumanTiming
 from ..core.context import build_anchor_msg
+from ..polish.human_timing import HumanTiming
+from .executor import SRC_OWNER
 
 if TYPE_CHECKING:
-    from ..llm.intent_parser import LLMIntentParser, IntentResult
+    from ..llm.intent_parser import IntentResult
 
 log = logging.getLogger(__name__)
 
@@ -139,13 +138,13 @@ class TaskCoordinator:
                                raw_text: str = "") -> Dict[str, Any]:
         """按 mode 分发一个 IntentResult（#16：语义确认后复用同一分发）。"""
         if result.mode == "stop":
-            self.agent.log(f"[coordinator] 🛑 执行 stop", "info")
+            self.agent.log("[coordinator] 🛑 执行 stop", "info")
             return await self._do_stop(result)
         if result.mode == "longterm":
-            self.agent.log(f"[coordinator] ⏳ 执行 longterm", "info")
+            self.agent.log("[coordinator] ⏳ 执行 longterm", "info")
             return await self._do_longterm(result)
         if result.mode == "finite":
-            self.agent.log(f"[coordinator] 📝 执行 finite", "info")
+            self.agent.log("[coordinator] 📝 执行 finite", "info")
             return await self._do_finite(result, source)
         if result.mode == "chat":
             await self._do_chat(raw_text or result.raw, result)

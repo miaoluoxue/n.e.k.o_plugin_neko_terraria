@@ -6,8 +6,8 @@
 - 紧急事件 (priority=emergency): 危险警报（专用配额）
 """
 
-import time
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)

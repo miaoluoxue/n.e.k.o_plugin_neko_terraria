@@ -9,7 +9,7 @@
 import re
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # 半衰期：7 天（秒）
 _HALF_LIFE = 7 * 24 * 3600

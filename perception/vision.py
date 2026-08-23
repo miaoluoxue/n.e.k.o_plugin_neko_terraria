@@ -11,9 +11,6 @@ v2.0: 实现了实际的 LLM Vision 分析流程。
 import asyncio
 from typing import Any, Dict, List, Optional
 
-from ..core.context import build_user_context
-
-
 # ── LLM Vision 分析 prompt（v0.7：画面理解 + 情感）──
 # 猫娘通过主人窗口画面"看"主人在干什么，输出结构化事实 + 自己的心情与想说的话。
 # 台词归属角色 LLM：这里的 want_to_say 只是画面触发的第一反应，最终表达由

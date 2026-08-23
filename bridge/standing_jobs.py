@@ -15,8 +15,8 @@ import logging
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from .longterm import StandingTask
 from ..polish.human_timing import HumanTiming
+from .longterm import StandingTask
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ class StandingJobs:
             logger.info(f"🔄 follow_loop 第 {loop_count} 次循环")
 
             if not await lt.wait_turn(task.kind):
-                logger.info(f"⚠️ wait_turn 返回 False，退出循环")
+                logger.info("⚠️ wait_turn 返回 False，退出循环")
                 break
 
             owner = self._owner()
@@ -156,7 +156,7 @@ class StandingJobs:
                 lost += 1
                 if lost == 5:
                     task.beat("找不到主人了，先待在原地")
-                    logger.warning(f"⚠️ 连续 5 次找不到主人")
+                    logger.warning("⚠️ 连续 5 次找不到主人")
                 self._following = False  # 失去目标时重置
                 await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
                 continue
@@ -311,7 +311,7 @@ class StandingJobs:
                 if dist_from_home > guard_range * 2:
                     task.beat("走远了，回守点")
                     await self.agent.navigate_to(hx, hy, timeout=15)
-                    await self._notify_step("guard", f"返回守点", dist=dist_from_home)
+                    await self._notify_step("guard", "返回守点", dist=dist_from_home)
                 else:
                     task.beat(f"守着呢（范围{guard_range}格）")
                     await self._notify_step("guard", f"守点中，{task.progress}s", elapsed=task.progress)

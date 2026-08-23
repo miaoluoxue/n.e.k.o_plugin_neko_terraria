@@ -1,6 +1,5 @@
 """并行执行器：多层动作优先级队列（移动/攻击/垫土可并行）。"""
 
-import asyncio
 from typing import Any, Callable, Dict, List
 
 

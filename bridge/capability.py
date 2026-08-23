@@ -3,7 +3,7 @@
 无能力时及时制止并汇报主人，而非硬冲导致卡死或掉坑。
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class Capability:

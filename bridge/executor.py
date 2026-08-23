@@ -1,7 +1,6 @@
 """任务执行器：任务生命周期与占用仲裁的唯一权威（谁在做、能否打断、怎么停）。"""
 
 import asyncio
-import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional

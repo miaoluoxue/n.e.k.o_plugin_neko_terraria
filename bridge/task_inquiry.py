@@ -7,10 +7,9 @@
 4. 主人指令含糊需要确认（"帮帮"→ 帮什么？）
 """
 
-import json
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
