@@ -18,6 +18,7 @@ namespace NekoTerrariaLink
         public string GetValue(string k) => this[k] as string ?? "";
         public double GetNum(string k) => Convert.ToDouble(this[k] ?? 0, CultureInfo.InvariantCulture);
         public List<string> GetArray(string k) => this[k] as List<string> ?? new List<string>();
+        public bool Has(string k) => _m.ContainsKey(k);
 
         public string ToJson() => Serialize(this);
 

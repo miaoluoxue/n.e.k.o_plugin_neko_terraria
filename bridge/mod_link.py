@@ -30,7 +30,13 @@ class ModLink:
         await self.conn.request_mod({"cmd": "hook", "x": x, "y": y})
 
     async def use_item(self, x: int = -1, y: int = -1) -> None:
-        await self.conn.request_mod({"cmd": "use_item", "x": x, "y": y})
+        # 带目标坐标（tile 格）：让角色朝向/挥动方向对准目标（战斗/砍树/钓鱼用）
+        cmd = {"cmd": "use_item"}
+        if x >= 0:
+            cmd["target_x"] = x
+        if y >= 0:
+            cmd["target_y"] = y
+        await self.conn.request_mod(cmd)
 
     async def select_item(self, slot: int) -> None:
         await self.conn.request_mod({"cmd": "select_item", "slot": slot})
@@ -180,12 +186,16 @@ class ModLink:
     # C# 侧 BFS 寻路 + 逐点执行，通过 nav_* 事件流回传状态
     # （nav_moving/nav_arrived/nav_stuck/nav_timeout），Python 可中断/感知进度
 
-    async def navigate_async(self, x: int, y: int, timeout: int = 20) -> bool:
+    async def navigate_async(self, x: int, y: int, timeout: int = 20,
+                             on_tick=None) -> bool:
         """流式导航：发 navigate_stream，等 nav_arrived/stuck/timeout 事件确认真正到达。
 
         ACK 只表示导航已启动，不代表到达——必须等最终 nav 事件。
+        on_tick: 等待期间每 ~0.5s 回调的异步函数。返回 True → 中断导航（返回 False）。
+          导航途中遇敌用：停下打怪，打完由外层决定是否重新导航（参考轮子插件）。
         """
         import asyncio
+        import time as _time
         callbacks = getattr(self, "_nav_callbacks", None)
         if callbacks is None:
             callbacks = set()
@@ -207,7 +217,38 @@ class ModLink:
             # 导航未启动（no_path/连接问题）直接失败，不等事件
             if resp is None or not resp.get("ok"):
                 return False
-            await asyncio.wait_for(done.wait(), timeout=timeout + 2)
+            deadline = _time.time() + timeout + 2
+            while True:
+                remaining = deadline - _time.time()
+                if remaining <= 0:
+                    result["event"] = "nav_timeout"
+                    break
+                try:
+                    await asyncio.wait_for(done.wait(),
+                                           timeout=min(0.5, remaining))
+                    if result["event"] in ("nav_arrived", "nav_stuck",
+                                           "nav_timeout"):
+                        break
+                    done.clear()
+                except asyncio.TimeoutError:
+                    done.clear()
+                # 等待期间对外部开放：让调用方感知环境（遇敌可中断）
+                if on_tick is not None:
+                    try:
+                        interrupt = await on_tick()
+                        if interrupt:
+                            # 发一条新导航接管 C# 路径代际，清掉旧路径
+                            try:
+                                await self.conn.request_mod(
+                                    {"cmd": "navigate_stream", "x": x, "y": y,
+                                     "timeout": 1}, timeout=1)
+                            except Exception:
+                                pass
+                            return False
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
             return result["event"] == "nav_arrived"
         except asyncio.TimeoutError:
             return False

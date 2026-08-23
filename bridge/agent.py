@@ -79,6 +79,7 @@ class TerrariaAgent:
 
         self.upgrade = UpgradeEngine(self)
         self._state: Dict[str, Any] = {}
+        self._in_combat: bool = False  # 战斗中标志：防止导航遇敌检查自我嵌套
         self._inv_full: Dict[str, Any] = {"hotbar": [], "equipped": [], "inventory": []}
         self._chests: List[Dict[str, Any]] = []
         self._world_info: Dict[str, Any] = {}
@@ -733,7 +734,10 @@ class TerrariaAgent:
         return await self.mod.give_item(iid, 1)
 
     async def navigate_to(self, x: int, y: int, timeout: int = 25) -> bool:
-        """自动寻路走到坐标（v3.0: 流式导航——C# BFS 寻路 + 状态流，可中断）"""
+        """自动寻路走到坐标（v3.0: 流式导航——C# BFS 寻路 + 状态流，可中断）。
+
+        导航途中遇敌 → 停下打怪 → 打完继续走（参考轮子插件）。
+        """
         await self.capability.refresh()
         st = self._state
         cur_y = st.get("tile_y", 0)
@@ -742,11 +746,43 @@ class TerrariaAgent:
             self.log(f"落差{height_diff}格单次上不去，尝试分段爬升", "nav")
             return await self.climb_to(x, y)
 
-        ok = await self.mod.navigate_async(x, y, timeout)
+        ok = await self._nav_with_fight(x, y, timeout)
         self.log(f"走到 ({x},{y}) " + ("成功" if ok else "失败/超时"), "nav")
         if not ok:
             await self.send_chat(f"主人，我过不去 ({x},{y})，卡住了，等你想想办法~")
         return ok
+
+    async def _nav_with_fight(self, x: int, y: int, timeout: int,
+                              _tries: int = 0) -> bool:
+        """带战斗守卫的导航：遇敌停下打，打完重新导航续走（最多 3 轮）。"""
+        if _tries > 3:
+            return False
+        fought = {"yes": False}
+
+        async def _guard():
+            # 战斗中不自我嵌套（战斗内部的风筝移动也是 navigate_to）
+            if self._in_combat:
+                return False
+            try:
+                st = self.get_state()
+            except Exception:
+                return False
+            enemies = [e for e in (st.get("nearby_npcs", []) or [])
+                       if e.get("damage", 0) > 0 and e.get("life", 0) > 0]
+            if not enemies:
+                return False
+            fought["yes"] = True
+            self.log(f"导航途中遇敌（{len(enemies)}只），先打再走", "combat")
+            await self.combat.fight_nearest(st, timeout=6)
+            return True  # 打断本次导航，由外层重发导航续走
+
+        ok = await self.mod.navigate_async(x, y, timeout, on_tick=_guard)
+        if ok:
+            return True
+        # 只有真遇敌打断才续走；导航本身失败（卡住/超时）不重复白等
+        if fought["yes"]:
+            return await self._nav_with_fight(x, y, timeout, _tries + 1)
+        return False
 
     async def climb_to(self, x: int, y: int, _round: int = 1) -> bool:
         """复杂垂直移动（深坑回地面）：先规划分段，再逐段执行"""

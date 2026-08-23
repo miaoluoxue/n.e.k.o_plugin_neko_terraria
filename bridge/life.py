@@ -112,8 +112,20 @@ class LifeEngine:
 
     # ---------------- 砍树 ----------------
 
+    async def _say_no_tool(self, kind: str, msg: str) -> None:
+        """无执行条件情感交互：没工具时跟主人撒娇要（进程内说话，不静默）。"""
+        try:
+            await self.agent.send_chat(msg)
+        except Exception:
+            pass
+        self.agent.log(msg, "warn")
+
     async def chop_wood(self, target: int = 10) -> int:
-        """砍树收集木材。返回本次获得的数量（背包计数确认）。"""
+        """砍树收集木材。返回本次获得的数量（背包计数确认）。
+
+        真实砍树：走过去 → 选斧头 → 朝树挥斧 → 收掉落 → 计数。
+        人物必须真的走到树边（C# InReach 距离校验），挥斧砍下才算数。
+        """
         # 木材物品 id=9
         iid = 9
         try:
@@ -122,13 +134,14 @@ class LifeEngine:
         except Exception:
             before = -1
 
-        # 选斧头
+        # 选斧头；没有就跟主人撒娇（无执行条件情感交互）
         if not await self.select_tool("axe"):
-            self.agent.log("没斧头，砍不了树~", "warn")
+            await self._say_no_tool(
+                "斧", "主人我没有斧头无法砍树喵，主人有也可以给我喵")
             return 0
 
         got = 0
-        for _ in range(3):  # 最多砍 3 棵
+        for _ in range(4):  # 最多砍 4 棵
             if self.agent.executor and self.agent.executor.should_stop():
                 break
             trees = await self.agent.mod.find_trees(radius=30)
@@ -136,22 +149,41 @@ class LifeEngine:
                 break
             tree = trees[0]
             tx, ty = int(tree.get("x", 0)), int(tree.get("y", 0))
-            # 走过去
+            # 走过去（导航途中遇敌会先打再走）
             try:
                 await self.agent.navigate_to(tx, ty, timeout=15)
             except Exception:
                 pass
-            # 砍
-            try:
-                ok = await self.agent.mod.chop_trees(tx, ty)
-            except Exception:
-                ok = False
-            if not ok:
-                continue
-            await asyncio.sleep(0.5)
-            # 收集掉落
+            # 选好斧头，朝树根挥砍（真实挥斧，树真的会被砍倒）
+            await self.select_tool("axe")
+            for _ in range(12):
+                if self.agent.executor and self.agent.executor.should_stop():
+                    break
+                try:
+                    await self.agent.mod.use_item(tx, ty)
+                except Exception:
+                    break
+                await asyncio.sleep(0.35)
+            # 收掉落再数木头（树倒下掉地上的木材得先捡）
+            await asyncio.sleep(0.3)
             try:
                 await self.agent.mod.collect_items(radius=400)
+            except Exception:
+                pass
+            try:
+                inv2 = self.agent.get_inventory_sync()
+                now = _count_id(inv2, iid)
+                if now > before + got:
+                    got = now - before
+                    continue  # 这棵砍到了，下一棵
+            except Exception:
+                pass
+            # 挥了 12 下还没倒：补一发原生砍树（有 InReach 校验，真走到才生效）
+            try:
+                ok = await self.agent.mod.chop_trees(tx, ty)
+                if ok:
+                    await asyncio.sleep(0.3)
+                    await self.agent.mod.collect_items(radius=400)
             except Exception:
                 pass
 
@@ -177,9 +209,10 @@ class LifeEngine:
         - 特殊生物群系水域：丛林/雪地/腐化/神圣/地狱 特有鱼
         鱼饵（蚯蚓/萤火虫/龙虾）是消耗品，use_item 朝水会自动消耗背包鱼饵。
         """
-        # 选钓竿
+        # 选钓竿；没有就跟主人撒娇
         if not await self.select_tool("rod"):
-            self.agent.log("没有钓竿，钓不了鱼~", "warn")
+            await self._say_no_tool(
+                "钓竿", "主人我没有钓竿钓不了鱼喵，主人有也可以给我喵")
             return False
 
         # 感知当前生物群系（决定钓什么水域的鱼）

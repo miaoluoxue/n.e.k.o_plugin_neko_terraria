@@ -328,6 +328,37 @@ class TaskChain:
                 )
             return ok
 
+        if target in ("附近", "周围", "目标", ""):
+            # 附近探索：真实走动一段（人物必须动起来，不能站着算完成）。
+            # 先看附近有没有可去的有趣点（矿/树），没有就往一侧走 ~50 格。
+            try:
+                ores = await self.agent.mod.find_ore(radius=30)
+                if ores:
+                    o = ores[0]
+                    return bool(await self.agent.navigate_to(
+                        int(o.get("x", 0) or 0), int(o.get("y", 0) or 0),
+                        timeout=30))
+            except Exception:
+                pass
+            try:
+                trees = await self.agent.mod.find_trees(radius=30)
+                if trees:
+                    t = trees[0]
+                    return bool(await self.agent.navigate_to(
+                        int(t.get("x", 0) or 0), int(t.get("y", 0) or 0),
+                        timeout=30))
+            except Exception:
+                pass
+            # 往世界中间方向走（不贴边），确认真的到达才算完成
+            direction = 1 if sx < 4000 else -1
+            tx = sx + direction * 50
+            ok = bool(await self.agent.navigate_to(tx, sy, timeout=30))
+            if self.agent:
+                self.agent.log(
+                    f"探索：向{'右' if direction > 0 else '左'}走了 {abs(tx - sx)} 格"
+                    f"{'（成功）' if ok else '（失败）'}", "nav")
+            return ok
+
         if target in ("地下", "下方", "underground"):
             # v0.5: 完整地下探索闭环（找洞→下挖→挖矿→回家），替代单纯下挖 25 格
             explorer = getattr(self.agent, "explorer", None)

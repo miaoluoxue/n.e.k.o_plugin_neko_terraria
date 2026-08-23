@@ -58,8 +58,8 @@ class Reasoner:
         if depth > 3 or not item:
             return None
 
-        # 能力物品（镐/钩）要先落成具体物品名
-        if item in ("镐", "钩爪"):
+        # 能力物品（镐/斧/钓竿/钩）要先落成具体物品名
+        if item in ("镐", "斧", "钓竿", "钩爪"):
             return await self._fix_capability(item, vi, depth)
 
         # 1) 身上其实就有
@@ -156,11 +156,18 @@ class Reasoner:
 
         只认死那几个原版镐子的话，装了 mod 的存档会漏掉一堆能用的工具。
         """
-        base = list(PICKAXE_CANDIDATES) if kind == "镐" else ["抓钩", "Grappling Hook"]
+        base = {
+            "镐": list(PICKAXE_CANDIDATES),
+            "斧": ("铜斧", "铁斧", "银斧", "金斧", "Wooden Axe"),
+            "钓竿": ("木钓竿", "钓竿", "铁钓竿", "Fishing Rod"),
+            "钩爪": ["抓钩", "Grappling Hook"],
+        }.get(kind, [])
+        if isinstance(base, tuple):
+            base = list(base)
         reg = getattr(self.agent, "registry", None)
         if reg is None:
             return base
-        want = "tool" if kind == "镐" else "accessory"
+        want = "tool" if kind in ("镐", "斧") else "accessory"
         try:
             names: List[str] = []
             for mod, items in getattr(reg, "mods", {}).items():
@@ -172,6 +179,13 @@ class Reasoner:
                     tg = tags.get(name, [])
                     if kind == "镐" and ("pickaxe" in tg or "pick" in tg
                                          or "镐" in name or "pickaxe" in name):
+                        names.append(name)
+                    elif kind == "斧" and ("axe" in tg or "斧" in name
+                                           or "axe" in name):
+                        names.append(name)
+                    elif kind == "钓竿" and ("fishing" in tg or "钓竿" in name
+                                             or "鱼竿" in name
+                                             or "rod" in name):
                         names.append(name)
                     elif kind == "钩爪" and ("hook" in tg or "钩" in name
                                              or "hook" in name):
@@ -206,4 +220,11 @@ class Reasoner:
                 best = f
         if best:
             return best
-        return Fix(how="ask", desc=f"我没有{kind}，主人给我一个吧", cost=COST_ASK)
+        # 无执行条件情感交互：说清楚缺什么、想要主人怎么帮
+        ask_msg = {
+            "镐": "主人我没有镐子挖不了矿喵，主人有也可以给我喵",
+            "斧": "主人我没有斧头无法砍树喵，主人有也可以给我喵",
+            "钓竿": "主人我没有钓竿钓不了鱼喵，主人有也可以给我喵",
+            "钩爪": "主人我没有钩爪爬不上去喵，主人有也可以给我喵",
+        }.get(kind, f"我没有{kind}，主人给我一个吧")
+        return Fix(how="ask", desc=ask_msg, cost=COST_ASK)

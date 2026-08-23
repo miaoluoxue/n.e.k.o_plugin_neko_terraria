@@ -830,9 +830,25 @@ namespace NekoTerrariaLink
             }
         }
 
+        /// <summary>玩家到目标格的曼哈顿距离（格）。</summary>
+        private static int TileDist(int x, int y)
+        {
+            var p = Main.LocalPlayer;
+            if (p == null) return int.MaxValue;
+            int px = (int)(p.Center.X / 16f), py = (int)(p.Center.Y / 16f);
+            return Math.Abs(px - x) + Math.Abs(py - y);
+        }
+
+        /// <summary>目标格是否在玩家可触及范围内（真走到附近才允许改世界，防远程假完成）。</summary>
+        private static bool InReach(int x, int y, int range = 8)
+        {
+            return TileDist(x, y) <= range;
+        }
+
         private bool BreakTile(Dict cmd)
         {
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
+            if (!InReach(x, y, 8)) return false;   // 太远：人物没走过去就不许拆
             WorldGen.KillTile(x, y, false, false, true);
             SyncTile(x, y, 1);   // 破坏 → 服务器广播
             return true;
@@ -842,6 +858,7 @@ namespace NekoTerrariaLink
         {
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
             int tile = (int)cmd.GetNum("tile");
+            if (!InReach(x, y, 8)) return false;   // 太远：人物没走过去就不许放
             bool ok = WorldGen.PlaceTile(x, y, tile, false, false, -1, 0);
             if (ok) SyncTile(x, y, 0);   // 放置 → 服务器广播
             return ok;
@@ -859,8 +876,21 @@ namespace NekoTerrariaLink
         {
             var ctrl = Main.LocalPlayer?.GetModPlayer<NekoControlPlayer>();
             if (ctrl == null) return false;
-            if (ctrl.useSlot < 0) ctrl.useSlot = Main.LocalPlayer.selectedItem;
-            ctrl.useTicks = 10;
+            // 始终使用当前选中物品（select_item 后 useSlot 可能残留旧的）
+            ctrl.useSlot = Main.LocalPlayer.selectedItem;
+            ctrl.useTicks = 15;   // 约 0.25s 持续挥动（战斗/砍树/钓鱼循环每轮刷新）
+            // 支持目标坐标：让角色朝向/挥动方向对准目标（战斗/砍树/钓鱼用）
+            if (cmd.Has("target_x"))
+            {
+                ctrl.digTargetX = (int)cmd.GetNum("target_x");
+                ctrl.digTargetY = (int)cmd.GetNum("target_y");
+            }
+            else
+            {
+                // 不带目标时清掉旧目标，避免光标残留在上次战斗/砍树点
+                ctrl.digTargetX = -1;
+                ctrl.digTargetY = -1;
+            }
             return true;
         }
 
@@ -1779,6 +1809,7 @@ namespace NekoTerrariaLink
             var ctrl = p.GetModPlayer<NekoControlPlayer>();
             if (ctrl == null) return false;
             if (!TrySetDigTarget(x, y)) return false;
+            if (!InReach(x, y, 8)) return false;   // 太远：人物没走过去就不许挖
             // 找背包里镐力最强的镐子
             int pickSlot = -1, pickPower = 0;
             for (int i = 0; i < p.inventory.Length; i++)
@@ -2149,7 +2180,7 @@ namespace NekoTerrariaLink
         {
             var player = Main.LocalPlayer;
             bool hasHook = player != null && HasHook(player);
-            int dirtCount = 0, hasPick = 0, pickPower = 0, rope = 0;
+            int dirtCount = 0, hasPick = 0, pickPower = 0, rope = 0, hasAxe = 0, hasRod = 0;
             if (player != null)
             {
                 for (int i = 0; i < player.inventory.Length; i++)
@@ -2158,6 +2189,8 @@ namespace NekoTerrariaLink
                     if (it.type == 0) continue;
                     if (it.type == 0 || it.type == 1) dirtCount += it.stack;
                     if (it.pick > 0) { hasPick = 1; pickPower = Math.Max(pickPower, it.pick); }
+                    if (it.axe > 0) hasAxe = 1;
+                    if (it.fishingPole > 0 || it.Name.Contains("钓竿") || it.Name.Contains("鱼竿")) hasRod = 1;
                     if (it.createTile == 65 || it.createTile == 415) rope += it.stack;
                 }
             }
@@ -2166,6 +2199,7 @@ namespace NekoTerrariaLink
                 ["has_hook"] = hasHook, ["hook_range"] = hasHook ? 22 : 0,
                 ["dirt_count"] = dirtCount, ["has_pickaxe"] = hasPick == 1,
                 ["pickaxe_power"] = pickPower, ["rope_count"] = rope,
+                ["has_axe"] = hasAxe == 1, ["has_rod"] = hasRod == 1,
                 ["nearby_stations"] = NearbyStations(player),
             });
         }
@@ -2256,6 +2290,7 @@ namespace NekoTerrariaLink
             var p = Main.LocalPlayer;
             if (p == null) return false;
             int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
+            if (!InReach(tx, ty, 10)) return false;   // 太远：人物没走过去不许砍（防远程假完成）
             int count = 0;
             for (int dy = -25; dy <= 2; dy++)
             {

@@ -138,6 +138,12 @@ namespace NekoTerrariaLink
                 useTicks--;
             }
             if (hookTicks > 0) { p.controlHook = true; hookTicks--; }
+            // 面向目标：近战挥动/挖掘方向对准目标（战斗时人物不动也朝怪方向砍）
+            if (digTargetX >= 0 && digTargetY >= 0)
+            {
+                int tdx = digTargetX - (int)(p.Center.X / 16f);
+                if (tdx != 0) p.direction = Math.Sign(tdx);
+            }
         }
         private int _diagFrame = 0;
 

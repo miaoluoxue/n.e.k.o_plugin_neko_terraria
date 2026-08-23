@@ -55,6 +55,20 @@ class CombatEngine:
         if not target:
             return False
 
+        # 战斗中置标志：防止导航遇敌守卫自我嵌套（战斗内部的风筝移动也是 navigate_to）
+        if self.agent is not None:
+            self.agent._in_combat = True
+        try:
+            return await self._fight_loop(state, timeout, check_task,
+                                          px0, py0, target)
+        finally:
+            if self.agent is not None:
+                self.agent._in_combat = False
+
+    async def _fight_loop(self, state: Dict[str, Any], timeout: int,
+                          check_task: Optional[Callable[[], bool]],
+                          px0: int, py0: int,
+                          target: Dict[str, Any]) -> bool:
         # 战斗前选好武器（近战/远程/魔法/召唤中伤害最高，陪玩真实感）
         try:
             life = getattr(self.agent, "life", None)
@@ -125,7 +139,8 @@ class CombatEngine:
                 offset = -2 if tx > px else 2
                 target_y = ty + 1 if dy < -2 else ty
                 await self.mod.navigate_to(tx + offset, target_y, timeout=1)
-            await self.mod.damage_npc(slot, 50)
+            # 真实武器挥动：朝敌人 tile 坐标挥砍（方向由 C# 面向目标自动对准）
+            await self.mod.use_item(tx, ty)
 
             # 伤害后刷新状态读最新血量（联机伤害由服务器结算，缓存不刷新会拿到旧值）
             new_hp = hp

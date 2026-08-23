@@ -238,7 +238,9 @@ class AutonomousBrain:
             except Exception:
                 pass
 
-        # ── P1 战斗：无前台任务才打（P1 优先级，但可让路） ──
+        # ── P1 战斗：无前台任务才打（P1 优先级，但可让路）。
+        # 有主线任务时（如挖矿/砍树），途中遇敌由导航守卫（navigate_to 的 on_tick）
+        # 停下先打再走；这里不打断主线，避免两条控制流抢操作权。
         if enemies and not handled:
             ex = getattr(self.agent, "executor", None)
             fg_busy = bool(ex and ex.busy())

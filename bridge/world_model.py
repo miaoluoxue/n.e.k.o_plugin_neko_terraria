@@ -20,12 +20,15 @@ class VirtualInventory:
 
     counts: Dict[str, int] = field(default_factory=dict)
     has_pickaxe: bool = False
+    has_axe: bool = False
+    has_rod: bool = False
     has_hook: bool = False
     rope: int = 0
     dirt: int = 0
 
     def copy(self) -> "VirtualInventory":
         return VirtualInventory(dict(self.counts), self.has_pickaxe,
+                                self.has_axe, self.has_rod,
                                 self.has_hook, self.rope, self.dirt)
 
     def count(self, item: str) -> int:
@@ -35,9 +38,13 @@ class VirtualInventory:
         if not item or n <= 0:
             return
         self.counts[item] = self.count(item) + n
-        # 拿到镐子/钩爪，能力也跟着变，后续步骤要看得到
+        # 拿到镐子/斧头/钓竿/钩爪，能力也跟着变，后续步骤要看得到
         if "镐" in item:
             self.has_pickaxe = True
+        if "斧" in item:
+            self.has_axe = True
+        if "钓竿" in item or "鱼竿" in item:
+            self.has_rod = True
         if "钩" in item:
             self.has_hook = True
         if "绳" in item or "梯" in item:
@@ -52,6 +59,16 @@ class VirtualInventory:
         self.counts[item] = self.count(item) - n
         if item in ("土块", "泥土"):
             self.dirt = max(0, self.dirt - n)
+        # 工具用完归零 → 能力收回（推演内闭环）
+        if self.count(item) <= 0:
+            if "镐" in item:
+                self.has_pickaxe = False
+            if "斧" in item:
+                self.has_axe = False
+            if "钓竿" in item or "鱼竿" in item:
+                self.has_rod = False
+            if "钩" in item:
+                self.has_hook = False
         return True
 
 
@@ -124,6 +141,8 @@ class WorldModel:
         try:
             await cap.refresh()
             vi.has_pickaxe = cap.has_pickaxe()
+            vi.has_axe = cap.has_axe()
+            vi.has_rod = cap.has_rod()
             vi.has_hook = cap.has_hook()
             vi.rope = cap.rope_count()
             vi.dirt = cap.dirt_count()
@@ -268,6 +287,28 @@ class WorldModel:
                     st.produces = item
                     st.note = f"在箱子({chest.get('x')},{chest.get('y')})"
 
+            elif action == "chop":
+                # 砍树：得有斧头（能力物品）
+                if not vi.has_axe:
+                    st.ok = False
+                    st.gap = "没有斧头，砍不了树"
+                    st.need_item = "斧"
+                    st.need_amount = 1
+                else:
+                    st.produces = item or "木材"
+                    st.note = "用斧头砍"
+
+            elif action == "fish":
+                # 钓鱼：得有钓竿
+                if not vi.has_rod:
+                    st.ok = False
+                    st.gap = "没有钓竿，钓不了鱼"
+                    st.need_item = "钓竿"
+                    st.need_amount = 1
+                else:
+                    st.produces = item or "鱼"
+                    st.note = "用钓竿钓"
+
             elif action == "give":
                 if vi.count(item) < amt:
                     st.ok = False
@@ -300,7 +341,8 @@ class WorldModel:
     def _desc(action: str, item: str, amt: int) -> str:
         table = {"mine": "挖", "gather": "挖", "craft": "合成",
                  "fetch": "取", "give": "给主人", "climb": "爬到",
-                 "goto": "走到", "follow": "回到主人身边"}
+                 "goto": "走到", "follow": "回到主人身边",
+                 "chop": "砍", "fish": "钓"}
         head = table.get(action, action)
         if action in ("climb", "goto", "follow"):
             return head

@@ -32,6 +32,12 @@ class Capability:
     def has_pickaxe(self) -> bool:
         return bool(self._cache.get("has_pickaxe", False))
 
+    def has_axe(self) -> bool:
+        return bool(self._cache.get("has_axe", False))
+
+    def has_rod(self) -> bool:
+        return bool(self._cache.get("has_rod", False))
+
     def pickaxe_power(self) -> int:
         return int(self._cache.get("pickaxe_power", 0))
 
