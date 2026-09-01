@@ -13,9 +13,6 @@ class ModLink:
 
     # 注意：mod 对每条命令都会回 ACK，这些动作也必须把回执读走，
     # 否则残留回执会让后续请求读到上一条的答复（串线）
-    async def move(self, directions: List[str]) -> None:
-        await self.conn.request_mod({"cmd": "move", "dirs": directions})
-
     async def place_tile(self, x: int, y: int, tile_type: int) -> bool:
         resp = await self.conn.request_mod(
             {"cmd": "place_tile", "x": x, "y": y, "tile": tile_type})
@@ -179,7 +176,7 @@ class ModLink:
     async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
         resp = await self.conn.request_mod(
             {"cmd": "navigate_to", "x": x, "y": y, "timeout": timeout},
-            timeout=timeout + 2)
+            timeout=timeout + 5)
         return bool(resp and resp.get("ok"))
 
     # ── v3.0: 流式导航──
@@ -213,11 +210,11 @@ class ModLink:
         try:
             resp = await self.conn.request_mod(
                 {"cmd": "navigate_stream", "x": x, "y": y, "timeout": timeout},
-                timeout=timeout + 2)
+                timeout=timeout + 5)
             # 导航未启动（no_path/连接问题）直接失败，不等事件
             if resp is None or not resp.get("ok"):
                 return False
-            deadline = _time.time() + timeout + 2
+            deadline = _time.time() + timeout + 5
             while True:
                 remaining = deadline - _time.time()
                 if remaining <= 0:
@@ -256,15 +253,25 @@ class ModLink:
             callbacks.discard(on_nav)
 
     async def navigate_stream_fire(self, x: int, y: int) -> None:
-        """流式导航 fire-and-forget：发 navigate_stream 不等事件。
+        """流式导航 fire-and-forget：发 navigate_stream 不等事件/ACK。
 
         跟随场景用：每轮实时更新目标（C# 侧路径代际接管，旧任务不误清），
-        相比 navigate_async 阻塞等待（15s 延迟）做到"主人走 AI 立刻追"。
+        C# 侧全程走完才回 ACK——这里不阻塞等待，发完立即返回，
+        调用方（follow_loop）每轮不再被 1.5s 超时拖住。
         """
+        import asyncio
+        conn = self.conn
+
+        async def _fire():
+            try:
+                await conn.request_mod(
+                    {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
+                    timeout=1.5)
+            except Exception:
+                pass
+
         try:
-            await self.conn.request_mod(
-                {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
-                timeout=1.5)
+            asyncio.get_running_loop().create_task(_fire())
         except Exception:
             pass
 

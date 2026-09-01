@@ -724,12 +724,13 @@ namespace NekoTerrariaLink
 
         private void ExecuteCommand(string line, NetworkStream stream)
         {
+            long reqId = 0;
             try
             {
                 var cmd = JsonParser.Parse(line);
                 if (cmd == null) return;
                 // 透传 req_id：Python 侧用它把回执与请求一一对应，避免串线
-                long reqId = (long)cmd.GetNum("req_id");
+                reqId = (long)cmd.GetNum("req_id");
                 var p0 = Main.LocalPlayer;
                 if (++_diagCmdCount % 20 == 1)
                 {
@@ -759,7 +760,7 @@ namespace NekoTerrariaLink
                     case "dig_tile": RunOnMain(stream, reqId, () => DigTile(cmd)); break;
                     case "navigate_to": NavigateTo(stream, cmd, reqId); break;
                     case "navigate_stream": NavigateStream(stream, cmd, reqId); break;
-                    case "send_chat": SendAck(stream, reqId, SendChatMessage(cmd)); break;
+                    case "send_chat": Main.QueueMainThreadAction(() => SendAck(stream, reqId, SendChatMessage(cmd))); break;
                     case "get_inventory": SendInventory(stream, reqId); break;
                     case "enum_chests": Main.QueueMainThreadAction(() => SendChests(stream, reqId)); break;
                     case "store_item": RunOnMain(stream, reqId, () => StoreItem(cmd)); break;
@@ -768,8 +769,8 @@ namespace NekoTerrariaLink
                     case "get_state": SendState(stream, reqId, cmd.GetValue("player_name")); break;
                     case "enum_items": RunInBackground(() => SendItemRegistry(stream, reqId), "enum_items"); break;
                     case "get_capabilities": SendCapabilities(stream, reqId); break;
-                    case "scan_ledges": SendLedges(stream, reqId, cmd); break;
-                    case "find_ore": SendOrePositions(stream, reqId, cmd); break;
+                    case "scan_ledges": Main.QueueMainThreadAction(() => SendLedges(stream, reqId, cmd)); break;
+                    case "find_ore": Main.QueueMainThreadAction(() => SendOrePositions(stream, reqId, cmd)); break;
                     case "get_server_info": SendServerInfo(stream, reqId); break;
                     case "join_server": SendAck(stream, reqId, JoinServer(cmd)); break;
                     case "select_character": RunOnMain(stream, reqId, () => SelectCharacter(cmd)); break;
@@ -782,14 +783,23 @@ namespace NekoTerrariaLink
                     case "use_mirror": RunOnMain(stream, reqId, () => UseMirror(cmd)); break;
                     case "place_chest": RunOnMain(stream, reqId, () => PlaceChest(cmd)); break;
                     case "quick_stack": RunOnMain(stream, reqId, () => QuickStack(cmd)); break;
-                    case "find_trees": SendTreePositions(stream, reqId, cmd); break;
+                    case "find_trees": Main.QueueMainThreadAction(() => SendTreePositions(stream, reqId, cmd)); break;
                     case "chop_trees": RunOnMain(stream, reqId, () => ChopTrees(cmd)); break;
-                    case "find_water": SendWaterPositions(stream, reqId, cmd); break;
+                    case "find_water": Main.QueueMainThreadAction(() => SendWaterPositions(stream, reqId, cmd)); break;
+                    case "collect_items":
+                        RunOnMainCollect(stream, reqId, cmd);
+                        break;
+                    default:
+                        // 未知命令也回执，避免 Python 端 3s 超时空等
+                        SendAck(stream, reqId, false);
+                        break;
                 }
             }
             catch (Exception ex)
             {
                 Logger.Warn($"[NekoTerrariaLink] 忽略非法指令: {line.Substring(0, Math.Min(line.Length, 200))}  错误: {ex.Message}");
+                // 异常也要回执：否则 Python 端 request_mod 超时 3s（命令"不执行"假象）
+                try { SendAck(stream, reqId, false); } catch { }
             }
         }
 
@@ -811,6 +821,20 @@ namespace NekoTerrariaLink
                 }
             }
             return true;
+        }
+
+        /// <summary>同步箱子槽位到服务器（联机时本地直改 Main.chest 不会被服务器看到）。</summary>
+        private static void SyncChest(int idx, int slot)
+        {
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+            {
+                try
+                {
+                    NetMessage.SendData(MessageID.SyncChestItem, -1, -1,
+                        null, idx, slot, 0f, 0f, 0, 0, 0);
+                }
+                catch { }
+            }
         }
 
         /// <summary>
@@ -1060,7 +1084,8 @@ namespace NekoTerrariaLink
             int y = (int)cmd.GetNum("y");
             var p = Main.LocalPlayer;
             if (p == null) return false;
-            p.Teleport(new Vector2(x, y), 1);
+            // 命令坐标是 tile 格，Teleport 需要像素
+            p.Teleport(new Vector2(x * 16f, y * 16f), 1);
             return true;
         }
 
@@ -1141,6 +1166,7 @@ namespace NekoTerrariaLink
                         it.stack -= add;
                         if (it.stack <= 0) it.SetDefaults(0);
                         stacked++;
+                        SyncChest(chestIdx, k);
                         break;
                     }
                 }
@@ -1799,6 +1825,56 @@ namespace NekoTerrariaLink
             return true;
         }
 
+        /// <summary>收集半径内地面掉落物（把物品移到玩家身上，联机广播）。
+        /// 返回拾取数量；radius 为像素半径（与 Python 端语义一致）。</summary>
+        private void RunOnMainCollect(NetworkStream s, long reqId, Dict cmd)
+        {
+            Main.QueueMainThreadAction(() =>
+            {
+                try
+                {
+                    int n = CollectItems(cmd);
+                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = true, ["collected"] = n });
+                }
+                catch
+                {
+                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["collected"] = 0 });
+                }
+            });
+        }
+
+        private int CollectItems(Dict cmd)
+        {
+            int radius = (int)(cmd.GetNum("radius") > 0 ? cmd.GetNum("radius") : 600);
+            var player = Main.LocalPlayer;
+            if (player == null) return 0;
+            float px = player.Center.X, py = player.Center.Y;
+            float rr = radius;   // 像素半径（与轮子项目一致）
+            int collected = 0;
+            for (int i = 0; i < Main.item.Length; i++)
+            {
+                var it = Main.item[i];
+                if (it == null || !it.active || it.type <= 0) continue;
+                float dx = it.Center.X - px, dy = it.Center.Y - py;
+                if (dx * dx + dy * dy > rr * rr) continue;
+                // 让物品进背包（玩家靠近自动拾取）
+                try
+                {
+                    if (player.CanAcceptItemIntoInventory(it))
+                    {
+                        player.GetItem(player.whoAmI, it, GetItemSettings.InventoryEntityToPlayerInventorySettings);
+                        collected++;
+                    }
+                }
+                catch { }
+                it.active = false;
+                if (Main.netMode == NetmodeID.MultiplayerClient)
+                    NetMessage.SendData(MessageID.SyncItem, -1, -1, null, i, 0f, 0f, 0f, 0, 0, 0);
+            }
+            Logger.Info($"[CollectItems] radius={radius} collected={collected}");
+            return collected;
+        }
+
         /// <summary>原生物品挖掘（mod 原生能力）：自动选镐子 → PreItemCheck 修正光标 →
         /// controlUseItem 持续挖（工具动画/消耗/属性）。不可挖 tile 返回 false。</summary>
         private bool DigTile(Dict cmd)
@@ -1912,6 +1988,7 @@ namespace NekoTerrariaLink
                         var nw = src.Clone();
                         nw.stack = Math.Min(stack, src.stack);
                         chest.item[k] = nw;
+                        SyncChest(idx, k);
                         return true;
                     }
                     if (ci.type == src.type && ci.stack < ci.maxStack)
@@ -1920,6 +1997,7 @@ namespace NekoTerrariaLink
                         ci.stack += add;
                         src.stack -= add;
                         if (src.stack <= 0) src.SetDefaults(0);
+                        SyncChest(idx, k);
                         return true;
                     }
                 }
@@ -1948,6 +2026,7 @@ namespace NekoTerrariaLink
                     player.QuickSpawnItem(Src, got, take);
                     it.stack -= take;
                     if (it.stack <= 0) it.SetDefaults(0);
+                    SyncChest(idx, k);
                     return true;
                 }
                 return false;
@@ -2032,7 +2111,11 @@ namespace NekoTerrariaLink
                     }
                     Send(s, new Dict { ["req_id"] = reqId, ["type"] = "recipes", ["recipes"] = list });
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Logger.Error($"[Recipes] 生成配方列表异常: {ex.GetType().Name}: {ex.Message}");
+                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "recipe_exception" });
+                }
             });
         }
 
@@ -2136,7 +2219,11 @@ namespace NekoTerrariaLink
                         mods.Add(new Dict { ["mod"] = kv.Key, ["count"] = kv.Value.Count, ["items"] = kv.Value });
                     Send(s, new Dict { ["req_id"] = reqId, ["type"] = "item_registry", ["mods"] = mods });
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Logger.Error($"[Registry] 生成物品表异常: {ex.GetType().Name}: {ex.Message}");
+                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "registry_exception" });
+                }
             });
         }
 

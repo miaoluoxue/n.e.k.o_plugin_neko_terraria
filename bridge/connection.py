@@ -7,32 +7,6 @@ from typing import Callable, Dict, Optional
 
 log = logging.getLogger(__name__)
 
-# 优先级：# 高优先级命令（移动/导航/战斗/聊天/状态）插队，其余排队。
-# 大请求（enum_* / get_recipes / enum_chests）算低优先级，别堵住主线。
-HIGH_PRIORITY_CMDS = {
-    "move",
-    "navigate_to",
-    "navigate_stream",
-    "dig_tile",
-    "find_ore",
-    "use_item",
-    "use_item_slot",
-    "select_item",
-    "equip",
-    "damage_npc",
-    "send_chat",
-    "get_state",
-    "get_server_info",
-    "get_capabilities",
-    "join_status",
-    "get_network_info",
-    "ping",
-    "warp",
-    "hook",
-    "break_tile",
-    "place_tile",
-    "collect_items",
-}
 # 明确低优先级：这些容易几 MB，排后面
 LOW_PRIORITY_CMDS = {"enum_items", "get_recipes", "enum_chests"}
 
@@ -58,19 +32,7 @@ class Connection:
         self._pending: Dict[int, asyncio.Future] = {}  # req_id → future
         self._read_task: Optional[asyncio.Task] = None
 
-        # A6：优先级发送队列——高优先级命令插队，避免大请求堵住移动/导航/聊天
-        self._send_q: "asyncio.Queue[dict]" = asyncio.Queue()
-        self._sender_task: Optional[asyncio.Task] = None
-        self._sendentinel = object()
-
-    # ===== A6 优先级发送器 =====
-    # 协议一次一条，发送锁在 request_mod 内；为避免大请求（几 MB 响应）在后台
-    # 生成期间把 send 通道占住，这里在【发送命令】层做优先级缓冲：
-    #   高优（移动/导航/战斗/聊天/取状态）即刻插队发送；
-    #   低优（enum_* / get_recipes）排队到空闲再发。
-    # 由于 _mod_lock 串行且每条命令先发后等，响应由独立读循环分发，
-    # 高优命令不会等低优的响应——这正是"命令不下发"的根因之一。
-
+    # ===== 发送器 =====
     async def request_mod(self, cmd: dict, timeout: float = 3.0) -> Optional[dict]:
         """向 mod 接口发送 JSON 命令并等待回执（独立读循环按 req_id 分发）。
 
@@ -127,11 +89,11 @@ class Connection:
 
         async def _try_connect(port: int) -> bool:
             try:
-                # limit=8MB：大响应（enum_items 物品表/get_recipes 配方表/enum_chests 箱子列表）
-                # 可能几百 KB，StreamReader 默认 64KB limit 会导致 readline 抛
+                # limit=32MB：大响应（enum_items 物品表/get_recipes 配方表/enum_chests 箱子列表）
+                # 可能几 MB，StreamReader 默认 64KB limit 会导致 readline 抛
                 # ValueError("chunk exceed the limit") → 响应读不完 → 请求超时
                 r, w = await asyncio.wait_for(
-                    asyncio.open_connection(self.mod_host, port, limit=8 * 1024 * 1024), timeout=2.0
+                    asyncio.open_connection(self.mod_host, port, limit=32 * 1024 * 1024), timeout=2.0
                 )
                 self._mod_reader, self._mod_writer = r, w
                 self.mod_port = port

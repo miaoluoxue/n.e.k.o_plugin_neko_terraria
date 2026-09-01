@@ -16,9 +16,8 @@ def test_plugin_manifest_declares_expected_entrypoint_and_runtime():
     manifest = _manifest()
 
     assert manifest["plugin"]["id"] == "neko_terraria"
-    # 用户安装场景下宿主 normalize 会把 plugin.plugins. 前缀改写为 plugins.；
-    # 本插件直接声明 plugins. 前缀（实测 plugin.plugins. 前缀在本宿主下导入失败）
-    assert manifest["plugin"]["entry"] == "plugins.neko_terraria:NTerrariaPlugin"
+    # entry 使用新格式 plugin.plugins. 前缀（与 neko_pawpilot 一致，neko-plugin check 通过）
+    assert manifest["plugin"]["entry"] == "plugin.plugins.neko_terraria:NTerrariaPlugin"
     assert manifest["plugin_runtime"]["enabled"] is True
 
 

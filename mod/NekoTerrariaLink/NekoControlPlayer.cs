@@ -113,8 +113,9 @@ namespace NekoTerrariaLink
             {
                 if (moveDir < 0) p.controlLeft = true;
                 else if (moveDir > 0) p.controlRight = true;
-                if (jumpTicks > 0) { p.controlJump = true; jumpTicks--; }
             }
+            // 跳跃独立于移动方向：纯跳跃/“up” 命令也要生效
+            if (jumpTicks > 0) { p.controlJump = true; jumpTicks--; }
         }
 
         public override void PreUpdateMovement()

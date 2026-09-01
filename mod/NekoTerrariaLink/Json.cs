@@ -159,8 +159,23 @@ namespace NekoTerrariaLink
             {
                 if (rest[0] == '\\' && rest.Length > 1)
                 {
-                    sb.Append(rest[1]);
-                    rest = rest.Substring(2);
+                    char c = rest[1];
+                    switch (c)
+                    {
+                        case '"': sb.Append('"'); rest = rest.Substring(2); break;
+                        case '\\': sb.Append('\\'); rest = rest.Substring(2); break;
+                        case '/': sb.Append('/'); rest = rest.Substring(2); break;
+                        case 'n': sb.Append('\n'); rest = rest.Substring(2); break;
+                        case 'r': sb.Append('\r'); rest = rest.Substring(2); break;
+                        case 't': sb.Append('\t'); rest = rest.Substring(2); break;
+                        case 'b': sb.Append('\b'); rest = rest.Substring(2); break;
+                        case 'f': sb.Append('\f'); rest = rest.Substring(2); break;
+                        case 'u' when rest.Length >= 6:
+                            sb.Append((char)Convert.ToInt32(rest.Substring(2, 4), 16));
+                            rest = rest.Substring(6);
+                            break;
+                        default: sb.Append(c); rest = rest.Substring(2); break;
+                    }
                 }
                 else
                 {
