@@ -121,7 +121,6 @@ class StandingJobs:
         logger.info(f"🚶 follow_loop 开始执行，task.name={task.name}, kind={task.kind}")
         lt = self.lt
         self._following = False  # 重置跟随状态
-        self._nav_fails = 0      # 导航连续失败计数（直走兜底用）
         lost = 0
         # 贴身模式（"跟在我身边"）：target=="stick" → 用贴身阈值
         stick = task.target == "stick"
@@ -257,6 +256,58 @@ class StandingJobs:
                 await asyncio.sleep(self.timing.action_duration(1.0))
             await asyncio.sleep(self.timing.action_duration(0.3))
 
+    # ---------------- 砍树 ----------------
+    async def chop_loop(self, task: StandingTask) -> None:
+        """没说砍多少就一直砍，砍满 goal_amount（若有）或被叫停才停。"""
+        lt = self.lt
+        wood = task.target or "木材"
+        life = self.agent.life
+        empty_streak = 0  # 连续砍空次数（触发询问）
+        while not lt.should_stop(task.kind):
+            if not await lt.wait_turn(task.kind):
+                break
+
+            if task.goal_amount and task.progress >= task.goal_amount:
+                task.beat(f"{wood} 够了，一共 {task.progress} 个")
+                break
+
+            try:
+                got = await life.chop_wood(target=MINE_BATCH)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                task.beat(f"砍不动：{e}")
+                await asyncio.sleep(self.timing.action_duration(1.5))
+                continue
+
+            if got:
+                task.progress += int(got)
+                empty_streak = 0
+                task.beat(f"又砍到 {wood}，一共 {task.progress} 个")
+                await self._notify_step("chop",
+                    f"砍到{got}个{wood}，共{task.progress}个",
+                    ore=wood, got=int(got), total=task.progress)
+            else:
+                empty_streak += 1
+                task.beat(f"这附近没{wood}了")
+                # v2.1: 连续砍空 → 主动问主人（不阻塞砍树循环，回答由 coordinator 匹配）
+                if empty_streak >= 4:
+                    empty_streak = 0
+                    inq_mgr = getattr(self.agent, "inquiry", None)
+                    if inq_mgr and not inq_mgr.has_pending:
+                        inq = inq_mgr.ask(
+                            f"这附近砍不到{wood}了，换个地方还是继续砍？",
+                            options=["换个地方", "继续砍"], timeout=45.0)
+                        if inq:
+                            try:
+                                await self.agent.send_chat(inq.question)
+                            except Exception:
+                                pass
+                            # 后台等回答/超时，避免 pending 永久占位吞掉主人后续指令
+                            self._spawn_inquiry_wait(inq_mgr, inq)
+                await asyncio.sleep(self.timing.action_duration(1.0))
+            await asyncio.sleep(self.timing.action_duration(0.3))
+
     # ---------------- 守在这 ----------------
     async def guard_loop(self, task: StandingTask) -> None:
         """守在某点附近，走远了自己回来，有敌人就打。
@@ -329,9 +380,15 @@ class StandingJobs:
     async def start(self, kind: str, target: str = "", amount: int = 0,
                     reason: str = "", **params) -> Dict[str, Any]:
         """按 kind 起一个长期任务。"""
+        # 木材/树类目标 → 砍树（长期任务语义：砍够为止）
+        WOOD_WORDS = ("木材", "木", "树", "木头")
+        if kind == "mine" and target in WOOD_WORDS:
+            kind = "chop"
+            target = "木材"
         table = {
             "follow": ("跟着主人", self.follow_loop),
             "mine": (f"一直挖{target or '矿'}", self.mine_loop),
+            "chop": (f"一直砍{target or '木材'}", self.chop_loop),
             "guard": ("守在这里", self.guard_loop),
         }
         if kind not in table:

@@ -165,11 +165,18 @@ class TaskBrain:
                                     report_fail="探索没成功，主人"))
                 p.outline.append(f"探索{tgt}")
             elif action == "mine":
-                # 真挖矿：goal_type 用 "mine"，走 task_chain 默认挖矿流程（find_ore→dig→计数）
-                p.goals.append(Goal(goal_type="mine", target=item, amount=amt,
-                                    reason=goal_text,
-                                    report_fail=f"挖 {item} 没成功，主人"))
-                p.outline.append(f"挖{item}x{amt}")
+                # 目标为木材/树类时转 chop（真砍树，选斧头）；否则真挖矿
+                if item in ("木材", "木", "树", "木头"):
+                    p.goals.append(Goal(goal_type="chop", target=item, amount=amt,
+                                        reason=goal_text,
+                                        report_fail=f"砍 {item} 没成功，主人"))
+                    p.outline.append(f"砍{item}x{amt}")
+                else:
+                    # 真挖矿：goal_type 用 "mine"，走 task_chain 默认挖矿流程（find_ore→dig→计数）
+                    p.goals.append(Goal(goal_type="mine", target=item, amount=amt,
+                                        reason=goal_text,
+                                        report_fail=f"挖 {item} 没成功，主人"))
+                    p.outline.append(f"挖{item}x{amt}")
             elif action == "chop":
                 # 砍树：goal_type 用 "chop"（LifeEngine 真砍树，选斧头）
                 p.goals.append(Goal(goal_type="chop", target=item, amount=amt,

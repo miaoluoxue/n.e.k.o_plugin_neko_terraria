@@ -19,11 +19,11 @@ FOLLOW_WORDS = ("跟着", "跟上", "跟我", "跟随", "别走丢", "一起走"
 # 贴身跟随：跟在身边/贴贴（距离阈值更近，5-8格触发 / 2-3格停止）
 STICK_WORDS = ("身边", "贴身", "贴贴", "寸步不离", "别离开我", "别走远", "黏着我")
 GUARD_WORDS = ("守着", "守在", "待在这", "别乱跑", "原地待命")
-MINE_WORDS = ("挖", "采", "开采")
+MINE_WORDS = ("挖", "采", "开采", "砍")
 
 # 明确要求停止
 STOP_WORDS = ("别跟", "不用跟", "停下", "别挖", "停止", "歇着", "不用挖",
-              "别守", "结束任务", "停手")
+              "别守", "结束任务", "停手", "别砍", "不用砍", "别砍了")
 
 # 表示"一直/持续"的强化词
 FOREVER_WORDS = ("一直", "持续", "不停", "一路", "继续")
@@ -33,6 +33,7 @@ ORE_ALIAS = {
     "铁": "铁矿", "铜": "铜矿", "银": "银矿", "金": "金矿",
     "锡": "锡矿", "铅": "铅矿", "钨": "钨矿", "铂金": "铂金矿",
     "陨石": "陨石矿", "恶魔石": "恶魔石", "石头": "石块", "木": "木材",
+    "树": "木材", "木材": "木材",
 }
 
 CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
@@ -79,7 +80,7 @@ def _parse_ore(text: str) -> str:
     for alias, full in ORE_ALIAS.items():
         if alias in text:
             return full
-    m = re.search(r"(?:挖|采|开采)\s*(?:点|些)?\s*([\u4e00-\u9fa5]{1,4}?)(?:矿)?",
+    m = re.search(r"(?:挖|采|开采|砍)\s*(?:点|些)?\s*([\u4e00-\u9fa5]{1,4}?)(?:矿)?",
                   text)
     if m:
         w = m.group(1).strip()
@@ -99,6 +100,8 @@ def parse(text: str) -> Intent:
         kind = ""
         if any(w in low for w in ("跟", "跟着")):
             kind = "follow"
+        elif "砍" in low:
+            kind = "chop"  # "别砍了/不用砍"→ 停砍树（长期砍树注册为 chop）
         elif any(w in low for w in MINE_WORDS):
             kind = "mine"
         elif any(w in low for w in ("守",)):

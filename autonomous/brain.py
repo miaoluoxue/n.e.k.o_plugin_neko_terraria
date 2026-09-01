@@ -337,8 +337,8 @@ class AutonomousBrain:
         if not enabled:
             return
 
-        lo = self.cfg.get("llm_think_min_seconds", 60)
-        hi = self.cfg.get("llm_think_max_seconds", 120)
+        lo = self.cfg.get("llm_think_min_seconds", 120)
+        hi = self.cfg.get("llm_think_max_seconds", 240)
 
         # 首轮延迟：入服后等 10 秒再让 LLM 思考
         await asyncio.sleep(10)
@@ -354,8 +354,10 @@ class AutonomousBrain:
                 if ex and ex.busy():
                     continue
 
-                # 无聊度太低也没必要
-                if self.state.boredom < 0.3:
+                # 无聊度太低也没必要（阈值 0.6：只有明显无聊才自主思考，
+                # 曾 0.3——boredom 涨得快，60-120s 就推一条 respond，主人没说话时
+                # 积压多条自主思考 respond，宿主 LLM 一次性吐出 → 刷屏拼接）
+                if self.state.boredom < 0.6:
                     continue
 
                 # 获取上下文
@@ -385,7 +387,11 @@ class AutonomousBrain:
 
                     push = getattr(self.plugin, "push_message", None)
                     if push:
-                        push(parts=[{"type": "text", "text": prompt}], ai_behavior="respond")
+                        push(parts=[{"type": "text", "text": prompt}],
+                             ai_behavior="respond",
+                             # 防堆积：同类自主思考消息合并，主人长时间不说话时
+                             # 不会积压多条 respond 等下一轮一次性吐出
+                             coalesce_key="terraria_llm_think")
                         self.plugin.logger.info(f"[brain] LLM 自主思考已推送，boredom={self.state.boredom:.2f}")
                     else:
                         # 无 LLM 通道：规则兜底
@@ -585,8 +591,6 @@ class AutonomousBrain:
                 f"[任务状态] 「{name}」被中断了（{reason}）。这是状态通知，任务没有完成。",
                 ai_behavior="respond",
             )
-        except Exception:
-            pass
         except Exception:
             pass
 

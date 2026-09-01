@@ -13,7 +13,12 @@ class VisionBridge:
     def __init__(self, cfg: dict, push_message=None) -> None:
         self.cfg = cfg
         self.push = push_message
-        self.min_interval = cfg.get("screenshot_stream_min_interval_seconds", 6.0)
+        # ★ 截图推宿主 LLM 的间隔：曾默认 6s——boot 后约 100 秒内推 17-18 张
+        #   全屏截图进宿主 pending queue（read 模式），用户下一轮说话时 LLM 一次
+        #   携带全部图片+文本 → 上下文爆炸、LLM 卡死数分钟、恢复后拼接刷屏、
+        #   且 llm_tool 指令（terraria_command）随 LLM 卡住不执行。
+        #   120s 一张：仍保留"猫娘看到主人画面"的陪伴感，同时单轮最多多 1 张图。
+        self.min_interval = cfg.get("screenshot_stream_min_interval_seconds", 120.0)
         self._last = 0.0
 
     async def on_frame(self, b64: str, mime: str) -> None:
@@ -92,6 +97,7 @@ class VisionPipeline:
         self._frame_source: Optional[Callable] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # 截图采集循环间隔：与推宿主 LLM 的间隔解耦（采集可快，推送受 bridge 节流）
         self._interval = cfg.get("vision_capture_interval_seconds", 6.0)
 
     def set_frame_source(self, fn: Callable) -> None:

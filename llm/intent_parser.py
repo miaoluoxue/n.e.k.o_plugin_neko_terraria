@@ -274,13 +274,16 @@ class LLMIntentParser:
         t = text.lower()
         stop_kws = ("别跟了", "不跟了", "别跟着", "别跟", "不用跟", "别追了",
                     "停下", "停止", "停一下", "别动", "住手",
-                    "别做了", "别弄了", "别挖了", "别采了", "别打了", "别守了", "不用守")
+                    "别做了", "别弄了", "别挖了", "别采了", "别打了", "别守了", "不用守",
+                    "别砍了", "别砍", "不用砍")
         for kw in stop_kws:
             if kw not in t:
                 continue
             kind = ""
             if "跟" in t or "追" in t:
                 kind = "follow"
+            elif "砍" in t:
+                kind = "chop"  # 长期砍树任务注册为 chop（mine+木材归一化）
             elif "挖" in t or "采" in t:
                 kind = "mine"
             elif "守" in t:

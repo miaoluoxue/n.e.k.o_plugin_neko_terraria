@@ -38,7 +38,14 @@ class UnifiedLLMClient:
         except ImportError:
             raise RuntimeError("需要安装 httpx: pip install httpx")
 
+        # base_url 语义：API 根（如 https://api.deepseek.com）或完整端点均可。
+        # 只给根/无端点的补 /v1/chat/completions，避免把根路径当端点直接 POST（404）；
+        # 已以 /v1 结尾的不再重复加 v1
         url = self.base_url or "https://api.openai.com/v1/chat/completions"
+        if "/chat/completions" not in url:
+            base = url.rstrip("/")
+            url = base if base.endswith("/v1") else f"{base}/v1"
+            url = f"{url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

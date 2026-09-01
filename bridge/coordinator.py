@@ -222,7 +222,11 @@ class TaskCoordinator:
     # ---------------- 停止 ----------------
     async def _do_stop(self, it) -> Dict[str, Any]:
         if it.kind:
+            # 长期砍树任务注册为 chop（start() 里 mine+木材 归一化而来），
+            # 而"别砍了"intent 解析 kind=mine → 两个 key 都要查
             t = self.lt.get(it.kind)
+            if t is None and it.kind == "mine":
+                t = self.lt.get("chop")
             if t is None:
                 # 停的可能是前台有限任务（如"挖10个铁"进行中）→ 校验名称匹配再停
                 cur = self.executor.current()
@@ -231,7 +235,7 @@ class TaskCoordinator:
                     return {"ok": True, "output": "好的，我不做了~"}
                 return {"ok": True, "output": "我本来就没在做这个呀~"}
             name = t.name
-            await self.lt.stop(it.kind, "主人喊停")
+            await self.lt.stop(t.kind, "主人喊停")
             return {"ok": True, "output": f"好的，不{name}了~"}
         # 没指明停什么：全停
         names = await self.lt.stop_all("主人喊停")
@@ -247,7 +251,7 @@ class TaskCoordinator:
         kind = it.kind or ""
         name = str(cur.get("name", "") or "")
         table = {"follow": ("跟", "跟随"), "mine": ("挖", "矿", "采"),
-                 "guard": ("守",)}
+                 "chop": ("砍", "树", "木"), "guard": ("守",)}
         kw = table.get(kind)
         if not kw:
             return True  # kind 未知：保守停前台

@@ -295,117 +295,146 @@ class LifecycleMixin:
             "open_in": "new_tab",
         }])
 
-        # startup 在常驻事件循环中调度，create_task 启动的长任务可存活
-        async def _boot() -> None:
+        # ★ 启动不在 on_load 里 create_task：宿主的 lifecycle.startup 在临时
+        #   asyncio.run() 循环中执行（plugin/core/host.py:1162），create_task
+        #   的后台任务随循环结束被取消，boot 永远跑不完 → brain/交互/感知全不
+        #   启动（"几乎全部交互功能都有问题"的根因之一）。改为
+        #   _on_command_loop_start 在宿主持久命令循环上调度，见该钩子 docstring。
+
+    async def _on_command_loop_start(self) -> None:
+        """在宿主持久命令循环上调度 boot。
+
+        宿主在 _async_command_loop 开头调用本钩子
+        （plugin/core/host.py:1611-1621），它所在的 asyncio loop 就是之后所有
+        @plugin_entry/@llm_tool/@message 处理器运行的同一个长生命周期循环。
+        在这里 create_task 的后台任务能存活；且 create_task 立即返回，不阻塞
+        downlink_ready 的标记（host 在钩子返回后才 set）。
+        """
+        if getattr(self, "_boot_task", None) is not None:
+            return
+        self._boot_task = asyncio.create_task(self._boot())
+
+    async def _boot(self) -> None:
+        try:
+            self.logger.info("[boot] 开始启动 neko_terraria...")
+            await self._load_config()
+            self.logger.info("[boot] 配置加载完成")
+
+            # v2.1: 加载主项目角色人设（注入到 config 中供 habits/context 使用）
+            persona = await self._try_load_host_persona()
+            if persona:
+                self._config["_host_persona"] = persona
+                self.logger.info("[boot] 角色人设已注入")
+
+            # v2.0: LLM 集成（agent 启动前注入，确保首次 handle() 就能走 LLM）
+            await self._wire_llm_integration()
+            self.logger.info("[boot] LLM 集成完成")
+
+            self.logger.info("[boot] 正在连接游戏 Agent...")
             try:
-                self.logger.info("[boot] 开始启动 neko_terraria...")
-                await self._load_config()
-                self.logger.info("[boot] 配置加载完成")
-
-                # v2.1: 加载主项目角色人设（注入到 config 中供 habits/context 使用）
-                persona = await self._try_load_host_persona()
-                if persona:
-                    self._config["_host_persona"] = persona
-                    self.logger.info("[boot] 角色人设已注入")
-
-                # v2.0: LLM 集成（agent 启动前注入，确保首次 handle() 就能走 LLM）
-                await self._wire_llm_integration()
-                self.logger.info("[boot] LLM 集成完成")
-
-                self.logger.info("[boot] 正在连接游戏 Agent...")
-                try:
-                    # 硬超时：即使连接卡死，也继续启动大脑/交互（脑驱动 > 完美连接）
-                    ok = await asyncio.wait_for(self._agent.start(), timeout=45.0)
-                except asyncio.TimeoutError:
-                    ok = False
-                    self.logger.warning("[boot] Agent 连接超时（45s），继续启动大脑（可能游戏未开）")
-                except Exception as e:
-                    ok = False
-                    self.logger.warning(f"[boot] Agent 连接异常: {e}")
-                if not ok:
-                    self.logger.warning("Agent 未就绪，但继续启动大脑/交互（猫娘仍能思考说话）")
-                else:
-                    self.logger.info("[boot] Agent 启动成功")
-
-                # v2.0: brain.start() 内部会拉起交互引擎 + 注册 executor 回调
-                try:
-                    await asyncio.wait_for(self._autonomous_brain.start(), timeout=20.0)
-                except asyncio.TimeoutError:
-                    self.logger.warning("[boot] 自治大脑启动超时，尝试强制拉起")
-                    try:
-                        await self._autonomous_brain.start()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    self.logger.warning(f"[boot] 自治大脑启动异常: {e}")
-                self.logger.info("[boot] 自治大脑启动完成")
-
-                # v2.1: 交互引擎暴露给 agent → service/coordinator 可通过 agent._neko_interaction 访问
-                self._agent._neko_interaction = self._autonomous_brain.interaction
-                self._service.interaction = self._autonomous_brain.interaction
-
-                # v3.0: 绑定游戏事件发射器到交互引擎
-                self._service.bind_emitter_to_interaction()
-
-                await self._service.start()
-                self.logger.info("[boot] 游戏状态服务启动完成")
-
-                # v2.0: vision LLM 后注入（vision 在 agent.start() 后才初始化）
-                await self._wire_vision_llm()
-
-                # v2.1: 启动视觉管线。截图源（v0.7）：主玩家窗口截图优先（猫娘"看"
-                # 主人画面，陪伴感核心），失败时降级到 mod 截图（猫娘自己视角）。
-                vp = getattr(self._agent, "vision", None)
-                if vp:
-                    try:
-                        from ..perception.owner_screen import owner_window_frame
-                        mod_shot = self._agent.mod.screenshot
-
-                        async def _frame_source():
-                            try:
-                                f = await owner_window_frame()
-                                if f:
-                                    return f
-                            except Exception:
-                                pass
-                            return await mod_shot()
-
-                        vp.set_frame_source(_frame_source)
-                    except Exception:
-                        vp.set_frame_source(self._agent.mod.screenshot)
-                    await vp.start()
-                    self.logger.info("[boot] 视觉感知管线已启动（主人画面优先）")
-
-                # v0.7: 常驻场景上下文注入（read 模式不打扰，供主 LLM 人设感知）
-                try:
-                    # SDK push_message 是同步方法，不能 await
-                    self.push_message(
-                        parts=[{"type": "text", "text": (
-                            "[场景] 猫娘在泰拉瑞亚世界里陪主人玩：她在游戏里有一个身体"
-                            "（会疼、会累、会害怕、会冷），能看到主人的画面动态，"
-                            "对主人有长期依恋情感。用角色人设自然地互动，"
-                            "该场景贯穿本次会话。")}],
-                        visibility=[], ai_behavior="read")
-                except Exception:
-                    pass
-
-                self.logger.info("猫娘已进入泰拉瑞亚世界（v2.1 交互引擎 + 紧急事件已接通）")
+                # 硬超时：即使连接卡死，也继续启动大脑/交互（脑驱动 > 完美连接）
+                ok = await asyncio.wait_for(self._agent.start(), timeout=45.0)
+            except asyncio.TimeoutError:
+                ok = False
+                self.logger.warning("[boot] Agent 连接超时（45s），继续启动大脑（可能游戏未开）")
             except Exception as e:
-                import traceback
-                self.logger.error(f"[boot] 启动过程中抛出未捕获异常: {e}")
-                self.logger.error(f"[boot] 堆栈跟踪:\n{traceback.format_exc()}")
-                # 如果是 asyncio 任务内部的异常，也要让宿主感知
+                ok = False
+                self.logger.warning(f"[boot] Agent 连接异常: {e}")
+            if not ok:
+                self.logger.warning("Agent 未就绪，但继续启动大脑/交互（猫娘仍能思考说话）")
+            else:
+                self.logger.info("[boot] Agent 启动成功")
+
+            # v2.0: brain.start() 内部会拉起交互引擎 + 注册 executor 回调
+            try:
+                await asyncio.wait_for(self._autonomous_brain.start(), timeout=20.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("[boot] 自治大脑启动超时，尝试强制拉起")
                 try:
-                    self.push_message(
-                        parts=[{"type": "text",
-                                "text": f"[系统] neko_terraria 启动失败: {e}"}],
-                        visibility=["hud"], ai_behavior="blind")
+                    await self._autonomous_brain.start()
                 except Exception:
                     pass
-        asyncio.create_task(_boot())
+            except Exception as e:
+                self.logger.warning(f"[boot] 自治大脑启动异常: {e}")
+            self.logger.info("[boot] 自治大脑启动完成")
+
+            # v2.1: 交互引擎暴露给 agent → service/coordinator 可通过 agent._neko_interaction 访问
+            self._agent._neko_interaction = self._autonomous_brain.interaction
+            self._service.interaction = self._autonomous_brain.interaction
+
+            # v3.0: 绑定游戏事件发射器到交互引擎
+            self._service.bind_emitter_to_interaction()
+
+            await self._service.start()
+            self.logger.info("[boot] 游戏状态服务启动完成")
+
+            # v2.0: vision LLM 后注入（vision 在 agent.start() 后才初始化）
+            await self._wire_vision_llm()
+
+            # v2.1: 启动视觉管线。截图源（v0.7）：主玩家窗口截图优先（猫娘"看"
+            # 主人画面，陪伴感核心），失败时降级到 mod 截图（猫娘自己视角）。
+            vp = getattr(self._agent, "vision", None)
+            if vp:
+                try:
+                    from ..perception.owner_screen import owner_window_frame
+                    mod_shot = self._agent.mod.screenshot
+
+                    async def _frame_source():
+                        try:
+                            f = await owner_window_frame()
+                            if f:
+                                return f
+                        except Exception:
+                            pass
+                        return await mod_shot()
+
+                    vp.set_frame_source(_frame_source)
+                except Exception:
+                    vp.set_frame_source(self._agent.mod.screenshot)
+                await vp.start()
+                self.logger.info("[boot] 视觉感知管线已启动（主人画面优先）")
+
+            # v0.7: 常驻场景上下文注入（read 模式不打扰，供主 LLM 人设感知）
+            try:
+                # SDK push_message 是同步方法，不能 await
+                self.push_message(
+                    parts=[{"type": "text", "text": (
+                        "[场景] 猫娘在泰拉瑞亚世界里陪主人玩：她在游戏里有一个身体"
+                        "（会疼、会累、会害怕、会冷），能看到主人的画面动态，"
+                        "对主人有长期依恋情感。用角色人设自然地互动，"
+                        "该场景贯穿本次会话。")}],
+                    visibility=[], ai_behavior="read")
+            except Exception:
+                pass
+
+            self.logger.info("猫娘已进入泰拉瑞亚世界（v2.1 交互引擎 + 紧急事件已接通）")
+        except Exception as e:
+            import traceback
+            self.logger.error(f"[boot] 启动过程中抛出未捕获异常: {e}")
+            self.logger.error(f"[boot] 堆栈跟踪:\n{traceback.format_exc()}")
+            # 如果是 asyncio 任务内部的异常，也要让宿主感知
+            try:
+                self.push_message(
+                    parts=[{"type": "text",
+                            "text": f"[系统] neko_terraria 启动失败: {e}"}],
+                    visibility=["hud"], ai_behavior="blind")
+            except Exception:
+                pass
 
     @lifecycle(id="shutdown")
     async def on_unload(self) -> None:
+        # 取消还在跑的 boot 任务（可能卡在 agent.start() 45s 超时中），
+        # 避免它与下面的 stop 序列竞态（agent 启动一半被 stop，残留子进程）
+        boot_task = getattr(self, "_boot_task", None)
+        if boot_task is not None and not boot_task.done():
+            boot_task.cancel()
+            try:
+                await boot_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._boot_task = None
         # v3.0: 关闭记忆存储（SQLite）
         closer = getattr(self, "_close_memory", None)
         if closer:

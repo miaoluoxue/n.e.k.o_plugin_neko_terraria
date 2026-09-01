@@ -506,9 +506,15 @@ class InteractionEngine:
         # 这是"情感交互有声音"的兜底关键：宿主没接 push_message 时猫娘也会开口。
         try:
             await self.agent.speak(text, ai_behavior=behavior)
+            # #95 治理：只有真正开口（respond）才清零冲动 + 进入说话冷却。
+            # read 是上下文数据（step_done/画面感知），blind 是紧急短句——
+            # 二者若也刷新冷却/清零 urge，挖矿时每步 read 会持续压制主动说话，
+            # 猫娘永远不开口（"闷头干活"假象）。blind 紧急短句也不设冷却，
+            # 允许连续危险连续喊。
+            if behavior == "respond":
+                self._urge = 0.0  # 说过话了，冲动值清零
+                self._speech_cooldown_until = time.time() + self.timing.reaction_delay()
             self._last_speech_ts = time.time()
-            self._urge = 0.0  # 说过话了，冲动值清零
-            self._speech_cooldown_until = time.time() + self.timing.reaction_delay()
         except Exception:
             pass  # 推送失败不崩溃
 
@@ -680,7 +686,7 @@ class InteractionEngine:
         prompt = f"""[猫娘主动说话 - {scene_desc}]
 说话风格：{json.dumps(style, ensure_ascii=False)}
 话题提示：{topic}
-{self.owner.curiosity_question()}{fact}{vision_fact}
+{fact}{vision_fact}
 
 请用猫娘语气说1-2句话（不要超过30字），基于当前场景自然地说。"""
 
@@ -988,6 +994,9 @@ class InteractionEngine:
             "interrupted_at": time.time(),
             "snapshot": snapshot or {},
         })
+        # 只保留最近 5 条：恢复询问按 LIFO 弹最新一条，老的中断没必要一直占内存
+        if len(self._interrupted_stack) > 5:
+            self._interrupted_stack = self._interrupted_stack[-5:]
 
     def memory_count(self) -> int:
         return len(self._interrupted_stack)
