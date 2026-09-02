@@ -177,6 +177,14 @@ class AutonomousBrain:
                 if ex and ex.busy():
                     await asyncio.sleep(interval)
                     continue
+                # v2.2: 有长期任务在跑 → 自主行动（gather/explore/social/comfort）
+                # 全部让位。此前 bug：主人说"跟着我"后 follow 是长期任务不占
+                # executor 前台，fast_think 每 5s 仍跑 _act_on_drive——
+                # social drive（主人在旁 0.85）触发 follow_player 前台任务 →
+                # request_yield → follow 永久"让路等着"，猫娘不跟还在自主行动。
+                if self._has_longterm():
+                    await asyncio.sleep(interval)
+                    continue
                 drive = self.motivation.update(state, self.state.boredom)
                 await self._act_on_drive(drive, state)
             except asyncio.CancelledError:
@@ -184,6 +192,20 @@ class AutonomousBrain:
             except Exception as e:
                 self.plugin.logger.warning(f"[brain] _fast_think 异常: {e}")
             await asyncio.sleep(interval)
+
+    def _has_longterm(self) -> bool:
+        """是否有活跃长期任务（跟随/挖矿/守点/砍树）。
+
+        有则自主行为让位——主人明确指令 > 自主决策。用 busy_kinds()
+        （无日志）而非 active()（每条都打 info 日志，5s 轮询会刷屏）。
+        """
+        try:
+            lt = getattr(self.agent, "longterm", None)
+            if lt is None:
+                return False
+            return bool(lt.busy_kinds())
+        except Exception:
+            return False
 
     async def _guard_check(self, state: Dict[str, Any]) -> bool:
         """无条件优先级守卫。返回 True 表示本轮已处理（跳过其余自主行为）。
@@ -241,7 +263,11 @@ class AutonomousBrain:
         # ── P1 战斗：无前台任务才打（P1 优先级，但可让路）。
         # 有主线任务时（如挖矿/砍树），途中遇敌由导航守卫（navigate_to 的 on_tick）
         # 停下先打再走；这里不打断主线，避免两条控制流抢操作权。
+        # v2.2: 有长期任务（跟随/挖矿/守点）→ 不主动打怪——主人明确指令优先于
+        # 自主战斗（"别打怪了来跟着我"），且 fight_nearest 会抢占操作权。
         if enemies and not handled:
+            if self._has_longterm():
+                return handled
             ex = getattr(self.agent, "executor", None)
             fg_busy = bool(ex and ex.busy())
             if fg_busy:
@@ -352,6 +378,11 @@ class AutonomousBrain:
                 # 有前台任务在执行 → 不打扰（长期任务/跟随是常态，不阻塞自主思考）
                 ex = getattr(self.agent, "executor", None)
                 if ex and ex.busy():
+                    continue
+
+                # v2.2: 有长期任务在跑 → 不自主 LLM 决策（跟随/挖矿中猫娘
+                # 不该自己另起炉灶抢控制权，主人指令优先）
+                if self._has_longterm():
                     continue
 
                 # 无聊度太低也没必要（阈值 0.6：只有明显无聊才自主思考，
