@@ -278,90 +278,108 @@ class TerrariaAgent:
         self.conn.close()
 
     async def _state_loop(self) -> None:
-        """定期刷新状态 + 死亡/复活/联机模式检测"""
+        """状态维护循环 + 死亡/复活/联机检测 + 周期杂务。
+
+        v2.3 减主线程负担：状态改由 mod 主动推送驱动——
+          game_state 每 2s 推全量（hp/位置/敌人/玩家/身体感字段，见 C# PushGameState）
+          player_status 每 1s 推 hp/位置
+        这里不再每秒 get_state 轮询（曾与推送重复，给 C# 主线程徒增 200 NPC 扫描）。
+        保留低频兜底轮询（兜底间隔秒，推送断/漏时补），其余周期杂务节奏不变。
+        """
         player_name = self._character_name()
         bus = get_event_bus()
         self.log(f"_state_loop 启动, player_name='{player_name}', running={self._running}")
         self.plugin.logger.info(f"[_state_loop] 启动 player_name='{player_name}'")
         loop_count = 0
+        # 低频兜底 get_state 间隔：推送 2s 一次，兜底 5s 足矣（断推时最多 5s 旧状态）
+        fallback_interval = max(3, int(self.cfg.get("state_fallback_poll_seconds", 5) or 5))
         while self._running:
             loop_count += 1
             try:
-                # 轮询式：每秒主动拉状态（请求内读流，响应可靠收到）
-                st = await self.mod.get_state(player_name)
-                if st:
-                    self._state = st
-                    # ── 死亡/复活检测（基于推送的缓存血量） ──
-                    hp = st.get("hp", -1)
+                # 兜底轮询（低频繁）：推送为主，这里只在游戏状态事件尚未填缓存时补一次，
+                # 并承担死亡/复活/联机检测（推送是主通道，轮询是保险）
+                if loop_count == 1 or loop_count % fallback_interval == 0:
+                    st = await self.mod.get_state(player_name)
+                    if st:
+                        # 只补缺失字段，不覆盖推送的实时数据（避免旧响应盖新推送）
+                        for k, v in st.items():
+                            if k not in self._state:
+                                self._state[k] = v
+                        # ── 死亡/复活检测（基于推送的缓存血量） ──
+                        hp = st.get("hp", -1)
 
-                    # 检测死亡：hp==0 且之前未标记死亡
-                    if hp == 0 and not self._is_dead:
-                        self._is_dead = True
-                        self._death_count += 1
-                        tx = st.get("tile_x", st.get("x", 0))
-                        ty = st.get("tile_y", st.get("y", 0))
-                        self._death_position = (tx, ty)
-                        self._death_message = f"角色在 tile=({tx},{ty}) 死亡 (第{self._death_count}次)"
-                        print(f"[agent] 💀 {self._death_message}")
-                        bus.fire(
-                            "player_died",
-                            {
-                                "count": self._death_count,
-                                "position": self._death_position,
-                                "message": self._death_message,
-                            },
-                        )
+                        # 检测死亡：hp==0 且之前未标记死亡
+                        if hp == 0 and not self._is_dead:
+                            self._is_dead = True
+                            self._death_count += 1
+                            tx = st.get("tile_x", st.get("x", 0))
+                            ty = st.get("tile_y", st.get("y", 0))
+                            self._death_position = (tx, ty)
+                            self._death_message = f"角色在 tile=({tx},{ty}) 死亡 (第{self._death_count}次)"
+                            print(f"[agent] 💀 {self._death_message}")
+                            bus.fire(
+                                "player_died",
+                                {
+                                    "count": self._death_count,
+                                    "position": self._death_position,
+                                    "message": self._death_message,
+                                },
+                            )
 
-                    # 检测复活：hp>0 且之前标记为死亡
-                    if hp > 0 and self._is_dead:
-                        self._is_dead = False
-                        tx = st.get("tile_x", st.get("x", 0))
-                        ty = st.get("tile_y", st.get("y", 0))
-                        print(f"[agent] ✨ 角色复活！hp={hp} pos=({tx},{ty}) 累计死亡={self._death_count}")
-                        bus.fire(
-                            "player_respawned",
-                            {
-                                "hp": hp,
-                                "position": {"tile_x": tx, "tile_y": ty},
-                                "death_count": self._death_count,
-                            },
-                        )
-                        # 触发复活回调（brain 注册的自动寻路等）
-                        for cb in self.respawn_callbacks:
-                            try:
-                                if asyncio.iscoroutinefunction(cb):
-                                    asyncio.ensure_future(cb())
-                                else:
-                                    cb()
-                            except Exception:
-                                pass
+                        # 检测复活：hp>0 且之前标记为死亡
+                        if hp > 0 and self._is_dead:
+                            self._is_dead = False
+                            tx = st.get("tile_x", st.get("x", 0))
+                            ty = st.get("tile_y", st.get("y", 0))
+                            print(f"[agent] ✨ 角色复活！hp={hp} pos=({tx},{ty}) 累计死亡={self._death_count}")
+                            bus.fire(
+                                "player_respawned",
+                                {
+                                    "hp": hp,
+                                    "position": {"tile_x": tx, "tile_y": ty},
+                                    "death_count": self._death_count,
+                                },
+                            )
+                            # 触发复活回调（brain 注册的自动寻路等）
+                            for cb in self.respawn_callbacks:
+                                try:
+                                    if asyncio.iscoroutinefunction(cb):
+                                        asyncio.ensure_future(cb())
+                                    else:
+                                        cb()
+                                except Exception:
+                                    pass
 
-                    # 更新上一帧血量（供 service 暴跌检测）
-                    self._last_hp = hp
+                        # 更新上一帧血量（供 service 暴跌检测）
+                        self._last_hp = hp
 
-                    # ── 联机模式检测 ──
-                    nearby = st.get("nearby_players", []) or []
-                    has_other = False
-                    if nearby and isinstance(nearby, list):
-                        me_x = int(st.get("tile_x", 0) or 0)
-                        me_y = int(st.get("tile_y", 0) or 0)
-                        for p in nearby:
-                            if isinstance(p, dict):
-                                name = p.get("name", "")
-                                px = int(p.get("tile_x", 0) or 0)
-                                py = int(p.get("tile_y", 0) or 0)
-                                dist = ((px - me_x) ** 2 + (py - me_y) ** 2) ** 0.5
-                                if name and name != player_name and dist < MULTIPLAYER_DIST_THRESHOLD:
-                                    has_other = True
-                                    break
-                    if has_other != self._multiplayer_mode:
-                        self._multiplayer_mode = has_other
-                        mode_str = "联机" if self._multiplayer_mode else "单人"
-                        print(f"[agent] 🔄 模式切换 → {mode_str}模式")
-                        bus.fire("multiplayer_mode_changed", {"mode": mode_str})
+                        # ── 联机模式检测 ──
+                        nearby = st.get("nearby_players", []) or []
+                        has_other = False
+                        if nearby and isinstance(nearby, list):
+                            me_x = int(st.get("tile_x", 0) or 0)
+                            me_y = int(st.get("tile_y", 0) or 0)
+                            for p in nearby:
+                                if isinstance(p, dict):
+                                    name = p.get("name", "")
+                                    px = int(p.get("tile_x", 0) or 0)
+                                    py = int(p.get("tile_y", 0) or 0)
+                                    dist = ((px - me_x) ** 2 + (py - me_y) ** 2) ** 0.5
+                                    if name and name != player_name and dist < MULTIPLAYER_DIST_THRESHOLD:
+                                        has_other = True
+                                        break
+                        if has_other != self._multiplayer_mode:
+                            self._multiplayer_mode = has_other
+                            mode_str = "联机" if self._multiplayer_mode else "单人"
+                            print(f"[agent] 🔄 模式切换 → {mode_str}模式")
+                            bus.fire("multiplayer_mode_changed", {"mode": mode_str})
 
             except Exception as e:
                 self.log(f"_state_loop 处理异常: {e}", "error")
+
+            # 周期杂务（节奏不变，用 self._state 缓存而非本地 st——
+            # 现在状态主要由推送维护，缓存就是最新）
+            st = self._state
 
             # 背包完全按需：挖矿/查询/装备时主动 get_inventory，这里不轮询。
             # 箱子缓存低频刷新（变化慢），供取物/存物使用
@@ -465,7 +483,7 @@ class TerrariaAgent:
             except Exception:
                 pass
 
-        # v3.0: mod 统一推送全量游戏状态（血量/位置/背包/敌人/玩家/时间，2s 一次）
+        # v3.0: mod 统一推送全量游戏状态（血量/位置/敌人/玩家/时间，2s 一次）
         elif event == "game_state":
             try:
                 pl = msg.get("player", {}) or {}
@@ -475,6 +493,18 @@ class TerrariaAgent:
                 self._state["tile_y"] = int(pl.get("tile_y", self._state.get("tile_y", 0)))
                 if "alive" in pl:
                     self._state["alive"] = bool(pl.get("alive"))
+                # 身体感/移动字段（PushGameState 补齐推送后，Python 无需每秒轮询 get_state）
+                for f in ("velocity_x", "velocity_y", "grounded", "selected_slot"):
+                    if f in pl:
+                        self._state[f] = pl.get(f)
+                if "biome" in pl:
+                    self._state["biome"] = pl.get("biome", "")
+                if "buffs" in pl:
+                    self._state["buffs"] = pl.get("buffs", [])
+                if "movement_state" in pl:
+                    self._state["movement_state"] = pl.get("movement_state", "")
+                if "brightness" in pl:
+                    self._state["brightness"] = pl.get("brightness", 1.0)
                 # 背包
                 inv = msg.get("inventory", {}) or {}
                 if inv:

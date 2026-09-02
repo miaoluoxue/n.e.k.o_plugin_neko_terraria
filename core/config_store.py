@@ -53,7 +53,8 @@ _USER_KEYS: tuple[str, ...] = (
     "follow_stick_trigger_dist", "follow_stick_stop_dist",
     "auto_return_after_respawn",
     # ── 运行时调参 ──
-    "state_tick_interval_seconds", "fast_think_interval_seconds",
+    "state_tick_interval_seconds", "state_fallback_poll_seconds",
+    "fast_think_interval_seconds",
     "deep_think_min_seconds", "deep_think_max_seconds",
     "system_prompt_interval_seconds",
     # ── 入服后一次性全量同步（enum_items/get_recipes）延迟 ──
@@ -92,6 +93,9 @@ DEFAULTS: Dict[str, Any] = {
     "auto_return_after_respawn": True,
     # ── 运行时调参 ──
     "state_tick_interval_seconds": 1.0,
+    # 状态兜底轮询间隔（秒）：状态由 mod 推送驱动（game_state 2s），
+    # 这里只在推送断/漏时低频补拉，减轻 C# 主线程 200 NPC 扫描负担
+    "state_fallback_poll_seconds": 5.0,
     "fast_think_interval_seconds": 5.0,
     "deep_think_min_seconds": 30,
     "deep_think_max_seconds": 90,

@@ -300,8 +300,19 @@ namespace NekoTerrariaLink
                         ["max_life"] = p.statLifeMax,
                         ["tile_x"] = (int)(p.Center.X / 16),
                         ["tile_y"] = (int)(p.Center.Y / 16),
+                        ["velocity_x"] = p.velocity.X,
+                        ["velocity_y"] = p.velocity.Y,
+                        ["grounded"] = p.velocity.Y == 0f,
                         ["selected_slot"] = p.selectedItem,
                         ["alive"] = p.statLife > 0,
+                        // 身体感字段（原只在 get_state 回执返回）——补齐推送，
+                        // 让 Python 去掉每秒 get_state 轮询后这些字段仍实时：
+                        // brain 场景分类用 velocity/travel、交互引擎用 biome/brightness、
+                        // 状态汇报用 buffs/movement_state
+                        ["biome"] = BiomeName(p),
+                        ["buffs"] = CurrentBuffs(p),
+                        ["movement_state"] = MovementState(p),
+                        ["brightness"] = BrightnessAround(p),
                     },
                     // Python 侧用它过滤"自己"（避免把自己当成主人去追）
                     // 背包数据不再随 game_state 持续推送（2s 一次太浪费）。
@@ -2614,28 +2625,10 @@ namespace NekoTerrariaLink
                         ["velocityX"] = pl.velocity.X, ["velocityY"] = pl.velocity.Y,
                     });
             }
-            // 活动 buff 名称（身体感：猫娘知道自己中了什么状态）
-            var buffs = new List<string>();
-            for (int i = 0; i < p.buffType.Length; i++)
-            {
-                if (p.buffType[i] > 0 && p.buffTime[i] > 0)
-                {
-                    try { buffs.Add(BuffID.Search.GetName(p.buffType[i])); }
-                    catch { }
-                }
-            }
-            // 亮度采样（3x3，情感素材：暗→害怕、亮→安心）
-            int ptx = (int)(p.Center.X / 16f), pty = (int)(p.Center.Y / 16f);
-            float brightness = 0f; int samples = 0;
-            for (int bx = ptx - 1; bx <= ptx + 1; bx++)
-                for (int by = pty - 1; by <= pty + 1; by++)
-                    if (bx >= 0 && by >= 0 && bx < Main.maxTilesX && by < Main.maxTilesY)
-                    {
-                        var col = Lighting.GetColor(bx, by);
-                        brightness += (col.R + col.G + col.B) / 765f;
-                        samples++;
-                    }
-            if (samples > 0) brightness /= samples;
+            // 活动 buff 名称 + 亮度采样（3x3）——提取到 CurrentBuffs/BrightnessAround，
+            // 与 PushGameState 共用（PushGameState 补了身体感字段后 Python 无需每秒轮询 get_state）
+            var buffs = CurrentBuffs(p);
+            float brightness = BrightnessAround(p);
 
             Send(s, new Dict {
                 ["req_id"] = reqId, ["type"] = "state",
@@ -2675,7 +2668,7 @@ namespace NekoTerrariaLink
             return "地表";
         }
 
-        /// <summary>运动状态（身体感：我在跑/跳/游/落）。</summary>
+        /// <summary>当前运动状态（身体感：我在跑/跳/游/落）。</summary>
         private static string MovementState(Player p)
         {
             if (p.mount.Active) return "mounted";
@@ -2684,6 +2677,38 @@ namespace NekoTerrariaLink
             if (p.velocity.Y > 0.5f) return "falling";
             if (p.velocity.X != 0f) return "running";
             return "grounded";
+        }
+
+        /// <summary>活动 buff 名称列表（身体感：猫娘知道自己中了什么状态）。</summary>
+        private static List<string> CurrentBuffs(Player p)
+        {
+            var buffs = new List<string>();
+            for (int i = 0; i < p.buffType.Length; i++)
+            {
+                if (p.buffType[i] > 0 && p.buffTime[i] > 0)
+                {
+                    try { buffs.Add(BuffID.Search.GetName(p.buffType[i])); }
+                    catch { }
+                }
+            }
+            return buffs;
+        }
+
+        /// <summary>玩家周围 3x3 亮度采样（情感素材：暗→害怕、亮→安心）。</summary>
+        private static float BrightnessAround(Player p)
+        {
+            int ptx = (int)(p.Center.X / 16f), pty = (int)(p.Center.Y / 16f);
+            float brightness = 0f; int samples = 0;
+            for (int bx = ptx - 1; bx <= ptx + 1; bx++)
+                for (int by = pty - 1; by <= pty + 1; by++)
+                    if (bx >= 0 && by >= 0 && bx < Main.maxTilesX && by < Main.maxTilesY)
+                    {
+                        var col = Lighting.GetColor(bx, by);
+                        brightness += (col.R + col.G + col.B) / 765f;
+                        samples++;
+                    }
+            if (samples > 0) brightness /= samples;
+            return brightness;
         }
 
         /// <summary>截图一帧返回 base64 PNG（Python 侧视觉管线消费）。
