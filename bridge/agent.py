@@ -638,8 +638,10 @@ class TerrariaAgent:
                 except Exception:
                     pass
             tail = "、".join(done_bits) if done_bits else plan.say()
+            # output 是纯事实（不含"做完啦"等硬编码台词）——由
+            # brain._on_executor_task_done 交宿主 LLM 自动生成汇报
             return {"ok": True, "status": "ok", "phase": "act",
-                    "output": f"做完啦：{tail}"}
+                    "output": tail}
 
         return await self.executor.run(goal_text or "多步任务", _work, source=source, steps=plan.outline)
 

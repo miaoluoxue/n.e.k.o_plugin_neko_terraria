@@ -561,27 +561,48 @@ class AutonomousBrain:
         return svc.event_emitter if svc else None
 
     async def _on_executor_task_done(self, data: Dict) -> None:
-        name = data.get("name", "任务")
-        status = data.get("status", "ok")
-        desc = f"「{name}」{'' if status == 'ok' else f'({status})'}完成了~"
+        """任务结束汇报：把**实测事实**交给宿主 LLM 由它用人设生成话——
+        不硬编码"完成/失败"台词（对齐 minecraft 插件 task_finished 四路分档：
+        ok / 受阻 / interrupted / failed；interrupted 不发 cue 防重派风暴）。
 
-        # v3.0: fire-and-forget 完成 cue —— 把任务结果推回宿主 LLM，
-        # 让六月喵知道结果并向主人汇报（参照 Minecraft 插件 task_finished 分档）
+        data.result.output 已含实测数（task_chain 各分支背包计数写入 goal.actual，
+        欠量已 fail 不会到 ok——绝不报"挖够 N"当实际只挖到几块）。
+        """
+        name = data.get("name", "任务")
+        status = str(data.get("status", "ok") or "ok").lower()
+        desc = f"「{name}」"
+
         result = data.get("result") or {}
         out = ""
         if isinstance(result, dict):
             out = str(result.get("output", "") or "")
         if out and out in (name, f"「{name}」"):
             out = ""
+        # interrupted/superseded：被新任务/主人接管，不单独汇报（防重派）
+        if status in ("interrupted", "superseded", "cancelled"):
+            # 主人喊停是自己发起的——需要轻告知（与 mc 不同：terraria 无
+            # 新任务 cue 接力，主人喊停应确认收到），走 read 不强制说话
+            if "cancelled" in status and out:
+                try:
+                    await self.agent.speak(
+                        f"[任务状态] {desc}已停下。{out}", ai_behavior="read")
+                except Exception:
+                    pass
+            return
+
+        # ok / failed 分档 → 结构化事实行，交宿主 LLM 自动生成人话
+        if status == "ok":
+            head = f"{desc}这一步做完了。"
+            if out:
+                head += f"实测结果：{out}。"
+            followup = "用猫娘语气向主人自然说说这次的结果（1-2句，只能依据上面事实）"
+        else:
+            head = f"{desc}这一步没有成功（{status}）。"
+            if out:
+                head += f"实际情况：{out}。"
+            followup = "用猫娘语气向主人说说这次没成的事（1-2句，如实说，别找借口编原因）"
         try:
-            if status == "ok":
-                cue = f"[任务结果] 「{name}」完成了" + (f"：{out}" if out else "") + "。"
-                await self.agent.speak(cue, ai_behavior="read")
-            else:
-                cue = f"[任务结果] 「{name}」没完成（{status}）" + (f"：{out}" if out else "") + "。"
-                await self.agent.speak(
-                    cue + "\n用猫娘语气向主人汇报这个结果（1-2句，不要添加不存在的细节）", ai_behavior="respond"
-                )
+            await self.agent.speak(head + followup, ai_behavior="respond")
         except Exception:
             pass
 
@@ -622,7 +643,7 @@ class AutonomousBrain:
 
     async def _on_executor_interrupted(self, data: Dict) -> None:
         name = data.get("name", "任务")
-        reason = data.get("reason", "不明原因")
+        reason = str(data.get("reason", "不明原因") or "")
 
         if self._emitter:
             goal_data = data.get("goal", {})
@@ -631,12 +652,19 @@ class AutonomousBrain:
             if gtype and gtarget:
                 self._emitter.on_goal_failed(gtype, gtarget, reason)
 
-        # 任务被中断直推主 LLM：猫娘必须知道任务没有完成
+        # 中断分流，都不硬编码台词（对齐 mc：interrupted 不单独播报防重派）：
+        # - 主人主动喊停（reason 含 主人/喊停/接管）→ read 静默确认，不抢话
+        # - 错误/异常中断 → 交宿主 LLM 生成，让它如实说
         try:
-            await self.agent.speak(
-                f"[任务状态] 「{name}」被中断了（{reason}）。这是状态通知，任务没有完成。",
-                ai_behavior="respond",
-            )
+            owner_stop = any(k in reason for k in ("主人", "喊停", "接管", "cancelled", "cancel"))
+            if owner_stop:
+                await self.agent.speak(
+                    f"[任务状态] 「{name}」停下了。主人发起的停止，已确认。", ai_behavior="read")
+            else:
+                await self.agent.speak(
+                    f"[任务状态] 「{name}」中途停下了（{reason}）。"
+                    f"用猫娘语气向主人如实说说（1-2句，不编原因）",
+                    ai_behavior="respond")
         except Exception:
             pass
 
