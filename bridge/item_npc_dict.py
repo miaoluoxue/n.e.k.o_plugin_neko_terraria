@@ -3,20 +3,18 @@
 from typing import Dict
 
 ITEM_IDS: Dict[str, int] = {
-    "dirt": 0, "stone": 1, "wood": 9, "gel": 23,
-    "copper_ore": 7, "tin_ore": 8, "iron_ore": 9, "lead_ore": 10,
-    "silver_ore": 11, "tungsten_ore": 12, "gold_ore": 13, "platinum_ore": 14,
-    "copper_bar": 20, "tin_bar": 21, "iron_bar": 22, "lead_bar": 23,
-    "silver_bar": 21, "tungsten_bar": 22, "gold_bar": 19, "platinum_bar": 1999,
-    "demonite_ore": 57, "crimtane_ore": 58, "hellstone": 58,
-    "obsidian": 58, "wood_sword": 1, "wood_pickaxe": 2, "wood_hammer": 3,
+    # 硬编码兜底（仅 registry 未加载的冷启动用）。registry（C# enum_items
+    # 全量枚举）才是权威——本表值历史上混过 TileID（copper_ore=7 实为 12）、
+    # 多物共用 58（hellstone/obsidian/healing）。已知确定正确的保留：
+    "dirt": 0, "stone": 1, "wood": 9, "gel": 23, "torch": 8,
+    "copper_ore": 12, "iron_ore": 11, "silver_ore": 14, "gold_ore": 19,
+    "demonite_ore": 57, "crimtane_ore": 58, "hellstone": 174, "obsidian": 173,
+    # 锭 ID 易与矿石冲突（gold_bar≠19）——不硬编码，registry 全量枚举是权威
+    "wood_pickaxe": 2, "wood_hammer": 3,
     "iron_pickaxe": 41, "iron_broadsword": 43, "iron_helmet": 44,
-    "iron_chainmail": 45, "iron_greaves": 46, "iron_anvil": 35,
-    "workbench": 18, "furnace": 17, "torch": 28, "magic_mirror": 50,
-    "recall_potion": 2350, "ice_mirror": 3199, "hook": 84,
-    "web_slinging_hook": 1236, "potion_healing": 58, "potion_mana": 59,
-    "gold_coin": 72, "silver_coin": 71, "copper_coin": 70,
-    "platinum_coin": 74,
+    "iron_chainmail": 45, "iron_greaves": 46,
+    "workbench": 18, "furnace": 17, "magic_mirror": 50, "hook": 84,
+    "gold_coin": 72, "silver_coin": 71, "copper_coin": 70, "platinum_coin": 74,
 }
 
 NPC_IDS: Dict[str, int] = {
@@ -66,12 +64,43 @@ NAME_TO_ITEM: Dict[str, int] = {v: k for k, v in ITEM_IDS.items()}
 
 
 def item_id(name: str, registry=None) -> int:
-    iid = ITEM_IDS.get(name.lower(), -1)
+    """物品中文/英文名 → item id。
+
+    解析顺序（registry 是 C# enum_items 全量导出的权威表，含原版+mod 英文名；
+    ITEM_IDS 是硬编码兜底、历史上有错误 ID，故 registry 优先）：
+    1. registry 英文名命中（原版 "Iron Ore" 空格名 / mod 名）
+    2. 中文名经 recipe_book.CN_EN 翻成英文再查 registry
+       （曾无此步：ITEM_IDS 全英文 key + registry 全英文，调用方传中文
+       "铁矿"必 MISS → give/craft/火把全失效返回 -1）
+    3. registry 完全未加载时才回退 ITEM_IDS 硬编码
+    """
+    low = (name or "").strip().lower()
+    if not low:
+        return -1
+    if registry is not None:
+        # registry 是否加载过（有任意 mod 表即认为权威可用）
+        loaded = any(registry.mods.values())
+        if loaded:
+            rid = registry.resolve(low)
+            if rid >= 0:
+                return rid
+            # 中文 → 英文（recipe_book 有中英对照）
+            try:
+                from .recipe_book import CN_EN
+                en = CN_EN.get((name or "").strip())
+                if en:
+                    rid2 = registry.resolve(en)
+                    if rid2 >= 0:
+                        return rid2
+            except Exception:
+                pass
+            return -1
+    # registry 未加载：回退硬编码（仅冷启动兜底）
+    iid = ITEM_IDS.get(low, -1)
     if iid >= 0:
         return iid
-    if registry is not None:
-        return registry.resolve(name)
-    return -1
+    iid2 = ITEM_IDS.get(low.replace(" ", "_"), -1)
+    return iid2
 
 
 def tile_type_of(name: str, iid: int = -1) -> int:

@@ -85,10 +85,11 @@ class ModItemRegistry:
             pass
 
     def resolve(self, name: str) -> int:
-        low = name.lower()
+        low = name.lower().replace("_", " ")  # iron_ore → iron ore（匹配 "Iron Ore"）
         for items in self.mods.values():
             if low in items:
                 return items[low]
+        # 部分物品名带括号/变体，尝试子串（rare）；失败回 -1
         return -1
 
     def use_of(self, name: str) -> str:

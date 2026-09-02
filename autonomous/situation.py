@@ -131,8 +131,13 @@ class SituationEngine:
             return
 
         try:
+            my_name = "Neko"
+            try:
+                my_name = self.agent._character_name()
+            except Exception:
+                pass
             prompt = SITUATION_PROMPT.format(
-                name="YUI",
+                name=my_name,
                 biome=state.get("biome", "未知"),
                 hp=state.get("hp", 0),
                 max=state.get("max_life", 100),

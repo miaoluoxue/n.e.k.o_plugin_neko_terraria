@@ -9,16 +9,23 @@ GDI PrintWindow 会黑屏，ImageGrab（屏幕拷贝）对可见窗口可靠。
 
 import base64
 import io
+import time
 from typing import Optional, Tuple
 
 _AI_PID_CACHE: Optional[int] = None
+_AI_PID_CACHE_TS: float = 0.0
+# PID 缓存 TTL：AI 客户端重启（launcher 新进程）后 PID 会变，
+# 缓存永不过期会一直指向旧进程 → 主人窗口识别失败。30s 重查一次。
+_PID_CACHE_TTL = 30.0
 
 
 def _ai_client_pid() -> Optional[int]:
     """AI 客户端进程 PID（launcher 启动的 subprocess）。"""
-    global _AI_PID_CACHE
-    if _AI_PID_CACHE is not None:
+    global _AI_PID_CACHE, _AI_PID_CACHE_TS
+    now = time.time()
+    if _AI_PID_CACHE is not None and now - _AI_PID_CACHE_TS < _PID_CACHE_TTL:
         return _AI_PID_CACHE
+    _AI_PID_CACHE = None
     try:
         import psutil
         # 找命令行含 -savedirectory 且指向插件 mod 目录的进程
@@ -29,6 +36,7 @@ def _ai_client_pid() -> Optional[int]:
                 continue
             if "-savedirectory" in cmd and "neko_terraria" in cmd:
                 _AI_PID_CACHE = proc.info["pid"]
+                _AI_PID_CACHE_TS = now
                 return _AI_PID_CACHE
     except Exception:
         pass
