@@ -30,11 +30,6 @@ class EventResponder:
         """A5：异步播报，不可用时游戏内聊天兜底，保证不静默。"""
         await self.agent.speak(text, ai_behavior=behavior)
 
-    @staticmethod
-    def _boss_position(name: str) -> tuple:
-        """根据名字获取 Boss 位置（从 agent 状态读）。"""
-        return 0, 0  # 已废弃，由事件总线直接传递位置
-
     async def _on_boss_spawned(self, data: Any) -> None:
         name = data.get("name", "未知Boss") if isinstance(data, dict) else "未知Boss"
         st = self.agent.get_state()
@@ -43,18 +38,42 @@ class EventResponder:
         self._remember("世界-Boss出现", f"{name} 出现了")
         if mx and hp / mx < RETREAT_HP_RATIO:
             await self._push(f"主人，{name}出现了！我只有{hp}/{mx}血，先躲远点保命~")
-            await self._retreat(name)
+            await self._retreat(name, st)
         else:
             await self._push(f"主人，{name}出现了！要我打还是躲起来？")
 
-    async def _retreat(self, name: str) -> None:
-        bx, by = self._boss_position(name)
-        if not bx and not by:
-            return  # 拿不到 Boss 位置就不躲（避免在原地乱跑）
-        mx, my = int(self.agent.get_state().get("tile_x", 0) or 0), int(self.agent.get_state().get("tile_y", 0) or 0)
-        away = -1 if bx > mx else 1
+    async def _retreat(self, name: str, st: dict) -> None:
+        """低血遇 Boss：从 nearby_npcs 找 Boss（或最近敌怪）坐标，反方向跑开。
+
+        曾 `_boss_position` 恒返 (0,0) → 永远提前 return——口头说"躲远点"
+        实际一步不动（只播报不躲避）。C# 事件不推 Boss 坐标，但 game_state
+        推送的 nearby_npcs 里有（已归一化 tile_x/tile_y）。
+        """
+        mx = int(st.get("tile_x", 0) or 0)
+        my = int(st.get("tile_y", 0) or 0)
+        # 优先找目标 Boss，找不到退到最近敌怪
+        bx, by = None, None
+        best_d = 1 << 30
+        for n in (st.get("nearby_npcs", []) or []):
+            nx = int(n.get("tile_x", n.get("tileX", 0)) or 0)
+            ny = int(n.get("tile_y", n.get("tileY", 0)) or 0)
+            nm = str(n.get("name", "") or "")
+            if name and name.lower() in nm.lower():
+                bx, by = nx, ny
+                break
+            d = (nx - mx) ** 2 + (ny - my) ** 2
+            if d < best_d:
+                best_d, bx, by = d, nx, ny
+        if bx is None or by is None:
+            return  # 状态里没有敌人信息，不乱跑
+        # 反方向跑开（远离 Boss）
+        dx = (mx - bx) or 1
+        dy = (my - by) or 0
+        norm = max(abs(dx), abs(dy), 1)
+        tx = mx + (dx // norm) * 15
+        ty = my + (dy // norm) * 15
         try:
-            await self.agent.mod.navigate_async(mx + away * 15, my, timeout=6)
+            await self.agent.mod.navigate_async(tx, ty, timeout=6)
         except Exception:
             pass
 

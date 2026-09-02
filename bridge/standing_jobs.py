@@ -132,7 +132,10 @@ class StandingJobs:
             base_trigger = self.agent.cfg.get("follow_trigger_dist", FOLLOW_TRIGGER_DIST)
             base_stop = self.agent.cfg.get("follow_stop_dist", FOLLOW_STOP_DIST)
             try:
-                heart = getattr(getattr(self.agent, "brain", None), "heart", None)
+                # 真 Heart 在插件 AutonomousBrain 上（agent.brain 是 TaskBrain）
+                plugin = getattr(self.agent, "plugin", None)
+                abrain = getattr(plugin, "_autonomous_brain", None)
+                heart = getattr(abrain, "heart", None) if abrain else None
                 stickiness = heart.stickiness() if heart else 0.5
             except Exception:
                 stickiness = 0.5

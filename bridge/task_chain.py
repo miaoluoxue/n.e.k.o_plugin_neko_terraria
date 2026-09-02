@@ -262,7 +262,7 @@ class TaskChain:
         t = (tgt or "").strip()
         # 方向词
         if t in ("左", "左边", "left", "west"):
-            tx = sx + 100
+            tx = sx - 100  # 往左 = x 减小（曾误写 +100，往左却向右跑）
             return bool(await self.agent.navigate_to(tx, sy, timeout=30))
         if t in ("右", "右边", "right", "east"):
             tx = sx + 100

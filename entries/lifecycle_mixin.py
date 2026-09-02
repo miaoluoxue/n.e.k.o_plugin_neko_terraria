@@ -99,9 +99,11 @@ class LifecycleMixin:
             model_info = "（独立意图模型）" if intent_llm != main_llm else "（共享主模型）"
             self.logger.info(f"已注入意图解析 LLM {model_info}")
 
+        # 注：service.set_llm_call 当前无消费者（紧急事件评估已由交互引擎
+        # 直推宿主，不走 service 内 LLM）——保留注入便于未来启用，不再打
+        # "已注入紧急评估 LLM"误导日志
         if self._service and main_llm:
             self._service.set_llm_call(main_llm)
-            self.logger.info("已注入紧急评估 LLM")
 
     async def _resolve_llm_call(self):
         """主 LLM：对话、人格、汇报。优先使用宿主注入，否则从配置创建。"""

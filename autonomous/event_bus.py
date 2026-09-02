@@ -57,7 +57,16 @@ class EventBus:
         self._subs: Dict[str, List[Callable[[Any], Any]]] = {}
 
     def subscribe(self, event: str, cb: Callable[[Any], Any]) -> None:
-        self._subs.setdefault(event, []).append(cb)
+        # 去重：面板断开→重连会多次 start()，各模块重复 bind/subscribe，
+        # 同回调被 append 两次 → 事件双触发（player_died 推两次等）
+        subs = self._subs.setdefault(event, [])
+        if cb not in subs:
+            subs.append(cb)
+
+    def unsubscribe(self, event: str, cb: Callable[[Any], Any]) -> None:
+        subs = self._subs.get(event, [])
+        if cb in subs:
+            subs.remove(cb)
 
     async def publish(self, event: str, data: Any) -> None:
         for cb in self._subs.get(event, []):

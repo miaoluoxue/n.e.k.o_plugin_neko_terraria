@@ -87,22 +87,26 @@ class TaskCoordinator:
             from ..autonomous.heart import Heart
             aff = Heart.classify_affection(text)
             if aff:
-                brain = getattr(self.agent, "brain", None)
+                # 真 Heart 在插件的 AutonomousBrain 上（agent.brain 是 TaskBrain，无 heart——
+                # 曾取 agent.brain.heart 恒 None，夸/凶永不增减依恋值）
+                plugin = getattr(self.agent, "plugin", None)
+                brain = getattr(plugin, "_autonomous_brain", None)
                 heart = getattr(brain, "heart", None) if brain else None
+                interaction = getattr(brain, "interaction", None) if brain else None
                 if aff == "praise":
                     if heart:
                         heart.on_praise(text)
-                    if brain and getattr(brain, "interaction", None):
-                        brain.interaction.mood.trigger("excitement", 0.5)
-                        await brain.interaction.push_speech(
+                    if interaction:
+                        interaction.mood.trigger("excitement", 0.5)
+                        await interaction.push_speech(
                             f"[被夸] 主人夸我了：{text}\n开心地回应（1句话，15字内）",
                             behavior="respond")
                 elif aff == "scold":
                     if heart:
                         heart.on_scold(text)
-                    if brain and getattr(brain, "interaction", None):
-                        brain.interaction.mood.trigger("tired", 0.45)
-                        await brain.interaction.push_speech(
+                    if interaction:
+                        interaction.mood.trigger("tired", 0.45)
+                        await interaction.push_speech(
                             f"[被凶] 主人凶我了：{text}\n委屈地回应（1句话，15字内）",
                             behavior="respond")
         except Exception:
