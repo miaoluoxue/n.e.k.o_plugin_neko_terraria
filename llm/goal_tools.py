@@ -51,10 +51,17 @@ class GoalToolsMixin:
         async def _dispatch() -> None:
             """后台执行 + 非 executor 路径的结果回读。
 
-            finite 任务走 executor → task_done/step_done 回调已由 brain 推回
-            （不重复）；chat 由 _do_chat 直接 respond（不重复）。只有 stop /
-            unknown(反问) / longterm(启动确认) 这些即时结果没有异步通道，
-            这里用 read 模式回传给宿主 LLM，避免 fire-and-forget 后 LLM 失明。
+            finite 任务分两类，完成汇报来源不同：
+            - phase=act（已交 executor）→ task_done/step_done 回调已由 brain 推回
+              （不重复）。
+            - phase=think/plan（还没进执行器就被拒：not_doable / empty_plan /
+              not_understood）→ executor 不会发任何事件，必须在这里 read 回读，
+              否则宿主 LLM 只看到"已受理"后永远等不到结果、误以为任务还在跑
+              （对齐 mc：拒绝要明确说出来，绝不能假装在做）。busy 由 executor
+              发 interrupted(busy)，brain 会 respond「没接上」，这里不重复。
+            chat 由 _do_chat 直接 respond（不重复）。只有 stop / unknown(反问) /
+            longterm(启动确认) 这些即时结果没有异步通道，这里用 read 模式回传
+            给宿主 LLM，避免 fire-and-forget 后 LLM 失明。
             """
             try:
                 res = await self._agent.command(text, source="owner")
@@ -62,8 +69,27 @@ class GoalToolsMixin:
                 self._agent.logger.warning(f"[llm_command] 执行异常: {e}")
                 return
             mode = str(res.get("mode", "") or "")
-            if mode in ("finite", "chat"):
-                return  # executor 回调 / _do_chat 已覆盖，防双响
+            if mode == "chat":
+                return  # _do_chat 已覆盖
+            if mode == "finite":
+                phase = str(res.get("phase", "") or "")
+                status = str(res.get("status", "") or "")
+                # 已交 executor 的终态（ok/step_failed/cancelled/error/busy）
+                # 都由 executor 事件覆盖（task_done / interrupted），不重复。
+                if phase == "act" or status in ("ok", "step_failed",
+                                                "cancelled", "busy", "error"):
+                    return
+                out = str(res.get("output", "") or "")
+                if not out:
+                    return
+                # think/plan 阶段拒绝（not_doable/empty_plan/not_understood）：
+                # 无 executor 事件 → read 回读，让宿主 LLM 如实知道"没做/做不了"
+                try:
+                    await self._agent.speak(
+                        f"[指令结果] {out}", ai_behavior="read")
+                except Exception:
+                    pass
+                return
             out = str(res.get("output", "") or "")
             if not out:
                 return

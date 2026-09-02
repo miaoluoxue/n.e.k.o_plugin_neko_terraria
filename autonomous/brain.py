@@ -592,12 +592,15 @@ class AutonomousBrain:
 
         # ok / failed 分档 → 结构化事实行，交宿主 LLM 自动生成人话
         if status == "ok":
-            head = f"{desc}这一步做完了。"
+            # executor.run 一次 = 整个多步任务（agent.run_complex_task 的 _work
+            # 内部循环全部 goal 才 task_done），不是"一步"——措辞避免误导
+            # 宿主 LLM 以为只完成了其中一小步。
+            head = f"{desc}整个任务做完了。"
             if out:
                 head += f"实测结果：{out}。"
             followup = "用猫娘语气向主人自然说说这次的结果（1-2句，只能依据上面事实）"
         else:
-            head = f"{desc}这一步没有成功（{status}）。"
+            head = f"{desc}这个任务没有成功（{status}）。"
             if out:
                 head += f"实际情况：{out}。"
             followup = "用猫娘语气向主人说说这次没成的事（1-2句，如实说，别找借口编原因）"
@@ -653,11 +656,21 @@ class AutonomousBrain:
                 self._emitter.on_goal_failed(gtype, gtarget, reason)
 
         # 中断分流，都不硬编码台词（对齐 mc：interrupted 不单独播报防重派）：
+        # - busy 拒绝（新指令撞上正在跑的任务，打断级别不够没取消）→ 交宿主
+        #   LLM 如实说明"这条没接上、正在做 X"（任务根本没开始，绝不能说得像
+        #   "做了又中途停"——曾误述成「X 中途停下」，宿主 LLM 会脑补假完成）
         # - 主人主动喊停（reason 含 主人/喊停/接管）→ read 静默确认，不抢话
         # - 错误/异常中断 → 交宿主 LLM 生成，让它如实说
         try:
+            busy_refused = reason.startswith("busy:")
             owner_stop = any(k in reason for k in ("主人", "喊停", "接管", "cancelled", "cancel"))
-            if owner_stop:
+            if busy_refused:
+                cur = reason.split(":", 1)[-1].strip()
+                await self.agent.speak(
+                    f"[任务状态] 新任务「{name}」没有接上，因为{cur}。"
+                    f"用猫娘语气向主人如实说明（1-2句：现在正在做什么、这条为什么没接）",
+                    ai_behavior="respond")
+            elif owner_stop:
                 await self.agent.speak(
                     f"[任务状态] 「{name}」停下了。主人发起的停止，已确认。", ai_behavior="read")
             else:

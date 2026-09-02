@@ -1,4 +1,12 @@
-"""UI 操作：前端面板入口 @plugin_entry + @ui.action。"""
+"""UI 操作：前端面板入口 @plugin_entry + @ui.action。
+
+⚠️ 全部入口都标 agent_hidden=True——它们只供宿主前端面板 callEntry 直调，
+**绝不暴露给宿主 task_executor 的 LLM 自动路由**（对齐 neko_arcade play_game 的
+做法）。宿主 task_executor 会把非 agent_hidden 的 plugin_entry 当"user_plugin 任务"
+暴露给 LLM 自动路由：一旦游戏指令被路由成宿主 run，就用宿主 run 语义判定完成
+（entry 返回即 succeeded / 长任务超时错乱），绕过"插件自管执行、真完成才由
+宿主 LLM 生成播报"的 mc 对齐模型。agent_hidden 不影响面板 callEntry / @ui.action。
+"""
 
 from typing import Any
 
@@ -13,6 +21,7 @@ class UiActionsMixin:
         name="获取面板状态",
         description="返回猫娘当前状态：连接/世界/正在做什么/任务/日志等，供前端轮询刷新。",
         input_schema={"type": "object", "properties": {}},
+        metadata={"agent_hidden": True},
     )
     async def act_get_dashboard_state(self, **_):
         """统一状态入口，供前端轮询。
@@ -109,6 +118,7 @@ class UiActionsMixin:
         name="获取连接状态",
         description="兼容入口：供 N.E.K.O 框架插件管理页面调用",
         input_schema={"type": "object", "properties": {}},
+        metadata={"agent_hidden": True},
     )
     async def act_get_status(self, **_):
         """简化状态入口"""
@@ -126,6 +136,7 @@ class UiActionsMixin:
         name="连接游戏",
         description="启动猫娘并连接 Terraria 服务端/mod 接口。",
         input_schema={"type": "object", "properties": {}},
+        metadata={"agent_hidden": True},
     )
     async def act_connect(self, **_):
         if self._agent is None:
@@ -153,6 +164,7 @@ class UiActionsMixin:
             },
             "required": ["text"],
         },
+        metadata={"agent_hidden": True},
     )
     async def act_command(self, text: str = "", **_):
         """前端 → 猫娘指令：走与 LLM 工具相同的 coordinator 管道。"""
@@ -203,6 +215,7 @@ class UiActionsMixin:
         name="断开连接",
         description="断开猫娘与 Terraria 世界的连接。",
         input_schema={"type": "object", "properties": {}},
+        metadata={"agent_hidden": True},
     )
     async def act_stop(self, **_):
         if self._agent is not None:
@@ -236,6 +249,7 @@ class UiActionsMixin:
             },
             "required": [],
         },
+        metadata={"agent_hidden": True},
     )
     @ui.action(id="nt_save_config", label="保存配置", refresh_context=True)
     async def act_save_config(self, **kwargs):
