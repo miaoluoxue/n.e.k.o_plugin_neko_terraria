@@ -1,7 +1,5 @@
 """neko_terraria 入口层：所有 Mixin 统一聚合导出。"""
 
-from ..llm.action_tools import ActionToolsMixin
-
 # ── LLM 工具 Mixin（实现在 llm/，entries 统一重导出）──
 from ..llm.goal_tools import GoalToolsMixin
 from .lifecycle_mixin import LifecycleMixin
@@ -15,5 +13,4 @@ __all__ = [
     "UiContextMixin",
     "MemoryEntriesMixin",
     "GoalToolsMixin",
-    "ActionToolsMixin",
 ]

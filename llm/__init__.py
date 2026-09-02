@@ -4,7 +4,6 @@ Mixin 类统一在 entries/__init__.py 聚合；intent_parser 由 coordinator �
 此处不在模块级自动导入以避免触发 core → autonomous → bridge 循环依赖。
 """
 
-from .action_tools import ActionToolsMixin
 from .goal_tools import GoalToolsMixin
 
 # intent_parser 不能模块级导入（会触发 core → autonomous → bridge 循环依赖），
@@ -12,7 +11,6 @@ from .goal_tools import GoalToolsMixin
 
 __all__ = [
     "GoalToolsMixin",
-    "ActionToolsMixin",
     "LLMIntentParser",
     "IntentResult",
 ]

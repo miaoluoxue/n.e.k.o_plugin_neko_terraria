@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional
 from plugin.sdk.plugin import NekoPluginBase, neko_plugin
 
 from .entries import (
-    ActionToolsMixin,
     GoalToolsMixin,
     LifecycleMixin,
     MemoryEntriesMixin,
@@ -24,7 +23,6 @@ class NTerrariaPlugin(
     UiActionsMixin,
     UiContextMixin,
     GoalToolsMixin,
-    ActionToolsMixin,
     MemoryEntriesMixin,
 ):
     def __init__(self, ctx):

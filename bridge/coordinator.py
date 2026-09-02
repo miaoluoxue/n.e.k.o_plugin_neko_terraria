@@ -136,23 +136,33 @@ class TaskCoordinator:
 
     async def _dispatch_result(self, result, source: str,
                                raw_text: str = "") -> Dict[str, Any]:
-        """按 mode 分发一个 IntentResult（#16：语义确认后复用同一分发）。"""
+        """按 mode 分发一个 IntentResult（#16：语义确认后复用同一分发）。
+
+        返回统一带 mode 标记（fire-and-forget 的 llm_command 靠它判别哪些
+        是 executor 已覆盖的 finite、哪些需即时回读给宿主 LLM）。
+        """
         if result.mode == "stop":
             self.agent.log("[coordinator] 🛑 执行 stop", "info")
-            return await self._do_stop(result)
+            r = await self._do_stop(result)
+            r.setdefault("mode", "stop")
+            return r
         if result.mode == "longterm":
             self.agent.log("[coordinator] ⏳ 执行 longterm", "info")
             return await self._do_longterm(result)
         if result.mode == "finite":
             self.agent.log("[coordinator] 📝 执行 finite", "info")
-            return await self._do_finite(result, source)
+            r = await self._do_finite(result, source)
+            r.setdefault("mode", "finite")
+            return r
         if result.mode == "chat":
             await self._do_chat(raw_text or result.raw, result)
             return {"ok": True, "status": "chat", "mode": "chat",
                     "output": result.pre_reply,
                     "intent": result.to_dict()}
         # 认不出来：根据置信度决定是反问还是拒绝
-        return await self._handle_unknown(raw_text or result.raw, result)
+        r = await self._handle_unknown(raw_text or result.raw, result)
+        r.setdefault("mode", "unknown")
+        return r
 
     # ---------------- 闲聊处理 ----------------
 

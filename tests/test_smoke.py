@@ -35,3 +35,36 @@ def test_plugin_source_modules_compile():
 
     for py in sorted((_ROOT / "bridge").glob("*.py")) + sorted((_ROOT / "autonomous").glob("*.py")):
         ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+
+
+# 已注册给宿主 LLM 的工具名（SDK 只认 @llm_tool 装饰器标记）
+# — 与 goal_tools.py 唯一注册的 terraria_command + memory_entries 的记忆工具一致。
+# 历史教训：llm/action_tools.py 曾有 ~30 个无装饰器的 llm_* "幽灵工具"，
+# ai_guidance/提示词教了名字但宿主看不到，LLM 照调必失败。本测试防复活：
+# 任何提示词里教 LLM 用的 terraria_* 工具名必须在注册名单内。
+_REGISTERED_TOOL_PREFIXES = (
+    "terraria_command",
+    "terraria_remember",
+    "terraria_recall",
+    "terraria_forget",
+)
+
+
+def test_no_ghost_tool_names_in_guidance_prompts():
+    import re
+
+    targets = [
+        _ROOT / "core" / "context.py",      # build_ai_guidance
+        _ROOT / "llm" / "prompts.py",       # BEHAVIOR_RULES
+        _ROOT / "autonomous" / "brain.py",  # LLM_THINK_PROMPT
+        _ROOT / "llm" / "goal_tools.py",    # terraria_command description
+    ]
+    ghost = []
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        # 只查 LLM 会照抄的"调用形态"（terraria_X(）；说明文字/coalesce_key 不算
+        for name in set(re.findall(r"terraria_[a-z_]+(?=\()", text)):
+            if name.startswith(_REGISTERED_TOOL_PREFIXES):
+                continue
+            ghost.append(f"{path.name}:{name}")
+    assert not ghost, f"提示词教 LLM 调用未注册的幽灵工具: {sorted(ghost)}"
