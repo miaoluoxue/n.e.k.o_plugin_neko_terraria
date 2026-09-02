@@ -133,7 +133,18 @@ class MiningEngine:
             except Exception:
                 pass
         if before < 0:
-            return 1  # 基数不可用：至少做了一次真实挖掘动作
+            # 基数不可用：重试一次读包确认，仍失败按 0 处理并诚实上报——
+            # 曾无条件 return 1（"做了挖掘动作就算挖到1个"），收获未证实即报数
+            try:
+                self.agent._inv_full = await self.mod.get_inventory()
+                after = self._count_item(self.agent.get_inventory_sync(), iid)
+                if after > 0:
+                    return max(0, after)
+            except Exception:
+                pass
+            if self.agent:
+                self.agent.log("挖掘完成但背包计数不可用，无法确认收获", "warn")
+            return 0
         after = self._count_item(self.agent.get_inventory_sync(), iid)
         return max(0, after - before)
 

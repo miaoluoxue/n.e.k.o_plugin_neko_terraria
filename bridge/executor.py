@@ -132,7 +132,14 @@ class TaskExecutor:
             lt.request_yield()
         try:
             result = await inner
-            out = result if isinstance(result, dict) else {"ok": True, "output": str(result)}
+            if isinstance(result, dict):
+                out = result
+            else:
+                # 非 dict 结果（bool/None）不代表成功——曾一律包 ok:True 导致
+                # navigate 返回 False 也算"完成"。假完成红线：非 dict 视为失败。
+                self._log(f"任务 {name} 返回非 dict({result!r})，按失败处理", "warn")
+                out = {"ok": False, "status": "error",
+                       "output": f"任务内部返回值异常（{result!r}）"}
         except asyncio.CancelledError:
             self._last = {"ok": False, "status": "cancelled", "output": f"「{name}」被打断了"}
             if self._current is info:

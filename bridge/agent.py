@@ -588,8 +588,11 @@ class TerrariaAgent:
         # 处理：用补全前置后的步骤编译，顺手合并冗余
         plan = self.brain.plan(steps, goal_text, assess)
         self.log(f"处理：{plan.say()}", "task")
-        if not plan.goals:
-            return {"ok": False, "status": "empty_plan", "phase": "plan", "output": "没解析出可执行步骤"}
+        if not plan.goals or plan.blocked:
+            reason = plan.blocked_reason or "没解析出可执行步骤"
+            return {"ok": False, "status": "empty_plan", "phase": "plan",
+                    "output": reason,
+                    "skipped": plan.skipped}
         if dry_run:
             return {
                 "ok": True,
@@ -604,6 +607,7 @@ class TerrariaAgent:
         # 做：交给执行器（单槽位 + 可被主人打断）
         async def _work(info):
             info.phase = "act"
+            done_bits = []
             for i, g in enumerate(plan.goals):
                 if self.executor.should_stop():
                     return {"ok": False, "status": "cancelled", "output": f"做到第{i + 1}步被叫停了"}
@@ -625,22 +629,40 @@ class TerrariaAgent:
                         "phase": "act",
                         "output": f"在第{i + 1}步「{info.note}」停下：{msg}",
                     }
-                # 每步成功后也吱一声（有真实结果才说，不空喊）
+                # 完成播报用实测数（g.actual），不 echo 计划里的目标数——
+                # 曾 plan.say() 报"挖铁矿x10 完成"，实际可能只挖到几块。
+                done_desc = self._step_done_text(g)
+                done_bits.append(done_desc)
                 try:
-                    await self._announce_step_done(self.tasks.chain(), g)
+                    await self.send_chat(f"{done_desc}~")
                 except Exception:
                     pass
-            return {"ok": True, "status": "ok", "phase": "act", "output": f"做完啦：{plan.say()}"}
+            tail = "、".join(done_bits) if done_bits else plan.say()
+            return {"ok": True, "status": "ok", "phase": "act",
+                    "output": f"做完啦：{tail}"}
 
         return await self.executor.run(goal_text or "多步任务", _work, source=source, steps=plan.outline)
 
-    async def _announce_step_done(self, chain, goal: "Goal") -> None:
-        """A5：步骤成功后的播报（有真实结果才说，不空喊）。"""
-        try:
-            last = chain[-1] if chain else ""
-            await self.send_chat(f"{last} 哦~")
-        except Exception:
-            pass
+    @staticmethod
+    def _step_done_text(g: "Goal") -> str:
+        """单步完成的人话（用实测数）。g.actual<=0 视为无数量语义的动作。
+
+        goal.actual 由 task_chain 各分支写入（背包计数/真做成数）。
+        fish 等无法计数的目标 actual 保持默认 → 只报动作名不报数量。
+        """
+        name = g.goal_type
+        if g.target and g.goal_type in ("mine", "chop", "craft", "gather",
+                                        "fetch", "give", "fish"):
+            name = f"{g.goal_type} {g.target}"
+        act = int(getattr(g, "actual", 0) or 0)
+        amt = int(getattr(g, "amount", 0) or 0)
+        if act > 0 and amt > 0:
+            if act >= amt:
+                return f"{name}完成（{act}个）"
+            return f"{name}只做到{act}个"
+        if act > 0:
+            return f"{name}完成（{act}个）"
+        return f"{name}完成"
 
     async def command(self, text: str, source: str = SRC_OWNER) -> Dict[str, Any]:
         """自然语言统一入口：自动判断长期任务/有限任务/喊停并派发。"""
@@ -724,7 +746,12 @@ class TerrariaAgent:
     async def follow_player(self, player_pos: tuple) -> None:
         """自动寻路走到玩家身边"""
         px, py = player_pos
-        await self.executor.run("跟随玩家", lambda info: self.navigate_to(px, py, timeout=8), source=SRC_AUTO)
+
+        async def _go(info):
+            ok = await self.navigate_to(px, py, timeout=8)
+            return {"ok": ok, "output": "到主人身边了" if ok else "没追上主人"}
+
+        await self.executor.run("跟随玩家", _go, source=SRC_AUTO)
 
     async def heal_self(self) -> bool:
         # 用注册表中标记为 heal（加血）的物品自愈：

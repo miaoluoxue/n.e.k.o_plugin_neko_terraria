@@ -51,6 +51,8 @@ class StepPlan:
     goals: List[Goal] = field(default_factory=list)
     outline: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)   # 省掉的步骤及原因
+    blocked: bool = False           # 规划遇无法执行的步骤 → 整链中止（防部分执行谎报）
+    blocked_reason: str = ""        # 中止原因
 
     def say(self) -> str:
         return " → ".join(self.outline) if self.outline else "（无步骤）"
@@ -227,6 +229,20 @@ class TaskBrain:
             elif action == "follow":
                 p.goals.append(Goal(goal_type="follow", target="", reason=goal_text))
                 p.outline.append("回到主人身边")
+            elif action == "combat":
+                # 战斗：goal_type 用 "combat"（task_chain 有现成 fight_nearest 分支）
+                p.goals.append(Goal(goal_type="combat", target=item or "",
+                                    amount=max(1, amt), reason=goal_text,
+                                    report_fail="战斗没打赢，主人"))
+                p.outline.append(f"打{item or '敌人'}")
+            else:
+                # 未识别 action：绝不静默丢弃——曾无声跳过导致 LLM 多步链里
+                # combat 被丢、只做剩余步骤后整串报"完成"（假完成）。
+                # 记入 skipped + 标记整链不可行（宁停不谎报）。
+                p.skipped.append(f"步骤「{action}」无法识别，已停止整串任务")
+                p.blocked = True
+                p.blocked_reason = f"遇到无法执行的步骤：{action or '空'}"
+                break
         return p
 
     @staticmethod

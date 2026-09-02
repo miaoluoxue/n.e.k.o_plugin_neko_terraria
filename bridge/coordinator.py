@@ -357,19 +357,24 @@ class TaskCoordinator:
         kind = it.kind
         target = it.target or ""
         amount = it.amount
+        # 只有引擎真实现的 kind 才映射。hunt/place 无实现——曾偷换成 goto
+        # （"猎杀史莱姆"→走过去算完成，假完成红线），宁诚实失败不偷换语义。
         kind_map = {
             "mine":    ("mine",   "挖掘"),
             "chop":    ("chop",   "砍伐"),
             "dig":     ("mine",   "挖掘"),
             "fish":    ("fish",   "钓鱼"),
-            "hunt":    ("goto",   "猎杀"),
             "collect": ("gather", "收集"),
-            "place":   ("goto",   "放置"),
             "craft":   ("craft",  "制作"),
             "explore": ("explore", "探索"),
+            "combat":  ("combat", "战斗"),
+            "give":    ("give",   "给物"),
         }
-        action, _ = kind_map.get(kind, ("goto", "执行"))
-        item = target or "矿"
+        mapped = kind_map.get(kind)
+        if mapped is None:
+            return []  # 未实现 kind → 空步骤，上层走 empty_plan 诚实失败
+        action, _ = mapped
+        item = target or ("矿" if action == "mine" else "目标")
         if action == "goto" and item == "矿" and kind != "hunt":
             item = "目标"
         if kind == "explore":

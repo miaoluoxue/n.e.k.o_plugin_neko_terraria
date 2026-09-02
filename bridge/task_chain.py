@@ -27,6 +27,18 @@ class Goal:
     equip_self: bool = False
     interrupt: bool = False
     report_fail: str = ""  # 步骤失败时向主人汇报的话
+    actual: int = 0        # 实际完成量（背包实测/真实计数），供完成播报用实数
+
+
+def _goal_done(goal: "Goal") -> bool:
+    """有数量目标时：实际获得 >= 目标 才算真完成。
+
+    曾各分支用 ">0 即成功"——挖到 1 个也报"挖铁矿x10 完成"（欠量谎报）。
+    对齐 mc 插件：完成必须由实测量证实，不足如实带量失败。
+    """
+    if goal.amount <= 0:
+        return True  # 无数量目标（如"跟着我"）只看动作成功
+    return goal.actual >= goal.amount
 
 
 class TaskChain:
@@ -134,9 +146,15 @@ class TaskChain:
         if goal.goal_type == "give":
             iid = self.agent.resolve_item(goal.target) if self.agent else -1
             if iid < 0:
+                if self.agent:
+                    self.agent.log(f"give：不认识物品 {goal.target}", "warn")
                 return False
-            await self.equip.give_to_player(iid, goal.amount)
-            return True
+            # 真验证：give 结果曾被丢弃恒 True（给失败也报完成）——假完成红线
+            ok = await self.equip.give_to_player(iid, goal.amount)
+            if not ok:
+                if self.agent:
+                    self.agent.log(f"give：{goal.target} 转交失败（可能不在背包）", "warn")
+            return ok
 
         # wait：等待 N 秒
         if goal.goal_type == "wait":
@@ -163,10 +181,15 @@ class TaskChain:
         if goal.goal_type == "gather":
             try:
                 collected = await self.mod.collect_items(radius=600)
-                ok = collected > 0
-                if not ok and self.agent:
-                    self.agent.log("gather：附近没有可捡的掉落物", "warn")
-                return ok
+                goal.actual = int(collected or 0)
+                if goal.actual <= 0:
+                    if self.agent:
+                        self.agent.log("gather：附近没有可捡的掉落物", "warn")
+                    return False
+                if goal.actual < goal.amount:
+                    goal.report_fail = f"只捡到 {goal.actual} 个（要 {goal.amount} 个）"
+                    return False
+                return True
             except Exception:
                 return False
 
@@ -177,7 +200,13 @@ class TaskChain:
                 if life:
                     amount = goal.amount or 10
                     got = await life.chop_wood(target=amount)
-                    return got > 0
+                    goal.actual = int(got or 0)
+                    if goal.actual <= 0:
+                        return False
+                    if goal.actual < goal.amount:
+                        goal.report_fail = f"只砍到 {goal.actual} 个木材（要 {goal.amount} 个）"
+                        return False
+                    return True
                 return False
             except Exception:
                 return False
@@ -187,8 +216,9 @@ class TaskChain:
             try:
                 life = getattr(self.agent, "life", None)
                 if life:
-                    # 用 goal.amount 控制甩竿次数（主人说"钓10条"→10竿），
-                    # 不再硬编码 3 竿
+                    # goal.amount 控制甩竿次数（"钓10条"→10 竿）。mod 不上报
+                    # 鱼获、无法逐条证实 → 不设 actual（播报不带数量），
+                    # life.fish 内部如实说"甩了N竿"，绝不宣称"钓到N条"
                     attempts = max(1, int(goal.amount or 0) or 3)
                     return await life.fish(attempts=attempts)
                 return False
@@ -232,15 +262,25 @@ class TaskChain:
             return False
         if goal.craft_first:
             crafted = await self.mod.craft(item_id=iid, amount=goal.amount)
-            if crafted <= 0:
+            goal.actual = int(crafted or 0)
+            if goal.actual <= 0:
                 if self.agent:
                     self.agent.log(f"craft：{goal.target} 材料不足或合成失败", "warn")
                 return False  # 材料不足/合成失败，不假装成功
+            if goal.actual < goal.amount:
+                # 材料不够做满：诚实报实际做成的量
+                goal.report_fail = f"{goal.target}材料不够，只做成 {goal.actual} 个（要 {goal.amount} 个）"
+                return False
             return True
         mined_iid, mined = await self.mining.mine_target(goal.target, goal.amount)
-        if mined <= 0:
+        goal.actual = int(mined or 0)
+        if goal.actual <= 0:
             if self.agent:
                 self.agent.log(f"mine：附近没找到 {goal.target} 或挖不到", "warn")
+            return False
+        if goal.actual < goal.amount:
+            # 矿脉挖尽/挖不够：诚实报实际量（假完成红线——绝不报"挖够 N"）
+            goal.report_fail = f"{goal.target}只挖到 {goal.actual} 个（要 {goal.amount} 个），附近没了"
             return False
         if goal.deliver_to_player:
             await self.equip.give_to_player(mined_iid, mined)
