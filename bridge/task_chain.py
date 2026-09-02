@@ -187,7 +187,10 @@ class TaskChain:
             try:
                 life = getattr(self.agent, "life", None)
                 if life:
-                    return await life.fish(attempts=3)
+                    # 用 goal.amount 控制甩竿次数（主人说"钓10条"→10竿），
+                    # 不再硬编码 3 竿
+                    attempts = max(1, int(goal.amount or 0) or 3)
+                    return await life.fish(attempts=attempts)
                 return False
             except Exception:
                 return False

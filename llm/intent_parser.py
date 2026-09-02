@@ -49,7 +49,7 @@ INTENT_PARSE_PROMPT = """你是{name}，在泰拉瑞亚世界里帮主人做事�
 【输出格式】严格 JSON，不要任何多余文字：
 {{
     "mode": "longterm|finite|stop|chat|unknown",
-    "kind": "follow|mine|guard|explore|craft|fetch|goto|give|wait|combat|...",
+    "kind": "follow|mine|guard|explore|craft|fetch|goto|give|wait|combat|fish|chop|gather|...",
     "target": "目标物/地点（如 铁矿、地下、这里）",
     "amount": 数量(整数, 0=不限量),
     "pre_reply": "你的第一句回应（猫娘语气，10字内）",
@@ -57,7 +57,7 @@ INTENT_PARSE_PROMPT = """你是{name}，在泰拉瑞亚世界里帮主人做事�
     "reason": "你理解的任务要点（1句话）",
     "confidence": 0.0-1.0 (你的把握度),
     "steps": [
-        {{"action": "explore|mine|craft|fetch|goto|give|gather|wait|combat|climb", "item": "目标", "amount": 数量}},
+        {{"action": "explore|mine|craft|fetch|goto|give|gather|wait|combat|climb|fish|chop", "item": "目标", "amount": 数量}},
         ...
     ]
 }}
@@ -106,6 +106,10 @@ INTENT_PARSE_PROMPT = """你是{name}，在泰拉瑞亚世界里帮主人做事�
 
 "帮我找找铁矿" → [
     {{"action":"explore", "item":"铁矿", "amount":1}}
+]
+
+"去钓鱼/钓点鱼" → [
+    {{"action":"fish", "item":"鱼", "amount":3}}
 ]
 
 "把背包里的铜做成铜镐" → [

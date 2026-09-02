@@ -36,8 +36,11 @@ ORE_ALIAS = {
     "树": "木材", "木材": "木材",
 }
 
+# 常用量词（"个/块/条/根/只"等）
 CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+AMOUNT_UNITS = ("个", "块", "颗", "组", "次", "只", "条", "根", "把")
 
 
 @dataclass
@@ -63,14 +66,15 @@ def _parse_amount(text: str) -> int:
     # "一组" 优先于单字匹配（否则先命中"一"返回 1）
     if "一组" in text:
         return 99
-    m = re.search(r"(\d+)\s*(个|块|颗|组|次|只)?", text)
+    unit_pat = "|".join(AMOUNT_UNITS)
+    m = re.search(rf"(\d+)\s*({unit_pat})?", text)
     if m:
         try:
             return int(m.group(1))
         except ValueError:
             pass
     for cn, n in CN_NUM.items():
-        if re.search(cn + r"\s*(个|块|颗|组|次|只)", text):
+        if re.search(cn + rf"\s*({unit_pat})", text):
             return n
     return 0
 
@@ -156,6 +160,91 @@ def parse(text: str) -> Intent:
         return Intent(mode="finite", kind="explore", target=target, raw=t,
                       reason=f"去{target}探索",
                       steps=[{"action": "explore", "item": target, "amount": 1}])
+
+    # 6) 钓鱼：有限行为（钓几条 / 去钓鱼 / 甩一竿）
+    #    裸"钓"也算（"钓10条鱼"），但排除"钓竿/钓具"等名词语境
+    FISH_WORDS = ("钓鱼", "钓点", "钓些", "钓几", "甩一竿", "去钓")
+    is_fish = any(w in low for w in FISH_WORDS)
+    if not is_fish and "钓" in low:
+        # "钓N条/钓到"等以钓开头的动作；含"竿/具/鱼饵"名词不算
+        if re.search(r"钓\s*\d", low) or (low.startswith("钓") and "竿" not in low and "具" not in low):
+            is_fish = True
+    if is_fish:
+        amount = _parse_amount(low) or 3
+        return Intent(mode="finite", kind="fish", target="鱼", amount=amount,
+                      raw=t, reason="去钓鱼",
+                      steps=[{"action": "fish", "item": "鱼", "amount": amount}])
+
+    # 7) 合成/制作：有限行为（做把镐子/合成铁锭/锻造装备/做2个火把）
+    #    "做" 单独太泛（"做什么/做饭"），必须带对象或工具词才判合成
+    CRAFT_WORDS = ("合成", "制作", "锻造", "打一把", "做一把", "做把",
+                   "做个", "做一个", "造把", "帮我做", "帮我造", "给我做")
+    is_craft = any(w in low for w in CRAFT_WORDS)
+    if not is_craft:
+        # "做2个火把"：做 + 数字 + 量词 + 物
+        unit_pat = "|".join(AMOUNT_UNITS)
+        if re.search(rf"做\s*\d+\s*({unit_pat})", low) or re.search(rf"做[一二两三四五六七八九十]+\s*({unit_pat})", low):
+            is_craft = True
+    if is_craft:
+        target = ""
+        # 数字量词场景（"做2个火把"/"做2火把"）→ 直接剥数字量词取物名
+        unit_pat = "|".join(AMOUNT_UNITS)
+        num_lead = re.match(
+            rf"^做\s*(\d+|[一二两三四五六七八九十]+)?\s*(?:{unit_pat})?\s*(.+)",
+            low)
+        if num_lead and num_lead.group(2):
+            target = num_lead.group(2).strip(" 的")
+        else:
+            # "做把铜镐" / "合成铁锭" 等：对象在触发词后
+            for w in ("合成", "制作", "锻造", "做一把", "做把", "做个",
+                      "做一个", "造把", "帮我做", "帮我造", "给我做"):
+                if w in low:
+                    rest = low.split(w)[-1].strip(" 的")
+                    # 去掉前导数量
+                    m2 = re.match(
+                        rf"(\d+|[一二两三四五六七八九十]+)?\s*(?:{unit_pat})?\s*(.+)?",
+                        rest)
+                    if m2 and m2.group(2):
+                        target = m2.group(2).strip(" 的")
+                    break
+        amount = _parse_amount(low) or 1
+        return Intent(mode="finite", kind="craft", target=target or "物品",
+                      amount=amount, raw=t, reason=f"制作{target or '物品'}",
+                      steps=[{"action": "craft", "item": target or "物品",
+                              "amount": amount}])
+
+    # 8) 给物：把东西给主人（给我铁/把木材给我/给我3个铁）
+    #    排除感官动词（"给我看/吃/听"不是给物品）
+    if (any(w in low for w in ("给我", "丢给我", "递给我", "拿给我", "分我", "交给我"))
+            or re.search(r"把[^，。]{1,8}给我", low)) \
+            and not re.search(r"给我(看看?|吃|听|闻|讲讲?|说|介绍|解释|用|玩|试)", low):
+        # 物品在"给我"前（"铁矿给我"）或"把X给我"中间
+        target = ""
+        m = re.search(r"把([^，。]{1,8}?)给我", low)
+        if m:
+            target = m.group(1).strip(" 的")
+        else:
+            # "给我X" / "X给我"
+            for w in ("给我", "丢给我", "递给我", "拿给我", "分我", "交给我"):
+                if w in low:
+                    # 若东西在词后面（"给我铁"）
+                    after = low.split(w)[-1].strip(" 的")
+                    before = low.split(w)[0].strip(" 的")
+                    target = (after or before).strip(" 的")
+                    break
+        # 剥掉 target 里带的数量（"3个铁" → "铁"；"3铁" → "铁"）
+        unit_pat2 = "|".join(AMOUNT_UNITS)
+        tm = re.match(
+            rf"(\d+|[一二两三四五六七八九十]+)?\s*(?:{unit_pat2})?\s*(.+)?",
+            target)
+        if tm and tm.group(2):
+            target = tm.group(2).strip(" 的")
+        amount = _parse_amount(low) or 1
+        if target:
+            return Intent(mode="finite", kind="give", target=target,
+                          amount=amount, raw=t, reason=f"给主人{target}",
+                          steps=[{"action": "give", "item": target,
+                                  "amount": amount}])
 
     return Intent(mode="unknown", raw=t)
 

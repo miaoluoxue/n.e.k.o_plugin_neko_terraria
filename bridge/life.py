@@ -241,7 +241,7 @@ class LifeEngine:
 
         where = biome or "普通水域"
         self.agent.log(f"找个{where}水边甩一竿~", "life")
-        caught = False
+        cast_count = 0
         for _ in range(attempts):
             if self.agent.executor and self.agent.executor.should_stop():
                 break
@@ -257,17 +257,19 @@ class LifeEngine:
                 await self.agent.mod.use_item(wx, wy)
             except Exception:
                 pass
-            caught = True
+            cast_count += 1
             await asyncio.sleep(1.0)
             if self.agent.executor and self.agent.executor.should_stop():
                 break
-        if caught:
-            self.agent.log(f"在{where}钓了一会儿鱼~", "life")
+        if cast_count:
+            # 诚实汇报：mod 不回报是否真钓到鱼，只说自己甩了几竿，
+            # 不宣称"钓到鱼了"（A3 诚实化——做不到的判定不编）
+            self.agent.log(f"在{where}甩了{cast_count}竿~", "life")
             try:
-                await self.agent.send_chat("钓到鱼了喵～")
+                await self.agent.send_chat(f"在{where}边甩了{cast_count}竿喵~")
             except Exception:
                 pass
-        return caught
+        return cast_count > 0
 
     # ---------------- 生活小动作（idle 驱动） ----------------
 
