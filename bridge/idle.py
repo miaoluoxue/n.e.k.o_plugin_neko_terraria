@@ -38,8 +38,12 @@ def _me(st) -> Tuple[int, int]:
     return int(st.get("tile_x", 0) or 0), int(st.get("tile_y", 0) or 0)
 
 
-def _owner(st) -> Optional[Tuple[int, int]]:
-    """最近的非自身玩家（残留槽位过滤）。"""
+def _owner(st, my_name: str = "") -> Optional[Tuple[int, int]]:
+    """最近的非自身玩家（残留槽位过滤）。my_name=猫娘角色名用于排除自身。
+
+    曾用 st.get("player_name") 过滤——该键从未写入状态，恒为空 → 推送
+    nearby_players 含自身时把自己当主人（追随失真/给"自己"塞火把）。
+    """
     players = st.get("nearby_players", []) or []
     best, best_d = None, 10**9
     mx, my = _me(st)
@@ -47,7 +51,7 @@ def _owner(st) -> Optional[Tuple[int, int]]:
         if not isinstance(p, dict):
             continue
         name = p.get("name", "")
-        if name == st.get("player_name", ""):
+        if my_name and name == my_name:
             continue  # 过滤自身（get_state 不含自身，但 state 可能来自推送含自身）
         x = int(p.get("tile_x", 0) or 0)
         y = int(p.get("tile_y", 0) or 0)
@@ -103,7 +107,12 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
         return
 
     ctx["cycle"] += 1
-    owner = _owner(st)
+    my_name = ""
+    try:
+        my_name = agent._character_name()
+    except Exception:
+        pass
+    owner = _owner(st, my_name)
     if owner is None:
         return  # 单人模式不主动搞事（等主人）
 

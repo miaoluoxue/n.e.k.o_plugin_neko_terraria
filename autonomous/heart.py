@@ -32,6 +32,9 @@ class Heart:
         self._file = base / BOND_FILE
         self.bond = 50.0                       # 0-100
         self._last_interact_ts = time.time()
+        # 冷落衰减上次结算时刻：只对增量 dt 扣分，避免每 30s 用完整 idle
+        # 重算（曾不推进 → 主人离开越久单次扣越多，雪崩式归零）
+        self._last_neglect_ts = time.time()
         self._load()
 
     # ---------- 持久化 ----------
@@ -73,11 +76,25 @@ class Heart:
         self.bond = min(100.0, self.bond + COMPANION_GAIN_PER_HOUR * dt / 3600.0)
 
     def on_neglect_tick(self, now: Optional[float] = None) -> None:
-        """冷落衰减：长时间无互动（定期调用，低频）。"""
+        """冷落衰减：长时间无互动（定期调用，低频）。
+
+        只对距上次结算的增量时间衰减（曾用完整 idle 重算——主人在
+        附近陪伴会 _touch 推进 _last_interact_ts，但纯冷落期间该值不动，
+        每次调用都按 [now - 最后互动] 扣，间隔越久单次扣越多 → 雪崩）。
+        以 _last_neglect_ts 为锚，每 tick 最多衰减间隔时长的份额。
+        """
         now = now or time.time()
+        # 有互动则重置锚点（下次从互动后开始算冷落）
+        if self._last_neglect_ts < self._last_interact_ts:
+            self._last_neglect_ts = self._last_interact_ts
+        dt = now - self._last_neglect_ts
+        self._last_neglect_ts = now
         idle = now - self._last_interact_ts
+        if dt <= 0:
+            return
         if idle > NEGLECT_AFTER_SECONDS:
-            self.bond = max(0.0, self.bond - NEGLECT_DECAY_PER_HOUR * idle / 3600.0)
+            # 冷落窗口外才衰减；窗口内不扣（dt 计满后进入窗口）
+            self.bond = max(0.0, self.bond - NEGLECT_DECAY_PER_HOUR * dt / 3600.0)
             self.save()
 
     def _touch(self) -> None:

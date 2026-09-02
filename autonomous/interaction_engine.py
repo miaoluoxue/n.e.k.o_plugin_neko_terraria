@@ -63,24 +63,30 @@ class SceneClassifier:
         不要读 nearby_enemies（mod 不返回该键，会导致战斗场景永不触发）。
         """
         nearby = state.get("nearby_npcs", []) or state.get("nearby_enemies", []) or []
+        # 只把"有伤害且活着"的 NPC 当敌人（曾把向导/商人等友善 NPC 也判
+        # 成 combat → 猫娘站在 NPC 旁永远战斗场景高频碎碎念战斗话题。
+        # 口径对齐 combat.py / brain._guard_check 的 damage>0 and life>0）
+        enemies = [e for e in nearby
+                   if int(e.get("damage", 0) or 0) > 0
+                   and int(e.get("life", 0) or 0) > 0]
         hp = state.get("hp", 100)
         max_hp = state.get("max_life", state.get("max_hp", 100))
         hp_ratio = hp / max(max_hp, 1)
 
         # BOSS 战：附近有 boss 级怪物
-        if nearby:
-            for e in nearby:
+        if enemies:
+            for e in enemies:
                 name = str(e.get("name", "")).lower()
                 for kw in SceneClassifier._boss_keywords:
                     if kw in name:
                         return "boss"
 
-        # 战斗：附近有怪
-        if nearby and len(nearby) > 0:
+        # 战斗：附近有敌怪
+        if enemies:
             return "combat"
 
-        # 恢复：血量低且附近没怪
-        if hp_ratio < 0.5 and not nearby:
+        # 恢复：血量低且附近没敌怪
+        if hp_ratio < 0.5 and not enemies:
             return "recovery"
 
         # 通过 agent 的长期任务判断其他场景

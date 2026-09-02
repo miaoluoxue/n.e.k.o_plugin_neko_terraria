@@ -17,6 +17,8 @@ class ParallelExecutor:
                 try:
                     if hasattr(action, "__await__"):
                         await action()
+                    else:
+                        action()  # 普通 callable 同步调用（曾缺 else，静默丢弃）
                 except Exception:
                     pass
             self._layers[layer].clear()

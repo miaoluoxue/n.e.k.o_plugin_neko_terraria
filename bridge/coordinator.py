@@ -64,19 +64,23 @@ class TaskCoordinator:
         if source == SRC_OWNER and inq_mgr and inq_mgr.has_pending:
             answered = inq_mgr.match_answer(text)
             if answered:
-                # #16: 语义确认询问存了 pending_intent —— 主人确认（非 hold）就执行原意图，
-                # 不再只回一句"好的主人~"就丢掉指令。
+                # #16: 语义确认询问存了 pending_intent —— 主人确认（非 hold）
+                # 就执行原意图，不再只回一句"好的主人~"就丢掉指令。
+                # deny（"不是/算了/先不做"）→ 丢弃 pending_intent，绝不执行原意图
                 pending = None
                 if isinstance(getattr(answered, "context", None), dict):
                     pending = answered.context.get("pending_intent")
                 hold = "hold" in (answered.answer or "")
-                if pending is not None and not hold:
+                deny = (answered.answer or "").startswith("deny")
+                if pending is not None and not hold and not deny:
                     try:
                         self.agent.log(
                             f"主人确认了语义询问 → 执行原意图 mode={pending.mode}", "task")
                         return await self._dispatch_result(pending, source, text)
                     except Exception:
                         pass
+                if deny:
+                    self.agent.log("主人否定了语义询问 → 不执行原意图", "task")
                 await self._announce_inquiry_answered(answered)
                 return {"ok": True, "status": "inquiry_answered",
                         "question": answered.question, "answer": answered.answer,

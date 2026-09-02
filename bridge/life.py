@@ -141,8 +141,15 @@ class LifeEngine:
             return 0
 
         got = 0
-        for _ in range(4):  # 最多砍 4 棵
+        # 目标棵数约束：曾写死 range(4) 忽略 target 参数——主人说"砍5个木材"
+        # 会砍 4 整棵（30+ 木材）。target 是"预期获得量"，按需砍到接近即可。
+        # 简化按"至少砍到 target 棵树才算够"不成立（一棵树给 5-20 木材），
+        # 故改为：最多砍 target 棵；配合背包计数——到账即停。
+        max_trees = max(1, min(int(target or 4), 12))
+        for _ in range(max_trees):
             if self.agent.executor and self.agent.executor.should_stop():
+                break
+            if target and 0 < target <= got:
                 break
             trees = await self.agent.mod.find_trees(radius=30)
             if not trees:

@@ -64,12 +64,15 @@ class TaskInquiry:
     def match_answer(self, user_text: str) -> Optional[Inquiry]:
         """尝试用主人回复匹配一个待决询问。
 
-        简单规则（Phase 1 用）：
-        - 主人说"继续"/"可以随便"/"go ahead" → 取最早未回复的，answer 为自动决策
-        - 主人说"等一等"/"先别" → 标记 resolved，等后续指令
-        - 其他文本 → 取最早未回复的，answer=user_text
+        规则：
+        - 命中某询问 options 里的词（如"换个地方"）→ 该询问 answered
+        - auto（继续/随便/你决定）→ 自动决策
+        - hold（等等/先别）→ 挂起，等后续
+        - deny（不是/不要/算了/先不做/不用）→ 否定回答
+        - 都不像 → 返回 None 放行——这条消息是**新指令**而非对旧问题的回答
 
-        Phase 2 可接 LLM 做语义匹配。
+        曾默认吞掉任意文本当答案：主人询问等待期说"帮我挖矿"会被当回答
+        消费，新指令永不进入 parse/派发（"说了不执行"）。
         """
         if not self._pending:
             return None
@@ -79,12 +82,25 @@ class TaskInquiry:
             return None
 
         auto_words = {"继续", "可以", "好", "行", "随便", "你决定", "你来",
-                       "go ahead", "ok", "yes", "sure", "continue"}
-        hold_words  = {"等等", "停", "先别", "等一下", "等等先", "hold", "wait", "stop", "先停"}
+                       "go ahead", "ok", "yes", "sure", "continue",
+                       "换个地方", "换地方"}
+        hold_words = {"等等", "停", "先别", "等一下", "等等先", "hold",
+                       "wait", "stop", "先停", "别急", "等会"}
+        deny_words = {"不是", "不要", "不用", "算了", "先不做", "不了", "不对",
+                       "别做", "停手", "没有", "no", "nope"}
 
         for inquiry in list(self._pending):
             if inquiry.resolved:
                 continue
+            # 先试询问自带 options（"换个地方"/"继续挖"这类精确回答）
+            if inquiry.options:
+                opt = next((o for o in inquiry.options
+                            if o and (o == text or o in text)), None)
+                if opt:
+                    inquiry.answer = opt
+                    inquiry.resolved = True
+                    self._pending.remove(inquiry)
+                    return inquiry
             if text in auto_words or any(w in text for w in auto_words):
                 inquiry.answer = "auto（主人让猫娘自己决定）"
                 inquiry.resolved = True
@@ -95,13 +111,13 @@ class TaskInquiry:
                 inquiry.resolved = True
                 self._pending.remove(inquiry)
                 return inquiry
-            # 默认：用主人的话作为答案
-            inquiry.answer = text
-            inquiry.resolved = True
-            self._pending.remove(inquiry)
-            return inquiry
+            if any(w in text for w in deny_words):
+                inquiry.answer = "deny（主人否定了）"
+                inquiry.resolved = True
+                self._pending.remove(inquiry)
+                return inquiry
 
-        return None
+        return None  # 都不像回答 → 放行，按新指令解析
 
     def check_timeouts(self) -> List[Inquiry]:
         """检查超时询问，自动决策并返回。"""

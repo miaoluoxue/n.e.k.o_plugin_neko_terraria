@@ -160,11 +160,20 @@ class VisualPerception:
 
         if not self.agent:
             return
+        # 真交互引擎在插件的 AutonomousBrain 上（agent.brain 是 TaskBrain，无
+        # interaction——曾用 agent.brain.interaction 恒 None，整条画面→交互
+        # 事件链路是死代码，'猫娘看到主人画面做反应'从不触发）。
         try:
-            brain = getattr(self.agent, "brain", None)
-            if not brain or not getattr(brain, "interaction", None):
+            plugin = getattr(self.agent, "plugin", None)
+            abrain = getattr(plugin, "_autonomous_brain", None)
+            interaction = getattr(abrain, "interaction", None) if abrain else None
+            if not interaction:
+                # lifecycle 也把交互引擎暴露为 agent._neko_interaction
+                interaction = getattr(self.agent, "_neko_interaction", None)
+            if not interaction:
                 return
-            inject = brain.interaction.inject_event
+            inject = interaction.inject_event
+            mood = interaction.mood
         except Exception:
             return
 
@@ -215,7 +224,7 @@ class VisualPerception:
             emo = mood_map.get(mood)
             if emo:
                 try:
-                    brain.interaction.mood.trigger(emo, 0.4)
+                    mood.trigger(emo, 0.4)
                 except Exception:
                     pass
         want = (report.get("want_to_say") or "").strip()
