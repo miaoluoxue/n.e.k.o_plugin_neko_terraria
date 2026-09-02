@@ -400,6 +400,12 @@ class InteractionEngine:
 
     async def _tick(self) -> None:
         """单次 tick：更新状态 → 场景分类 → 情绪衰减 → 主人追踪 → 处理事件 → urge → 判定 → 恢复。"""
+        # v2.2: AI 客户端未连接（等面板「连接游戏」）→ 空转，不主动开口。
+        # 此前 bug：游戏没开时 state 空 → 场景 idle → urge 慢慢涨到阈值 →
+        # 猫娘对着没开的游戏主动搭话（"主人，在忙什么呀？"）。
+        # 主人说话由 coordinator 直推 push_speech，不走 tick——不受此门影响。
+        if not getattr(self.agent, "running", False):
+            return
         state = self._get_state()
         longterm_kinds = self._get_longterm_kinds()
         current_name = self._get_current_task_name()
