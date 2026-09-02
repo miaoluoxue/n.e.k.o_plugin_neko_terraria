@@ -103,15 +103,22 @@ class TerrariaService:
         deep_interval = self.cfg.get("context_deep_push_interval_seconds", 30.0)
         last_deep = 0.0
 
-        if not self._joined:
-            self._joined = True
-            await self._push(
-                "[系统] 我正在进入泰拉瑞亚世界，马上就好...",
-                "system")
-            await self._push_joined_game()
-
+        # joined 推送延迟到 agent 真正连接后（boot 不再自动启动 AI 客户端，
+        # 未连接时推"进入世界"是假消息）
         while self._running:
             await asyncio.sleep(interval)
+
+            if not getattr(self.agent, "running", False):
+                # AI 客户端未连接：状态为空，不发 delta/deep（避免空上下文噪音）
+                continue
+
+            if not self._joined:
+                self._joined = True
+                await self._push(
+                    "[系统] 我正在进入泰拉瑞亚世界，马上就好...",
+                    "system")
+                await self._push_joined_game()
+                continue
 
             try:
                 state = self.agent.get_state()

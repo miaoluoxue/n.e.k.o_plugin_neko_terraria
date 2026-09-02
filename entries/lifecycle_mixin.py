@@ -330,20 +330,16 @@ class LifecycleMixin:
             await self._wire_llm_integration()
             self.logger.info("[boot] LLM 集成完成")
 
-            self.logger.info("[boot] 正在连接游戏 Agent...")
-            try:
-                # 硬超时：即使连接卡死，也继续启动大脑/交互（脑驱动 > 完美连接）
-                ok = await asyncio.wait_for(self._agent.start(), timeout=45.0)
-            except asyncio.TimeoutError:
-                ok = False
-                self.logger.warning("[boot] Agent 连接超时（45s），继续启动大脑（可能游戏未开）")
-            except Exception as e:
-                ok = False
-                self.logger.warning(f"[boot] Agent 连接异常: {e}")
-            if not ok:
-                self.logger.warning("Agent 未就绪，但继续启动大脑/交互（猫娘仍能思考说话）")
+            # ★ 不自动启动 AI 客户端：插件启动只加载大脑/交互待命，不拉起
+            #   tModLoader 游戏进程（曾 boot → agent.start() → launcher.launch()
+            #   自动弹游戏窗口，用户没在玩也占资源）。
+            #   由面板「连接游戏」(nt_connect → agent.start()) 手动拉起。
+            #   agent.running=False 期间 brain/service 空转（见 brain 的
+            #   running 门 + service 的 joined 延迟），连上后自动恢复。
+            if getattr(self._agent, "running", False):
+                self.logger.info("[boot] AI 客户端已在运行，跳过自动启动")
             else:
-                self.logger.info("[boot] Agent 启动成功")
+                self.logger.info("[boot] 未自动启动游戏（点面板『连接游戏』才会拉起 AI 客户端）")
 
             # v2.0: brain.start() 内部会拉起交互引擎 + 注册 executor 回调
             try:

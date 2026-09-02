@@ -139,6 +139,11 @@ class AutonomousBrain:
         interval = self.cfg.get("state_tick_interval_seconds", 1.0)
         while self.running:
             try:
+                # v2.2: AI 客户端未连接（boot 不再自动启动，等面板「连接游戏」）
+                # → 空转：不涨 boredom、不扣 Heart（否则用户没玩时依恋值狂掉）
+                if not getattr(self.agent, "running", False):
+                    await asyncio.sleep(interval)
+                    continue
                 # 刺激源只看前台任务——长期任务（跟随/挖矿）是常态陪伴，不算"刺激"；
                 # 否则跟随中 boredom 永远下降，_llm_think 永不触发，自主思考/情感交互全停。
                 ex = getattr(self.agent, "executor", None)
@@ -166,6 +171,11 @@ class AutonomousBrain:
         while self.running:
             try:
                 state = self.agent.get_state()
+                # v2.2: AI 客户端未连接 → 空转（不自主行动，避免空 state 触发
+                # motivation gather → executor 挖矿失败刷屏）
+                if not getattr(self.agent, "running", False):
+                    await asyncio.sleep(interval)
+                    continue
                 # P0 优先级守卫：自保（喝药/逃跑）无条件优先 + 长期任务中遇怪战斗
                 # 按生存循环惯例 主循环 P0 自保 > P1 战斗（不被任务占用抑制）
                 if await self._guard_check(state):
@@ -374,6 +384,11 @@ class AutonomousBrain:
                 await asyncio.sleep(random.uniform(lo, hi))
                 if not self.running:
                     break
+
+                # v2.2: AI 客户端未连接 → 不自主 LLM 决策（空 state 无从判断
+                # 该做什么，推自主思考只会让 LLM 对着空上下文乱编）
+                if not getattr(self.agent, "running", False):
+                    continue
 
                 # 有前台任务在执行 → 不打扰（长期任务/跟随是常态，不阻塞自主思考）
                 ex = getattr(self.agent, "executor", None)
