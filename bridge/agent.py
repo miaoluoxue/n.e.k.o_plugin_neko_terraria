@@ -231,6 +231,8 @@ class TerrariaAgent:
         """确保已连接到 AI Mod 的 TCP 端口，未连接则尝试重连。"""
         if self.conn.is_mod_connected():
             return True
+        self.registry.invalidate()
+        self.recipe_book.invalidate()
         for retry in range(10):
             if await self.conn.connect_mod(retry_ports=(retry >= 3)):
                 return True
@@ -289,6 +291,8 @@ class TerrariaAgent:
 
     async def stop(self) -> None:
         self._running = False
+        self.registry.invalidate()
+        self.recipe_book.invalidate()
         startup = self._start_task
         if startup and startup is not asyncio.current_task() and not startup.done():
             startup.cancel()
@@ -322,6 +326,8 @@ class TerrariaAgent:
         while self._running:
             loop_count += 1
             if not self.conn.is_mod_connected():
+                self.registry.invalidate()
+                self.recipe_book.invalidate()
                 await self.stop_everything("游戏连接已断开")
                 self._state.clear()
                 self._inv_full = {"hotbar": [], "equipped": [], "inventory": []}
@@ -330,6 +336,7 @@ class TerrariaAgent:
                     break
                 if not await self._ensure_mod_connected():
                     continue
+                self._spawn_background_task(self._auto_register())
             try:
                 # 兜底轮询（低频繁）：推送为主，这里只在游戏状态事件尚未填缓存时补一次，
                 # 并承担死亡/复活/联机检测（推送是主通道，轮询是保险）

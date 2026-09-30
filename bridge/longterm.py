@@ -238,6 +238,10 @@ class LongTermManager:
 
     async def stop(self, kind: str, why: str = "") -> bool:
         """停止某类长期任务（协作式，先置位再取消兜底）。"""
+        # 对外仍允许用 mine 指代“砍树”长期任务；start() 会将它规范化为 chop，
+        # 这里也统一别名，避免停止命令找不到已登记的 runner。
+        if kind == "mine" and kind not in self._tasks and "chop" in self._tasks:
+            kind = "chop"
         logger.info(f"🛑 stop() 被调用: kind={kind}, why={why}")
         self._log(f"🛑 stop() 被调用: kind={kind}, why={why}", "task")
         t = self._tasks.get(kind)

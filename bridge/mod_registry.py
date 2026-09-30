@@ -1,147 +1,137 @@
-"""mod 物品注册缓存：枚举已加载 mod 物品，按 mod 分文件存于 data/mod_items/。
-
-data/ 统一存放运行时数据（配置、缓存等），按分类建子文件夹。此缓存属游戏数据，
-进游戏时对比当前 mod 列表与已有文件：新增写入、消失删除，保持目录整洁。
-"""
+"""Session-authoritative item identities, with a disk cache for display only."""
 
 import json
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List
 
 
 class ModItemRegistry:
     def __init__(self, base_dir: str) -> None:
         self.dir = Path(base_dir) / "data" / "mod_items"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self.mods: Dict[str, Dict[str, int]] = {}
-        self.uses: Dict[str, Dict[str, str]] = {}
-        self.tags: Dict[str, Dict[str, List[str]]] = {}
+        self._lock = threading.RLock()
+        self.mods = {}
+        self.uses = {}
+        self.tags = {}
+        self._records = {}
+        self._aliases = {}
+        self._by_id = {}
+        self.live = False
         self.load_cached()
-
-    def load_cached(self) -> None:
-        if not self.dir.exists():
-            return
-        for f in self.dir.glob("*.json"):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                self.mods[data.get("mod", f.stem)] = {
-                    name: i["id"] for name, i in self._entries(data.get("items", []))
-                }
-                self.uses[data.get("mod", f.stem)] = {
-                    name: i.get("use", "misc") for name, i in self._entries(data.get("items", []))
-                }
-                self.tags[data.get("mod", f.stem)] = {
-                    name: i.get("tags", ["misc"]) for name, i in self._entries(data.get("items", []))
-                }
-            except Exception:
-                pass
-
-    def sync_from_enum(self, mods: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-        # 增量同步：新增/更新写入，消失的 mod 删除对应文件，返回变更
-        result: Dict[str, List[str]] = {"added": [], "updated": [], "removed": []}
-        # A failed/empty enumeration is ambiguous; it must not erase a valid cache.
-        if not mods:
-            return result
-        with self._lock:
-            seen: Set[str] = set()
-            for m in mods:
-                name = m.get("mod", "Unknown")
-                items = {n: i["id"] for n, i in self._entries(m.get("items", []))}
-                uses = {n: i.get("use", "misc") for n, i in self._entries(m.get("items", []))}
-                tags = {n: i.get("tags", ["misc"]) for n, i in self._entries(m.get("items", []))}
-                seen.add(name)
-                if name not in self.mods:
-                    result["added"].append(name)
-                elif self.mods[name] != items:
-                    result["updated"].append(name)
-                self.mods[name] = items
-                self.uses[name] = uses
-                self.tags[name] = tags
-                self._write_file(name, m.get("items", []))
-            for old in list(self.mods.keys()):
-                if old not in seen:
-                    result["removed"].append(old)
-                    self._remove_file(old)
-                    del self.mods[old]
-                    del self.uses[old]
-                    del self.tags[old]
-        return result
-
-    def _write_file(self, mod: str, items: List[Dict[str, Any]]) -> None:
-        path = self.dir / f"{mod}.json"
-        try:
-            path.write_text(
-                json.dumps({"mod": mod, "items": items},
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8")
-        except Exception:
-            pass
-
-    def _remove_file(self, mod: str) -> None:
-        path = self.dir / f"{mod}.json"
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
-
-    def resolve(self, name: str) -> int:
-        low = self._normalize(name)
-        for items in self.mods.values():
-            if low in items:
-                return items[low]
-        return -1
 
     @staticmethod
     def _normalize(name: str) -> str:
-        return "".join((name or "").lower().replace("_", "").split())
+        return "".join(str(name or "").casefold().replace("_", "").split())
 
-    @classmethod
-    def _entries(cls, items):
-        for item in items:
-            for name in [item["name"], *item.get("aliases", [])]:
-                if name:
-                    yield cls._normalize(name), item
+    def _rebuild(self) -> None:
+        self.mods, self.uses, self.tags = {}, {}, {}
+        self._aliases, self._by_id = {}, {}
+        for mod, entries in self._records.items():
+            aliases = {}
+            for source in entries:
+                iid = int(source.get("id", -1))
+                if iid <= 0:
+                    continue
+                item = dict(source, mod=mod)
+                item.setdefault("full_name", mod + "/" + item["name"])
+                self._by_id[iid] = item
+                names = [item["name"], item["full_name"], item.get("display_name", ""),
+                         *item.get("aliases", [])]
+                for name in names:
+                    if name:
+                        key = self._normalize(name)
+                        aliases.setdefault(key, set()).add(iid)
+                        self._aliases.setdefault(key, set()).add(iid)
+            # Keep the existing public indexes, excluding ambiguous aliases.
+            self.mods[mod] = {n: next(iter(ids)) for n, ids in aliases.items() if len(ids) == 1}
+            self.uses[mod] = {n: self._by_id[i].get("use", "misc") for n, i in self.mods[mod].items()}
+            self.tags[mod] = {n: self._by_id[i].get("tags", []) for n, i in self.mods[mod].items()}
 
-    def use_of(self, name: str) -> str:
-        low = self._normalize(name)
-        for uses in self.uses.values():
-            if low in uses:
-                return uses[low]
-        return "misc"
+    def invalidate(self) -> None:
+        with self._lock:
+            self.live = False
 
-    def find_by_use(self, use: str) -> List[int]:
-        # 返回某用途的所有物品 id（如 "potion" 找所有药水）
-        out: List[int] = []
-        for mod, items in self.mods.items():
-            u = self.uses.get(mod, {})
-            for name, iid in items.items():
-                if u.get(name, "misc") == use:
-                    out.append(iid)
-        return list(dict.fromkeys(out))
+    def load_cached(self) -> None:
+        with self._lock:
+            for path in self.dir.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    self._records[data.get("mod", path.stem)] = data.get("items", [])
+                except (OSError, ValueError, TypeError):
+                    continue
+            self._rebuild()
 
-    def find_by_tag(self, tag: str) -> List[int]:
-        # 按用途标签找物品 id（如 "heal" 找所有加血物品）
-        out: List[int] = []
-        for mod, items in self.mods.items():
-            t = self.tags.get(mod, {})
-            for name, iid in items.items():
-                if tag in t.get(name, []):
-                    out.append(iid)
-        return list(dict.fromkeys(out))
+    def sync_from_enum(self, mods: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        result = {"added": [], "updated": [], "removed": []}
+        if not mods:
+            self.invalidate()
+            return result
+        with self._lock:
+            incoming = {m["mod"]: m.get("items", []) for m in mods if m.get("mod")}
+            if not any(incoming.values()):
+                self.live = False
+                return result
+            for mod, items in incoming.items():
+                if mod not in self._records:
+                    result["added"].append(mod)
+                elif self._records[mod] != items:
+                    result["updated"].append(mod)
+                self._write_file(mod, items)
+            for mod in self._records.keys() - incoming.keys():
+                result["removed"].append(mod)
+                path = self._cache_path(mod)
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            self._records = incoming
+            self._rebuild()
+            self.live = True
+        return result
+
+    def _cache_path(self, mod):
+        path = (self.dir / (mod + ".json")).resolve()
+        return path if path.parent == self.dir.resolve() else None
+
+    def _write_file(self, mod, items):
+        path = self._cache_path(mod)
+        if path is None:
+            return
+        try:
+            path.write_text(json.dumps({"mod": mod, "items": items}, ensure_ascii=False,
+                                       indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def resolve(self, name: str) -> int:
+        with self._lock:
+            if not self.live:
+                return -1
+            key = self._normalize(name)
+            if key.isdecimal():
+                return int(key) if int(key) in self._by_id else -1
+            ids = self._aliases.get(key, set())
+            if len(ids) > 1:
+                return -2  # Ambiguous: callers must not fall back to a guessed ID.
+            return next(iter(ids), -1)
 
     def describe(self, name: str) -> Dict[str, Any]:
-        # 返回某物品的用途信息：id / use / tags
-        low = self._normalize(name)
-        for mod, items in self.mods.items():
-            if low in items:
-                u = self.uses.get(mod, {})
-                t = self.tags.get(mod, {})
-                return {"id": items[low], "use": u.get(low, "misc"),
-                        "tags": t.get(low, ["misc"])}
-        return {"id": -1, "use": "misc", "tags": ["misc"]}
+        with self._lock:
+            iid = self.resolve(name)
+            return dict(self._by_id.get(iid, {"id": iid, "use": "misc", "tags": []}))
+
+    def use_of(self, name: str) -> str:
+        return self.describe(name).get("use", "misc")
+
+    def find_by_use(self, use: str) -> List[int]:
+        with self._lock:
+            return [i for i, item in self._by_id.items() if self.live and item.get("use") == use]
+
+    def find_by_tag(self, tag: str) -> List[int]:
+        with self._lock:
+            return [i for i, item in self._by_id.items() if self.live and tag in item.get("tags", [])]
 
     def mod_list(self) -> List[Dict[str, Any]]:
-        return [{"mod": k, "count": len(set(v.values()))} for k, v in self.mods.items()]
+        return [{"mod": mod, "count": len(items)} for mod, items in self._records.items()]

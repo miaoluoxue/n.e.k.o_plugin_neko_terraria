@@ -13,13 +13,15 @@
 缓存放在 data/recipes/ 下，与 mod_items 同级，换整合包会自动重建。
 """
 
+import asyncio
+import copy
 import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # 常见原版物品中英对照，帮主人的中文对上 mod 回的英文名。
-# mod 物品的中文名通常没有官方对照，靠原名/模糊匹配兜底。
+# 模组物品使用游戏注册表中的本地化名称和完整内部名称。
 CN_EN: Dict[str, str] = {
     "铁矿": "Iron Ore", "铜矿": "Copper Ore", "银矿": "Silver Ore",
     "金矿": "Gold Ore", "锡矿": "Tin Ore", "铅矿": "Lead Ore",
@@ -32,7 +34,14 @@ CN_EN: Dict[str, str] = {
     "木材": "Wood", "石块": "Stone Block", "土块": "Dirt Block",
     "火把": "Torch", "工作台": "Work Bench", "熔炉": "Furnace",
     "铁砧": "Iron Anvil", "抓钩": "Grappling Hook", "绳": "Rope",
-    "恶魔石": "Demonite Ore", "陨石": "Meteorite",
+    "恶魔石": "Demonite Ore", "魔矿": "Demonite Ore", "陨石": "Meteorite",
+    "陨铁矿": "Meteorite", "陨石矿": "Meteorite", "猩红矿": "Crimtane Ore",
+    "钴矿": "Cobalt Ore", "钯金矿": "Palladium Ore", "秘银矿": "Mythril Ore",
+    "山铜矿": "Orichalcum Ore", "精金矿": "Adamantite Ore", "钛金矿": "Titanium Ore",
+    "叶绿矿": "Chlorophyte Ore", "狱石": "Hellstone", "黑曜石": "Obsidian",
+    "凝胶": "Gel", "木头": "Wood", "石头": "Stone Block", "泥土": "Dirt Block",
+    "铜斧": "Copper Axe", "铁斧": "Iron Axe", "银斧": "Silver Axe", "金斧": "Gold Axe",
+    "木钓竿": "Wood Fishing Pole", "铁钓竿": "Reinforced Fishing Pole",
 }
 EN_CN: Dict[str, str] = {v: k for k, v in CN_EN.items()}
 
@@ -45,50 +54,86 @@ STATION_CN: Dict[str, str] = {
     "Tinkerer's Workshop": "工匠作坊", "Alchemy Table": "炼药桌",
 }
 
-CACHE_TTL = 3600.0     # 配方一小时内不重复拉取（换 mod 会手动刷新）
+CACHE_TTL = 3600.0
 
 
 class Recipe:
-    """一条配方。"""
-
-    __slots__ = ("name", "item_id", "amount", "mod", "materials",
-                 "stations", "available")
+    """Keep the wire identity and all requirements; quantities are per batch."""
 
     def __init__(self, data: Dict[str, Any]) -> None:
-        self.name: str = data.get("name", "")
-        self.item_id: int = int(data.get("item_id", -1) or -1)
-        self.amount: int = int(data.get("amount", 1) or 1)
-        self.mod: str = data.get("mod", "Terraria")
-        self.available: bool = bool(data.get("available", True))
-        self.materials: List[Tuple[str, int]] = [
-            (m.get("name", ""), int(m.get("stack", 1) or 1))
-            for m in data.get("materials", []) or []
-            if m.get("name")
-        ]
-        self.stations: List[str] = [
-            st.get("name", "") for st in data.get("stations", []) or []
-            if st.get("name")
-        ]
+        self.data = copy.deepcopy(data)
+        self.name = str(data.get("name", ""))
+        self.full_name = str(data.get("full_name", ""))
+        self.item_id = int(data.get("item_id", -1))
+        self.recipe_index = int(data.get("recipe_index", -1))
+        self.amount = int(data.get("amount", 1))
+        if self.item_id <= 0 or self.amount <= 0 or self.recipe_index < 0:
+            raise ValueError("Invalid recipe output")
+        self.mod = data.get("mod", "Terraria")
+        self.ingredients = copy.deepcopy(data.get("materials", []) or [])
+        if any(int(m.get("stack", 0)) <= 0 or int(m.get("id", -1)) <= 0
+               for m in self.ingredients):
+            raise ValueError("Invalid ingredient")
+        self.materials = [(m.get("full_name") or m.get("name", ""), int(m["stack"]))
+                          for m in self.ingredients]
+        self.stations = [st.get("name", "") if isinstance(st, dict) else str(st)
+                         for st in data.get("stations", []) or []]
+        self.conditions = copy.deepcopy(data.get("conditions", []) or [])
+        self.available = data.get("available") is True
+        self.environment_ready = data.get("environment_ready") is True
+
+    def batches(self, amount: int) -> int:
+        return (max(0, amount) + self.amount - 1) // self.amount
+
+    def requirements(self, amount: int, inventory) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+        """Reserve shared ingredients once; accept mixed stacks from recipe groups."""
+        trial = inventory.copy()
+        takes, missing = [], []
+        for ingredient in self.ingredients:
+            need = int(ingredient["stack"]) * self.batches(amount)
+            options = [ingredient, *(ingredient.get("alternatives", []) or [])]
+            seen = set()
+            for option in options:
+                iid = int(option.get("id", -1))
+                if iid in seen:
+                    continue
+                seen.add(iid)
+                name = option.get("full_name") or option.get("name", "")
+                take = min(need, trial.count(name))
+                if take:
+                    trial.take(name, take)
+                    takes.append((name, take))
+                    need -= take
+                if not need:
+                    break
+            if need:
+                name = ingredient.get("full_name") or ingredient.get("name", "")
+                missing.append((name, need))
+        return takes, missing
 
     def is_modded(self) -> bool:
         return self.mod not in ("", "Terraria")
 
     def say(self) -> str:
-        mats = "、".join(f"{cn_name(n)}x{s}" for n, s in self.materials)
-        head = f"{cn_name(self.name)} = {mats}"
+        materials = []
+        for ingredient in self.ingredients:
+            names = [ingredient.get("name", ""),
+                     *(a.get("name", "") for a in ingredient.get("alternatives", []) or [])]
+            label = "/".join(dict.fromkeys(cn_name(n) for n in names if n))
+            materials.append(f"{label}x{ingredient['stack']}")
+        text = f"{cn_name(self.name)}x{self.amount} = " + "、".join(materials)
         if self.stations:
-            head += "（要" + "、".join(station_cn(s) for s in self.stations) + "）"
-        return head
+            text += "（要" + "、".join(station_cn(s) for s in self.stations) + "）"
+        if self.conditions:
+            text += "；条件：" + "、".join(c.get("name", "") for c in self.conditions)
+        return text
 
     def snapshot(self) -> Dict[str, Any]:
-        return {"name": self.name, "cn": cn_name(self.name),
-                "mod": self.mod, "amount": self.amount,
-                "materials": [{"name": n, "stack": s} for n, s in self.materials],
-                "stations": self.stations, "available": self.available}
+        return dict(copy.deepcopy(self.data), cn=cn_name(self.name),
+                    available=self.available, environment_ready=self.environment_ready)
 
 
 def cn_name(en: str) -> str:
-    """英文名转中文，转不了就原样返回（mod 物品多半没中文名）。"""
     return EN_CN.get(en, en)
 
 
@@ -97,153 +142,146 @@ def station_cn(en: str) -> str:
 
 
 def _norm(s: str) -> str:
-    return (s or "").strip().lower().replace(" ", "").replace("_", "")
+    return "".join(str(s or "").casefold().replace("_", "").split())
 
 
 class RecipeBook:
-    """配方索引：按产物查配方、按材料反查用途。"""
-
     def __init__(self, agent, base_dir: str = "") -> None:
         self.agent = agent
-        self._by_name: Dict[str, List[Recipe]] = {}   # 规范化名 -> 配方们
-        self._by_material: Dict[str, List[Recipe]] = {}
-        self._loaded_at: float = 0.0
-        self._loading = False
-        # 与 mod_items 缓存同级：<插件目录>/data/recipes/
-        base = (Path(base_dir) if base_dir
-                else Path(__file__).resolve().parent.parent)
+        self._by_name = {}
+        self._by_id = {}
+        self._by_material = {}
+        self._recipes = []
+        self._loaded_at = 0.0
+        self._lock = asyncio.Lock()
+        self.live = False
+        base = Path(base_dir) if base_dir else Path(__file__).resolve().parent.parent
         self.cache_file = base / "data" / "recipes" / "recipes.json"
 
-    # ---------- 索引 ----------
+    def invalidate(self) -> None:
+        self.live = False
+        self._loaded_at = 0.0
+        for recipe in self._recipes:
+            recipe.available = recipe.environment_ready = False
+
     def _index(self, recipes: List[Recipe]) -> None:
-        self._by_name.clear()
-        self._by_material.clear()
-        for r in recipes:
-            if not r.name:
-                continue
-            self._by_name.setdefault(_norm(r.name), []).append(r)
-            # 中文名也建索引，主人说中文时能命中
-            cn = cn_name(r.name)
-            if cn != r.name:
-                self._by_name.setdefault(_norm(cn), []).append(r)
-            for mname, _s in r.materials:
-                self._by_material.setdefault(_norm(mname), []).append(r)
+        self._recipes = recipes
+        self._by_name, self._by_id, self._by_material = {}, {}, {}
+        for recipe in recipes:
+            self._by_id.setdefault(recipe.item_id, []).append(recipe)
+            for name in {recipe.name, recipe.full_name, cn_name(recipe.name)} - {""}:
+                self._by_name.setdefault(_norm(name), []).append(recipe)
+            for ing in recipe.ingredients:
+                for option in [ing, *(ing.get("alternatives", []) or [])]:
+                    for name in {option.get("name", ""), option.get("full_name", ""),
+                                 str(option.get("id", ""))} - {""}:
+                        hits = self._by_material.setdefault(_norm(name), [])
+                        if recipe not in hits:
+                            hits.append(recipe)
 
     def count(self) -> int:
-        return sum(len(v) for v in self._by_name.values())
+        return len(self._recipes)
 
     def loaded(self) -> bool:
-        return bool(self._by_name)
+        return self.live
 
-    # ---------- 加载 ----------
     async def refresh(self, force: bool = False) -> int:
-        """向 mod 要全量配方；失败则退回磁盘缓存。返回配方条数。"""
-        if self._loading:
-            return self.count()
-        if not force and self.loaded() and (
-                time.time() - self._loaded_at) < CACHE_TTL:
-            return self.count()
-
-        self._loading = True
-        try:
-            raw: List[Dict[str, Any]] = []
+        async with self._lock:
+            if not force and self.live and time.monotonic() - self._loaded_at < CACHE_TTL:
+                return self.count()
             try:
+                registry = getattr(self.agent, "registry", None)
+                if registry is not None and not registry.live:
+                    registry.sync_from_enum(await self.agent.mod.enum_items())
+                    if not registry.live:
+                        raise ValueError("Item registry synchronization failed")
                 raw = await self.agent.mod.get_recipes("all")
-            except Exception:
-                raw = []
-
-            if raw:
+                if raw is None:
+                    raise ValueError("Recipe synchronization failed")
                 recipes = [Recipe(d) for d in raw]
-                # 只留有材料的，没材料的推演不了
-                recipes = [r for r in recipes if r.materials]
-                self._index(recipes)
-                self._loaded_at = time.time()
-                self._save(raw)
-                modded = sum(1 for r in recipes if r.is_modded())
-                self._log(f"配方书就绪：{len(recipes)} 条（其中 mod 配方 {modded} 条）")
-                return len(recipes)
-
-            # mod 没给：用磁盘缓存兜底
-            cached = self._load()
-            if cached:
-                recipes = [Recipe(d) for d in cached]
-                recipes = [r for r in recipes if r.materials]
-                self._index(recipes)
-                self._loaded_at = time.time()
-                self._log(f"配方书用了本地缓存：{len(recipes)} 条")
-                return len(recipes)
-            return 0
-        finally:
-            self._loading = False
+            except Exception:
+                self.invalidate()
+                # Disk data is descriptive only: mod IDs and recipe indexes change between sessions.
+                return 0
+            self._index(recipes)
+            self.live = True
+            self._loaded_at = time.monotonic()
+            self._save(raw)
+            return self.count()
 
     def _save(self, raw: List[Dict[str, Any]]) -> None:
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_file.write_text(
-                json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
+            self.cache_file.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
             pass
 
-    def _load(self) -> List[Dict[str, Any]]:
+    async def refresh_availability(self) -> bool:
+        """Refresh dynamic flags without transferring the full recipe book on every action."""
+        if not self.live:
+            await self.refresh()
+        if not self.live:
+            return False
         try:
-            if self.cache_file.exists():
-                return json.loads(self.cache_file.read_text(encoding="utf-8"))
+            status = await self.agent.mod.get_recipe_status()
+            if status is None:
+                raise ValueError("Recipe status unavailable")
+            available = set(status["available"])
+            environment = set(status["environment_ready"])
+            for recipe in self._recipes:
+                recipe.available = recipe.recipe_index in available
+                recipe.environment_ready = recipe.recipe_index in environment
+            return True
         except Exception:
-            pass
-        return []
+            for recipe in self._recipes:
+                recipe.available = recipe.environment_ready = False
+            return False
 
-    def _log(self, msg: str) -> None:
-        try:
-            self.agent.log(msg, "item")
-        except Exception:
-            pass
+    def _lookup(self, item) -> List[Recipe]:
+        if not self.live:
+            return []
+        from .item_npc_dict import item_id
+        iid = item_id(item, getattr(self.agent, "registry", None))
+        if iid > 0:
+            return self._by_id.get(iid, [])
+        if iid == -2:
+            return []
+        hits = self._by_name.get(_norm(item), [])
+        if not hits:
+            hits = self._by_name.get(_norm(CN_EN.get(str(item), "")), [])
+        return hits if len({r.item_id for r in hits}) == 1 else []
 
-    # ---------- 查询 ----------
-    def find(self, item: str) -> Optional[Recipe]:
-        """按名字找配方，优先能立刻做的那条。中英文都能查。"""
-        cands = self._lookup(item)
-        if not cands:
+    def find(self, item, inventory=None, amount: int = 1, recipe_index=None) -> Optional[Recipe]:
+        candidates = self._lookup(item)
+        if recipe_index is not None:
+            return next((r for r in candidates if r.recipe_index == recipe_index), None)
+        if not candidates:
             return None
-        for r in cands:
-            if r.available:
-                return r
-        return cands[0]
+        def rank(recipe):
+            missing = recipe.requirements(amount, inventory)[1] if inventory is not None else []
+            return (not recipe.environment_ready, bool(missing), sum(n for _, n in missing),
+                    not recipe.available)
+        return min(candidates, key=rank)
 
     def find_all(self, item: str) -> List[Recipe]:
         return list(self._lookup(item))
 
-    def _lookup(self, item: str) -> List[Recipe]:
-        key = _norm(item)
-        if key in self._by_name:
-            return self._by_name[key]
-        # 中文 -> 英文再试
-        en = CN_EN.get((item or "").strip())
-        if en and _norm(en) in self._by_name:
-            return self._by_name[_norm(en)]
-        # 模糊：包含匹配（mod 物品名常带前缀）
-        hits: List[Recipe] = []
-        for k, v in self._by_name.items():
-            if key and (key in k or k in key):
-                hits.extend(v)
-        return hits
-
     def materials_of(self, item: str) -> List[Tuple[str, int]]:
-        r = self.find(item)
-        return list(r.materials) if r else []
+        recipe = self.find(item)
+        return list(recipe.materials) if recipe else []
 
     def stations_of(self, item: str) -> List[str]:
-        r = self.find(item)
-        return list(r.stations) if r else []
+        recipe = self.find(item)
+        return list(recipe.stations) if recipe else []
 
     def used_in(self, material: str) -> List[Recipe]:
-        """这个材料能做出什么，供"这东西有什么用"回答。"""
-        key = _norm(material)
-        if key in self._by_material:
-            return self._by_material[key]
-        en = CN_EN.get((material or "").strip())
-        if en:
-            return self._by_material.get(_norm(en), [])
-        return []
+        from .item_npc_dict import item_id
+        if not self.live:
+            return []
+        iid = item_id(material, getattr(self.agent, "registry", None))
+        if iid == -2:
+            return []
+        return list(self._by_material.get(str(iid) if iid > 0 else _norm(material), []))
 
     def is_craftable(self, item: str) -> bool:
         return self.find(item) is not None

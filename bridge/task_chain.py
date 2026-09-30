@@ -30,6 +30,7 @@ class Goal:
     actual: int = 0        # 实际完成量（背包实测/真实计数），供完成播报用实数
     outcome: str = "pending"  # completed / started / partial / unconfirmed / failed
     evidence: str = ""       # 最终汇报只能使用已确认的事实
+    recipe_index: Optional[int] = None
 
 
 def _goal_done(goal: "Goal") -> bool:
@@ -324,7 +325,8 @@ class TaskChain:
             return False
         if goal.craft_first or goal.goal_type == "craft":
             before = await self.mod.get_inventory()
-            crafted = await self.mod.craft(item_id=iid, amount=goal.amount)
+            crafted = await self.mod.craft(item_id=iid, amount=goal.amount,
+                                           recipe_index=goal.recipe_index)
             await self.mod.collect_items(radius=160, item_id=iid)
             after = await self.mod.get_inventory()
             self.agent._inv_full = after
@@ -420,7 +422,7 @@ class TaskChain:
             if ores:
                 # 尽量匹配目标物对应的矿（tile 类型），匹配不到就取最近的矿
                 from .item_npc_dict import tile_type_of
-                want = tile_type_of(t)
+                want = tile_type_of(t, registry=getattr(self.agent, "registry", None))
                 pick = None
                 for o in ores:
                     if want and int(o.get("type", 0) or 0) == want:

@@ -26,49 +26,52 @@ class VirtualInventory:
     rope: int = 0
     dirt: int = 0
 
+    registry: Any = None
+
+    def __post_init__(self) -> None:
+        original = self.counts
+        self.counts = {}
+        for name, count in original.items():
+            key = name if str(name).startswith("id:") else self.key(name)
+            self.counts[key] = self.counts.get(key, 0) + count
+
     def copy(self) -> "VirtualInventory":
         return VirtualInventory(dict(self.counts), self.has_pickaxe,
-                                self.has_axe, self.has_rod,
-                                self.has_hook, self.rope, self.dirt)
+                                self.has_axe, self.has_rod, self.has_hook,
+                                self.rope, self.dirt, self.registry)
+
+    def key(self, item) -> str:
+        from .item_npc_dict import item_id
+        from .recipe_book import CN_EN, _norm
+        if str(item).isdecimal() and int(item) > 0:
+            return f"id:{int(item)}"
+        iid = item_id(item, self.registry)
+        return f"id:{iid}" if iid > 0 else _norm(CN_EN.get(str(item), str(item)))
 
     def count(self, item: str) -> int:
-        return int(self.counts.get(item, 0))
+        return int(self.counts.get(self.key(item), 0))
 
     def add(self, item: str, n: int) -> None:
         if not item or n <= 0:
             return
-        self.counts[item] = self.count(item) + n
-        # 拿到镐子/斧头/钓竿/钩爪，能力也跟着变，后续步骤要看得到
-        if "镐" in item:
+        key = self.key(item)
+        self.counts[key] = self.counts.get(key, 0) + n
+        info = self.registry.describe(item) if self.registry is not None else {}
+        tags = info.get("tags", [])
+        name = str(item).casefold()
+        if "pickaxe" in tags or "镐" in name or "pickaxe" in name:
             self.has_pickaxe = True
-        if "斧" in item:
+        if "axe" in tags or "斧" in name or ("axe" in name and "pickaxe" not in name):
             self.has_axe = True
-        if "钓竿" in item or "鱼竿" in item:
+        if "fishing" in tags or "钓竿" in name or "fishingpole" in name.replace(" ", ""):
             self.has_rod = True
-        if "钩" in item:
+        if "hook" in tags or "钩" in name or "hook" in name:
             self.has_hook = True
-        if "绳" in item or "梯" in item:
-            self.rope += n
-        if item in ("土块", "泥土"):
-            self.dirt += n
 
     def take(self, item: str, n: int) -> bool:
-        """扣减；不够则返回 False 且不改动。"""
-        if self.count(item) < n:
+        if n < 0 or self.count(item) < n:
             return False
-        self.counts[item] = self.count(item) - n
-        if item in ("土块", "泥土"):
-            self.dirt = max(0, self.dirt - n)
-        # 工具用完归零 → 能力收回（推演内闭环）
-        if self.count(item) <= 0:
-            if "镐" in item:
-                self.has_pickaxe = False
-            if "斧" in item:
-                self.has_axe = False
-            if "钓竿" in item or "鱼竿" in item:
-                self.has_rod = False
-            if "钩" in item:
-                self.has_hook = False
+        self.counts[self.key(item)] = self.count(item) - n
         return True
 
 
@@ -104,20 +107,6 @@ class SimResult:
         return [s for s in self.steps if not s.ok]
 
 
-# 简易配方表：合成物 -> (材料, 每份数量)
-# mod 能给出真实配方时以 mod 为准，这里只作兜底常识。
-FALLBACK_RECIPE: Dict[str, List[Tuple[str, int]]] = {
-    "铁镐": [("铁锭", 12), ("木材", 3)],
-    "铁锭": [("铁矿", 3)],
-    "铜镐": [("铜锭", 10), ("木材", 3)],
-    "铜锭": [("铜矿", 3)],
-    "金镐": [("金锭", 12), ("木材", 3)],
-    "金锭": [("金矿", 4)],
-    "银锭": [("银矿", 4)],
-    "火把": [("木材", 1)],
-    "木台": [("木材", 10)],
-}
-
 # 挖矿类动作默认产出自身
 MINE_ACTIONS = ("mine", "gather")
 
@@ -127,16 +116,14 @@ class WorldModel:
 
     def __init__(self, agent, book=None) -> None:
         self.agent = agent
-        self._recipes: Dict[str, List[Tuple[str, int]]] = {}
-        # 配方书：mod 真实配方的来源。没有它就只能靠常识表，
-        # mod 物品会全军覆没。
+        # 只使用当前游戏的真实配方，不用常识表猜模组配方。
         self.book = book if book is not None else getattr(
             agent, "recipe_book", None)
 
     # ---------- 快照 ----------
     async def snapshot(self) -> VirtualInventory:
         """把当前真实背包与能力拍成虚拟背包。"""
-        vi = VirtualInventory()
+        vi = VirtualInventory(registry=getattr(self.agent, "registry", None))
         cap = self.agent.capability
         try:
             await cap.refresh()
@@ -150,61 +137,49 @@ class WorldModel:
             pass
 
         try:
-            inv = self.agent.get_inventory_sync() or {}
-            for kind in ("inventory", "hotbar", "equipped"):
+            inv = await self.agent.mod.get_inventory()
+            self.agent._inv_full = inv
+            seen = set()
+            for kind in ("inventory", "hotbar"):
                 for it in inv.get(kind, []):
                     name = it.get("name") or ""
+                    slot = it.get("inv_slot")
+                    if slot is not None and slot in seen:
+                        continue
+                    if slot is not None:
+                        seen.add(slot)
                     if name:
-                        vi.counts[name] = vi.counts.get(name, 0) + int(
-                            it.get("stack", 0) or 0)
+                        identity = str(it["id"]) if int(it.get("id", 0)) > 0 else name
+                        vi.add(identity, int(it.get("stack", 0) or 0))
         except Exception:
             pass
         return vi
 
     # ---------- 配方 ----------
     async def recipe_of(self, item: str) -> List[Tuple[str, int]]:
-        """查配方：先问配方书（含 mod 真实配方），再退到常识表。"""
-        if item in self._recipes:
-            return self._recipes[item]
-        mats: List[Tuple[str, int]] = []
-        if self.book is not None:
-            try:
-                await self.book.refresh()
-                mats = self.book.materials_of(item)
-            except Exception:
-                mats = []
-        if not mats:
-            mats = list(FALLBACK_RECIPE.get(item, []))
-        self._recipes[item] = mats
-        return mats
+        recipe = await self.recipe_for(item)
+        return list(recipe.materials) if recipe else []
+
+    async def recipe_for(self, item, inventory=None, amount=1, recipe_index=None):
+        if self.book is None:
+            return None
+        await self.book.refresh()
+        return self.book.find(item, inventory, amount, recipe_index)
 
     async def stations_of(self, item: str) -> List[str]:
-        """这件东西要在哪个合成站做。"""
-        if self.book is None:
-            return []
-        try:
-            await self.book.refresh()
-            return self.book.stations_of(item)
-        except Exception:
-            return []
+        recipe = await self.recipe_for(item)
+        return list(recipe.stations) if recipe else []
 
-    async def station_ready(self, item: str) -> Tuple[bool, str]:
-        """合成站够不够得着。mod 配方常要专属站台，缺了就白规划。"""
-        stations = await self.stations_of(item)
-        if not stations:
+    async def station_ready(self, item: str, recipe=None) -> Tuple[bool, str]:
+        recipe = recipe or await self.recipe_for(item)
+        if recipe is None:
+            return False, "未同步到真实配方"
+        if recipe.environment_ready:
             return True, ""
-        try:
-            near = set(self.agent.capability.nearby_stations())
-        except Exception:
-            near = set()
-        if not near:
-            # mod 没上报站台信息就不拦，留给实际合成时反馈
-            return True, ""
-        missing = [s for s in stations if s not in near]
-        if missing:
-            from .recipe_book import station_cn
-            return False, "、".join(station_cn(s) for s in missing)
-        return True, ""
+        from .recipe_book import station_cn
+        reasons = [station_cn(s) for s in recipe.stations]
+        reasons.extend(c.get("name", "") for c in recipe.conditions if not c.get("met"))
+        return False, "、".join(reasons) or "未确认合成环境条件"
 
     # ---------- 推演 ----------
     async def simulate(self, steps: List[Dict[str, Any]],
@@ -212,6 +187,8 @@ class WorldModel:
         """按顺序推演每一步，让后面的步骤看得到前面的产出。"""
         vi = (start or await self.snapshot()).copy()
         res = SimResult(steps=[], final=vi)
+        if self.book is not None and any(s.get("action") == "craft" for s in steps):
+            await self.book.refresh_availability()
 
         for i, s in enumerate(steps):
             action = str(s.get("action", "")).lower()
@@ -233,42 +210,28 @@ class WorldModel:
                     st.produces = item
 
             elif action == "craft":
-                mats = await self.recipe_of(item)
-                if not mats:
-                    # 配方书里查不到：可能是 mod 物品但配方没同步
+                recipe = await self.recipe_for(item, vi, amt, s.get("recipe_index"))
+                if recipe is None:
                     st.ok = False
-                    st.gap = f"我不知道{item}怎么做"
-                    st.need_item = item
-                    st.need_amount = amt
-                    res.steps.append(st)
-                    continue
-
-                ok_station, lack_station = await self.station_ready(item)
-                missing = []
-                for mname, mstack in mats:
-                    need = mstack * amt
-                    if vi.count(mname) < need:
-                        missing.append((mname, need - vi.count(mname)))
-                if missing:
-                    st.ok = False
-                    mn, mneed = missing[0]
-                    st.gap = "、".join(f"缺 {n} 个{m}" for m, n in missing)
-                    st.need_item = mn
-                    st.need_amount = mneed
-                elif not ok_station:
-                    st.ok = False
-                    st.gap = f"没有{lack_station}，做不了"
-                    st.need_item = lack_station
-                    st.need_amount = 1
+                    st.gap = f"没有同步到{item}的唯一真实配方"
+                    st.need_item, st.need_amount = item, amt
                 else:
-                    for mname, mstack in mats:
-                        vi.take(mname, mstack * amt)
-                    vi.add(item, amt)
-                    st.produces = item
-                    if self.book is not None:
-                        r = self.book.find(item)
-                        if r is not None and r.is_modded():
-                            st.note = f"{r.mod} 的配方：{r.say()}"
+                    s["recipe_index"] = recipe.recipe_index
+                    takes, missing = recipe.requirements(amt, vi)
+                    ok_station, lack_station = await self.station_ready(item, recipe)
+                    if missing:
+                        st.ok = False
+                        st.gap = "、".join(f"缺 {n} 个{m}" for m, n in missing)
+                        st.need_item, st.need_amount = missing[0]
+                    elif not ok_station:
+                        st.ok = False
+                        st.gap = f"合成条件未满足：{lack_station}"
+                    else:
+                        for name, count in takes:
+                            vi.take(name, count)
+                        vi.add(item, recipe.amount * recipe.batches(amt))
+                        st.produces = item
+                        st.note = recipe.say()
 
             elif action == "fetch":
                 # 取箱子里的东西：能不能取到得问真实世界
@@ -296,6 +259,7 @@ class WorldModel:
                     st.need_amount = 1
                 else:
                     st.produces = item or "木材"
+                    vi.add(st.produces, amt)
                     st.note = "用斧头砍"
 
             elif action == "fish":

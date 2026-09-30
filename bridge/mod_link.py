@@ -41,8 +41,10 @@ class ModLink:
         return bool(resp and resp.get("ok"))
 
     async def craft(self, item_name: str = "", item_id: int = -1,
-                    amount: int = 1) -> int:
+                    amount: int = 1, recipe_index: Optional[int] = None) -> int:
         cmd = {"cmd": "craft", "amount": amount}
+        if recipe_index is not None:
+            cmd["recipe_index"] = recipe_index
         if item_name:
             cmd["item_name"] = item_name
         if item_id > 0:
@@ -311,12 +313,14 @@ class ModLink:
             {"cmd": "dig_tile", "x": x, "y": y}, timeout=timeout)
         return bool(resp and resp.get("ok"))
 
-    async def find_ore(self, radius: int = 30, tile_type: int = 0) -> List[Dict[str, Any]]:
-        """扫描附近矿石（扫描矿点）：返回按距离排序的矿坐标列表。
-        tile_type>0 时只返回该类型（铁矿石 tile 类型 = 铁矿物品 id）。"""
-        resp = await self.conn.request_mod(
-            {"cmd": "find_ore", "radius": radius, "tile_type": tile_type},
-            timeout=5.0)
+    async def find_ore(self, radius: int = 30, tile_type: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Scan ore, or an exact TileID; unknown (-1) must not broaden the search."""
+        if tile_type is not None and tile_type < 0:
+            return []
+        cmd = {"cmd": "find_ore", "radius": radius}
+        if tile_type is not None:
+            cmd["tile_type"] = tile_type
+        resp = await self.conn.request_mod(cmd, timeout=5.0)
         return resp.get("ores", []) if resp else []
 
     async def scan_ledges(self, x0: int, y0: int, x1: int, y1: int) -> List[Dict[str, Any]]:
@@ -325,10 +329,19 @@ class ModLink:
                                             "x1": x1, "y1": y1}, timeout=5.0)
         return resp.get("points", []) if resp else []
 
-    async def get_recipes(self, category: str = "all") -> List[Dict[str, Any]]:
+    async def get_recipes(self, category: str = "all") -> Optional[List[Dict[str, Any]]]:
         resp = await self.conn.request_mod({"cmd": "get_recipes", "cat": category},
                                            timeout=5.0)
-        return resp.get("recipes", []) if resp else []
+        return resp.get("recipes") if resp and resp.get("ok") is not False else None
+
+    async def get_recipe_status(self) -> Optional[Dict[str, Any]]:
+        """Return live recipe/environment indexes; None means the session is stale."""
+        resp = await self.conn.request_mod({"cmd": "get_recipes", "cat": "status"},
+                                           timeout=5.0)
+        if not resp or resp.get("ok") is False or "available" not in resp or "environment_ready" not in resp:
+            return None
+        return {"available": resp.get("available", []),
+                "environment_ready": resp.get("environment_ready", [])}
 
     async def get_state(self, player_name: str = "") -> Dict[str, Any]:
         resp = await self.conn.request_mod(

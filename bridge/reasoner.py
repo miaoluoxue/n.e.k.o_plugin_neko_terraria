@@ -62,9 +62,9 @@ class Reasoner:
         if item in ("镐", "斧", "钓竿", "钩爪"):
             return await self._fix_capability(item, vi, depth)
 
-        # 1) 身上其实就有
-        if vi.count(item) >= amount:
-            return Fix(how="have", desc=f"身上已经有{item}了", cost=COST_HAVE)
+        # amount is the additional shortage, not the target inventory total.
+        if amount <= 0:
+            return Fix(how="have", desc=f"无需再补{item}", cost=COST_HAVE)
 
         # 2) 箱子里取
         try:
@@ -79,48 +79,51 @@ class Reasoner:
                                "amount": amount}])
 
         # 3) 合成（材料不够就继续往下推；mod 配方也走这条）
-        mats = await self.world.recipe_of(item)
-        if mats:
-            # 站台够不着就别白规划，直接说清楚缺哪个台子
-            ok_station, lack = await self.world.station_ready(item)
+        recipe = await self.world.recipe_for(item, vi, amount)
+        if recipe is not None:
+            ok_station, lack = await self.world.station_ready(item, recipe)
             if not ok_station:
-                return Fix(how="ask", desc=f"做{item}要{lack}，我这儿没有",
-                           cost=COST_ASK)
+                return Fix(how="ask", desc=f"做{item}需要满足：{lack}", cost=COST_ASK)
+            trial = vi.copy()
+            takes, missing = recipe.requirements(amount, trial)
+            for name, count in takes:
+                trial.take(name, count)
             pre: List[Dict[str, Any]] = []
             feasible = True
             reasons = []
-            for mname, mstack in mats:
-                need = mstack * amount
-                lack = need - vi.count(mname)
-                if lack > 0:
-                    sub = await self.fix_for(mname, lack, vi, depth + 1)
-                    if sub is None:
-                        feasible = False
-                        reasons.append(f"缺{mname}又搞不到")
-                        break
-                    pre.extend(sub.steps)
-                    reasons.append(sub.desc)
+            for name, count in missing:
+                sub = await self.fix_for(name, count, trial, depth + 1)
+                if sub is None or sub.cost >= COST_ASK or not sub.steps:
+                    feasible = False
+                    break
+                simulated = await self.world.simulate(sub.steps, trial)
+                if not simulated.ok or simulated.final.count(name) < count:
+                    feasible = False
+                    break
+                trial = simulated.final
+                trial.take(name, count)
+                pre.extend(sub.steps)
+                reasons.append(sub.desc)
             if feasible:
-                pre.append({"action": "craft", "item": item, "amount": amount})
-                head = f"合成{item}"
-                if reasons:
-                    head += "（" + "、".join(r for r in reasons if r) + "）"
-                return Fix(how="craft", desc=head, cost=COST_CRAFT, steps=pre)
+                pre.append({"action": "craft", "item": item, "amount": amount,
+                            "recipe_index": recipe.recipe_index})
+                desc = f"合成{item}" + ("（" + "、".join(reasons) + "）" if reasons else "")
+                return Fix(how="craft", desc=desc, cost=COST_CRAFT, steps=pre)
 
         # 4) 自己挖（矿物类，mod 的英文名矿石也要认得）
         if self._is_mineable(item):
-            if vi.has_pickaxe or self._is_wood(item):
+            if (vi.has_axe if self._is_wood(item) else vi.has_pickaxe):
                 return Fix(how="mine", desc=f"自己去挖{amount}个{item}",
                            cost=COST_MINE,
-                           steps=[{"action": "mine", "item": item,
+                           steps=[{"action": "chop" if self._is_wood(item) else "mine", "item": item,
                                    "amount": amount}])
 
         # 5) 实在没辙，求助主人
         return Fix(how="ask", desc=f"我搞不到{item}，主人能给我吗", cost=COST_ASK)
 
     def _is_wood(self, item: str) -> bool:
-        low = (item or "").lower()
-        return item == "木材" or "wood" in low
+        from .item_npc_dict import item_id
+        return item_id(item, getattr(self.agent, "registry", None)) == 9
 
     def _is_mineable(self, item: str) -> bool:
         """这东西能不能自己挖出来。
@@ -128,28 +131,14 @@ class Reasoner:
         mod 矿石叫 "Aerialite Ore" 这种英文名，只判断中文"矿"结尾会漏掉，
         导致猫娘明明能挖却说搞不到。
         """
-        if not item:
+        from .item_npc_dict import item_id, ORE_ITEM_TO_TILE
+        registry = getattr(self.agent, "registry", None)
+        iid = item_id(item, registry)
+        if iid <= 0:
             return False
-        low = item.lower()
-        if item.endswith("矿") or item in ("木材", "石块", "土块"):
+        if iid in ORE_ITEM_TO_TILE or iid in (2, 3, 9):
             return True
-        # 英文常见矿物/可采集词缀（mod 物品普遍沿用这套命名）
-        for kw in ("ore", "wood", "stone", "block", "gem", "bar ore",
-                   "crystal", "shard", "dirt", "sand", "ingot ore"):
-            if low.endswith(kw) or low.endswith(kw + "s"):
-                return True
-        # 注册表说它是材料/可放置的，多半也能采
-        reg = getattr(self.agent, "registry", None)
-        if reg is not None:
-            try:
-                info = reg.describe(item)
-                if info.get("use") in ("material", "placeable"):
-                    return True
-                if "ore" in info.get("tags", []):
-                    return True
-            except Exception:
-                pass
-        return False
+        return registry is not None and "ore" in registry.describe(str(iid)).get("tags", [])
 
     def _candidates(self, kind: str) -> List[str]:
         """能力物品的候选名单：原版常见 + mod 里同类物品。
@@ -167,9 +156,11 @@ class Reasoner:
         reg = getattr(self.agent, "registry", None)
         if reg is None:
             return base
-        want = "tool" if kind in ("镐", "斧") else "accessory"
+        want = "tool" if kind in ("镐", "斧", "钓竿") else "accessory"
         try:
             names: List[str] = []
+            if not reg.live:
+                return base
             for mod, items in getattr(reg, "mods", {}).items():
                 uses = reg.uses.get(mod, {})
                 tags = reg.tags.get(mod, {})

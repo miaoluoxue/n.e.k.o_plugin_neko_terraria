@@ -32,8 +32,12 @@ FOREVER_WORDS = ("一直", "持续", "不停", "一路", "继续")
 ORE_ALIAS = {
     "铁": "铁矿", "铜": "铜矿", "银": "银矿", "金": "金矿",
     "锡": "锡矿", "铅": "铅矿", "钨": "钨矿", "铂金": "铂金矿",
-    "陨石": "陨石矿", "恶魔石": "恶魔石", "石头": "石块", "木": "木材",
+    "陨石": "陨石", "恶魔石": "恶魔石", "石头": "石块", "木": "木材",
     "树": "木材", "木材": "木材",
+    "钯金": "钯金矿", "精金": "精金矿", "钛金": "钛金矿",
+    "秘银": "秘银矿", "山铜": "山铜矿", "叶绿": "叶绿矿",
+    "魔矿": "魔矿", "猩红矿": "猩红矿", "钴": "钴矿",
+    "黑曜石": "黑曜石", "狱石": "狱石", "木头": "木材",
 }
 
 # 常用量词（"个/块/条/根/只"等）
@@ -80,17 +84,20 @@ def _parse_amount(text: str) -> int:
 
 
 def _parse_ore(text: str) -> str:
-    """认出要挖什么。"""
-    for alias, full in ORE_ALIAS.items():
-        if alias in text:
-            return full
-    m = re.search(r"(?:挖|采|开采|砍)\s*(?:点|些)?\s*([\u4e00-\u9fa5]{1,4}?)(?:矿)?",
-                  text)
-    if m:
-        w = m.group(1).strip()
-        if w and w not in ("点", "些", "一", "个"):
-            return ORE_ALIAS.get(w, w if w.endswith("矿") else w + "矿")
-    return ""
+    """保留完整物品名；不能把铂金、钯金或模组矿名中的单字当成金矿。"""
+    match = re.search(
+        r"(?:开采|挖|采|砍|找一找|找找|找|寻)\s*(?:一下|一点|一些|点|些)?"
+        r"\s*(?:(?:\d+|[一二两三四五六七八九十百]+)(?:个|块|颗|组|根)?)?"
+        r"\s*(.+)", text)
+    if not match:
+        return ""
+    target = re.split(r"[，。！？,!?]|(?:然后|之后|并且|给我|给主人)", match.group(1))[0]
+    target = target.strip().rstrip("吧呀喵~～")
+    aliases = dict(ORE_ALIAS)
+    aliases.update({full: full for full in ORE_ALIAS.values()})
+    if target.endswith("矿石") and target[:-1] in aliases:
+        target = target[:-1]
+    return aliases.get(target, target)
 
 
 def parse(text: str) -> Intent:

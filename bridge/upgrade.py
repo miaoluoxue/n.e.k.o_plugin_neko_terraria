@@ -103,7 +103,16 @@ class UpgradeEngine:
                 iid = int(best.get("item_id", -1) or -1)
                 if iid < 0:
                     continue
-            ok = await self.agent.mod.craft(item_id=iid, amount=1)
+            # 传递已选中的 recipe_index：同一物品可能有多个配方（不同
+            # 材料/合成站），只按 item_id 让 Mod 自己挑会重新选到不可用
+            # 或材料更贵的配方，导致升级规划与实际合成不一致。
+            recipe_index = best.get("recipe_index")
+            try:
+                recipe_index = int(recipe_index) if recipe_index is not None else None
+            except (TypeError, ValueError):
+                recipe_index = None
+            ok = await self.agent.mod.craft(item_id=iid, amount=1,
+                                            recipe_index=recipe_index)
             if ok > 0:
                 made += 1
                 if cat == "armor":

@@ -102,8 +102,10 @@ class TaskBrain:
                 f"推演第{round_i+1}遍：卡在第{gap.index}步「{gap.desc}」——{gap.gap}")
 
             # 想办法补救
+            # 补缺口必须使用卡住那一步之前的库存，前面的步骤可能已经消耗材料。
+            prefix = await self.world.simulate(work[:gap.index - 1], base)
             fix = await self.reasoner.fix_for(
-                gap.need_item or "", gap.need_amount or 1, base)
+                gap.need_item or "", gap.need_amount or 1, prefix.final)
             if fix is None or fix.cost >= COST_ASK or not fix.steps:
                 a.doable = False
                 a.blockers.append(f"第{gap.index}步{gap.gap}")
@@ -141,6 +143,9 @@ class TaskBrain:
         top = sorted(vi.counts.items(), key=lambda kv: -kv[1])[:3]
         for name, n in top:
             if n > 0:
+                if name.startswith("id:") and vi.registry is not None:
+                    info = vi.registry.describe(name[3:])
+                    name = info.get("display_name") or info.get("name") or name
                 bits.append(f"{name}x{n}")
         return "、".join(bits) if bits else "身上空空的"
 
@@ -204,6 +209,7 @@ class TaskBrain:
             elif action == "craft":
                 # 合成：goal_type 用 "craft" + craft_first，走 task_chain 合成流程（mod.craft）
                 p.goals.append(Goal(goal_type="craft", target=item, amount=amt,
+                                    recipe_index=s.get("recipe_index"),
                                     craft_first=True, reason=goal_text,
                                     report_fail=f"合成 {item} 失败了"))
                 p.outline.append(f"合成{item}x{amt}")

@@ -89,7 +89,7 @@ class MiningEngine:
         C# find_ore 拿 tile_type 与 Main.tile[].TileType 比较（铁矿 TileID=7 ≠ ItemID=11）。
         """
         from .item_npc_dict import tile_type_of
-        tile = tile_type_of(target_item, iid)
+        tile = tile_type_of(target_item, iid, getattr(self.agent, "registry", None))
         try:
             ores = await self.mod.find_ore(radius=30, tile_type=tile)
         except Exception:

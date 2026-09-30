@@ -1760,7 +1760,8 @@ namespace NekoTerrariaLink
                 SendCraft(s, reqId, 0);
                 return;
             }
-            long deadline = Environment.TickCount64 + 5000;
+            int requestedRecipe = cmd.Has("recipe_index") ? (int)cmd.GetNum("recipe_index") : -1;
+            long deadline = Environment.TickCount64 + 4500;
             Main.QueueMainThreadAction(() =>
             {
                 int crafted = 0;
@@ -1769,7 +1770,7 @@ namespace NekoTerrariaLink
                     if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline)
                     { SendCraft(s, reqId, 0); return; }
                     var player = Main.LocalPlayer;
-                    if (player == null) { Send(s, new Dict { ["req_id"] = reqId, ["crafted"] = 0 }); return; }
+                    if (player == null) { SendCraft(s, reqId, 0); return; }
                     // 必须是原生当前可用配方（站台、环境、Mod 条件均参与判断）。
                     Recipe.FindRecipes();
                     Recipe recipe = null;
@@ -1778,41 +1779,24 @@ namespace NekoTerrariaLink
                     {
                         int index = Main.availableRecipe[i];
                         var r = Main.recipe[index];
-                        if (r != null && r.createItem != null && r.createItem.type == id)
+                        if (r != null && !r.Disabled && r.createItem != null && r.createItem.type == id
+                            && (requestedRecipe < 0 || index == requestedRecipe))
                         { recipe = r; recipeIndex = index; break; }
                     }
                     if (recipe == null) { Send(s, new Dict { ["req_id"] = reqId, ["crafted"] = 0 }); return; }
                     // amount 和 crafted 都是物品数量。配方按整批制作，允许最后一批超出目标。
                     if (recipe.createItem.stack <= 0) { SendCraft(s, reqId, 0); return; }
-                    while (crafted < amount)
+                    int batches = 0;
+                    while (crafted < amount && batches++ < 100)
                     {
                         Recipe.FindRecipes();
                         if (!Main.availableRecipe.Take(Main.numAvailableRecipes).Contains(recipeIndex)) break;
-                        bool enough = true;
-                        foreach (var ing in recipe.requiredItem)
-                        {
-                            if (ing == null || ing.type <= 0) continue;
-                            if (player.CountItem(ing.type) < ing.stack) { enough = false; break; }
-                        }
-                        if (!enough) break;
-                        // 扣材料：手动遍历背包（不依赖 ConsumeItem 重载，签名在各 tML 版本不同）
-                        foreach (var ing in recipe.requiredItem)
-                        {
-                            if (ing == null || ing.type <= 0) continue;
-                            int remaining = ing.stack;
-                            for (int slot = 0; slot < player.inventory.Length && remaining > 0; slot++)
-                            {
-                                var it = player.inventory[slot];
-                                if (it == null || it.type != ing.type || it.stack <= 0) continue;
-                                int take = Math.Min(remaining, it.stack);
-                                it.stack -= take;
-                                remaining -= take;
-                                if (it.stack <= 0) it.SetDefaults(0);
-                            }
-                        }
-                        var created = new Item();
-                        created.SetDefaults(recipe.createItem.type);
-                        created.stack = recipe.createItem.stack;
+                        if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline) break;
+                        // Native consumption supports recipe groups, open storage and Mod callbacks.
+                        var created = recipe.createItem.Clone();
+                        created.Prefix(-1);
+                        recipe.Create();
+                        RecipeLoader.OnCraft(created, recipe, new Item());
                         int dropIndex = player.QuickSpawnItem(Src, created, created.stack);
                         if (dropIndex < 0 || dropIndex >= Main.maxItems || !Main.item[dropIndex].active) break;
                         crafted += created.stack;
@@ -1890,7 +1874,8 @@ namespace NekoTerrariaLink
                 if (it.type == 0) continue;
                 var entry = new Dict {
                     ["id"] = it.type, ["stack"] = it.stack, ["inv_slot"] = i,
-                    ["name"] = it.Name, ["defense"] = it.defense,
+                    ["name"] = it.Name, ["full_name"] = ItemIdentity(it),
+                    ["defense"] = it.defense,
                     ["armor_type"] = ArmorSlotFor(it),
                     // 工具/武器属性：use(melee/ranged/magic/tool…) + 伤害/镐力/斧力
                     ["use"] = ItemUse(it),
@@ -1900,7 +1885,7 @@ namespace NekoTerrariaLink
                     ["fishing_pole"] = it.fishingPole,
                 };
                 if (i >= 0 && i < 10) hotbar.Add(entry);
-                else if (i >= 10 && i < 50) inv.Add(entry);
+                else if (i >= 10) inv.Add(entry);
             }
             var equipped = new List<Dict>();
             for (int a = 0; a < player.armor.Length; a++)
@@ -1909,6 +1894,7 @@ namespace NekoTerrariaLink
                 if (it.type == 0) continue;
                 equipped.Add(new Dict {
                     ["id"] = it.type, ["stack"] = it.stack, ["armor_slot"] = a,
+                    ["full_name"] = ItemIdentity(it),
                     ["name"] = it.Name, ["defense"] = it.defense,
                 });
             }
@@ -2199,71 +2185,95 @@ namespace NekoTerrariaLink
             return names;
         }
 
+        private static string ItemIdentity(Item item)
+        {
+            return item.ModItem?.FullName ?? "Terraria/" + ItemID.Search.GetName(item.type);
+        }
+
+        private static bool RecipeEnvironmentReady(Recipe recipe)
+        {
+            var player = Main.LocalPlayer;
+            if (player == null || recipe.Disabled) return false;
+            foreach (int tile in recipe.requiredTile)
+                if (tile < 0 || tile >= player.adjTile.Length || !player.adjTile[tile]) return false;
+            foreach (var condition in recipe.Conditions)
+                if (!condition.IsMet()) return false;
+            return true;
+        }
+
         private void SendRecipes(NetworkStream s, long reqId, string cat)
         {
-            // Main.recipe/玩家背包只能主线程读——后台线程访问会卡死主线程
             Main.QueueMainThreadAction(() =>
             {
                 try
                 {
-                    bool onlyAvailable = cat == "available";
+                    Recipe.FindRecipes();
+                    // Guide mode displays suggestions, not craftable recipes.
+                    var available = new HashSet<int>(Main.availableRecipe.Take(Main.numAvailableRecipes));
+                    if (cat == "status")
+                    {
+                        var environment = new List<int>();
+                        for (int i = 0; i < Recipe.numRecipes; i++)
+                            if (Main.recipe[i] != null && RecipeEnvironmentReady(Main.recipe[i])) environment.Add(i);
+                        Send(s, new Dict { ["req_id"] = reqId, ["available"] = available.ToList(),
+                            ["environment_ready"] = environment });
+                        return;
+                    }
                     var list = new List<Dict>();
                     for (int i = 0; i < Recipe.numRecipes; i++)
                     {
                         Recipe r = Main.recipe[i];
-                        if (r == null || r.createItem == null || r.createItem.type <= 0) continue;
-                        if (onlyAvailable && !RecipeAvailable(r)) continue;
-
+                        if (r == null || r.Disabled || r.createItem == null || r.createItem.type <= 0) continue;
+                        if (cat == "available" && !available.Contains(i)) continue;
                         var mats = new List<Dict>();
-                        foreach (var ing in r.requiredItem)
+                        for (int ingredientIndex = 0; ingredientIndex < r.requiredItem.Count; ingredientIndex++)
                         {
+                            var ing = r.requiredItem[ingredientIndex];
                             if (ing == null || ing.type <= 0 || ing.stack <= 0) continue;
-                            mats.Add(new Dict { ["id"] = ing.type, ["name"] = ing.Name, ["stack"] = ing.stack });
+                            // acceptedGroups has one entry per required ingredient (-1 means no group).
+                            var alternatives = new List<Dict>();
+                            var seen = new HashSet<int> { ing.type };
+                            int groupId = ingredientIndex < r.acceptedGroups.Count
+                                ? r.acceptedGroups[ingredientIndex] : -1;
+                            if (groupId >= 0 && RecipeGroup.recipeGroups.TryGetValue(groupId, out var group)
+                                && group.ValidItems.Contains(ing.type))
+                            {
+                                foreach (int altId in group.ValidItems)
+                                {
+                                    if (!seen.Add(altId) || !ContentSamples.ItemsByType.TryGetValue(altId, out var alt)) continue;
+                                    alternatives.Add(new Dict { ["id"] = altId, ["name"] = alt.Name,
+                                        ["full_name"] = ItemIdentity(alt) });
+                                }
+                            }
+                            mats.Add(new Dict { ["id"] = ing.type, ["name"] = Lang.GetItemNameValue(ing.type),
+                                ["full_name"] = ItemIdentity(ing), ["stack"] = ing.stack,
+                                ["alternatives"] = alternatives });
                         }
-                        if (mats.Count == 0) continue;
-
                         var stations = new List<Dict>();
-                        foreach (var tile in r.requiredTile)
-                        {
-                            if (tile <= 0) continue;
-                            stations.Add(new Dict { ["tile"] = tile, ["name"] = TileName(tile) });
-                        }
-
-                        var createItem = r.createItem;
-                        string modName = createItem.ModItem == null ? "Terraria" : createItem.ModItem.Mod.Name;
-
+                        foreach (int tile in r.requiredTile)
+                            if (tile >= 0) stations.Add(new Dict { ["tile"] = tile, ["name"] = TileName(tile) });
+                        var conditions = new List<Dict>();
+                        foreach (var condition in r.Conditions)
+                            conditions.Add(new Dict { ["name"] = condition.Description.Value, ["met"] = condition.IsMet() });
+                        var created = r.createItem;
                         list.Add(new Dict {
-                            ["item_id"] = createItem.type, ["name"] = createItem.Name,
-                            ["amount"] = createItem.stack, ["mod"] = modName,
-                            ["available"] = RecipeAvailable(r),
-                            ["materials"] = mats, ["stations"] = stations,
-                            // v0.5: 物品属性（升级引擎比较用）——武器伤害/镐力/斧力/防御
-                            ["damage"] = createItem.damage,
-                            ["pick"] = createItem.pick,
-                            ["axe"] = createItem.axe,
-                            ["defense"] = createItem.defense,
+                            ["item_id"] = created.type, ["name"] = created.Name,
+                            ["full_name"] = ItemIdentity(created), ["recipe_index"] = i,
+                            ["amount"] = created.stack, ["mod"] = created.ModItem?.Mod.Name ?? "Terraria",
+                            ["available"] = available.Contains(i), ["environment_ready"] = RecipeEnvironmentReady(r),
+                            ["materials"] = mats, ["stations"] = stations, ["conditions"] = conditions,
+                            ["damage"] = created.damage, ["pick"] = created.pick,
+                            ["axe"] = created.axe, ["defense"] = created.defense,
                         });
                     }
                     Send(s, new Dict { ["req_id"] = reqId, ["type"] = "recipes", ["recipes"] = list });
                 }
                 catch (Exception ex)
                 {
-                    Logger.Error($"[Recipes] 生成配方列表异常: {ex.GetType().Name}: {ex.Message}");
+                    Logger.Error($"[Recipes] {ex.GetType().Name}: {ex.Message}");
                     Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "recipe_exception" });
                 }
             });
-        }
-
-        private static bool RecipeAvailable(Recipe r)
-        {
-            var player = Main.LocalPlayer;
-            if (player == null) return false;
-            foreach (var ing in r.requiredItem)
-            {
-                if (ing == null || ing.type <= 0 || ing.stack <= 0) continue;
-                if (player.CountItem(ing.type) < ing.stack) return false;
-            }
-            return true;
         }
 
         private string TileName(int tile)
@@ -2347,9 +2357,14 @@ namespace NekoTerrariaLink
                         if (string.IsNullOrWhiteSpace(name)) continue;
                         if (!byMod.ContainsKey(modName))
                             byMod[modName] = new List<Dict>();
+                        string fullName = ItemIdentity(itemInst);
                         byMod[modName].Add(new Dict {
                             ["id"] = i, ["name"] = name,
-                            ["aliases"] = new List<string> { itemInst.Name },
+                            ["full_name"] = fullName,
+                            ["display_name"] = itemInst.Name,
+                            ["aliases"] = new List<string> { itemInst.Name, fullName },
+                            ["create_tile"] = itemInst.createTile,
+                            ["create_wall"] = itemInst.createWall,
                             ["use"] = ItemUse(itemInst), ["tags"] = ItemTags(itemInst),
                         });
                     }
@@ -2371,14 +2386,14 @@ namespace NekoTerrariaLink
             if (item.healLife > 0) return "heal";
             if (item.healMana > 0) return "mana";
             if (item.buffType > 0 && item.consumable) return "buff";
+            if (item.pick > 0 || item.axe > 0 || item.hammer > 0 || item.fishingPole > 0) return "tool";
             if (item.CountsAsClass(DamageClass.Summon)) return "summon";
             if (item.damage > 0 && !item.accessory && item.ammo == 0)
                 return item.mana > 0 ? "magic" : (item.CountsAsClass(DamageClass.Ranged) ? "ranged" : "melee");
             if (item.defense > 0 || item.headSlot > 0 || item.bodySlot > 0 || item.legSlot > 0) return "armor";
             if (item.accessory) return "accessory";
             if (item.consumable) return "potion";
-            if (item.pick > 0 || item.axe > 0 || item.hammer > 0) return "tool";
-            if (item.createTile > 0 || item.createWall > 0) return "placeable";
+            if (item.createTile >= 0 || item.createWall > 0) return "placeable";
             if (item.material) return "material";
             return "misc";
         }
@@ -2390,6 +2405,9 @@ namespace NekoTerrariaLink
             if (item.healMana > 0) tags.Add("mana");
             if (item.buffType > 0) tags.Add("buff");
             if (item.CountsAsClass(DamageClass.Summon)) tags.Add("summon");
+            if (item.fishingPole > 0) tags.Add("fishing");
+            if (item.createTile >= 0 && item.createTile < TileID.Sets.Ore.Length
+                && TileID.Sets.Ore[item.createTile]) tags.Add("ore");
             if (item.pick > 0) tags.Add("pickaxe");
             if (item.axe > 0) tags.Add("axe");
             if (item.hammer > 0) tags.Add("hammer");
@@ -2413,7 +2431,7 @@ namespace NekoTerrariaLink
                 {
                     var it = player.inventory[i];
                     if (it.type == 0) continue;
-                    if (it.type == 0 || it.type == 1) dirtCount += it.stack;
+                    if (it.type == ItemID.DirtBlock) dirtCount += it.stack;
                     if (it.pick > 0) { hasPick = 1; pickPower = Math.Max(pickPower, it.pick); }
                     if (it.axe > 0) hasAxe = 1;
                     if (it.fishingPole > 0 || it.Name.Contains("钓竿") || it.Name.Contains("鱼竿")) hasRod = 1;
@@ -2439,7 +2457,7 @@ namespace NekoTerrariaLink
         };
 
         /// <summary>扫描附近矿石（参照  find_trees）：返回最近 10 个矿坐标，
-        /// tile_type&gt;0 时只返回该类型（铁矿石 tile 类型 = 铁矿物品 id，Python 直接匹配）。</summary>
+        /// tile_type 指定 TileID；未指定时扫描原版矿石。</summary>
         private void SendOrePositions(NetworkStream s, long reqId, Dict cmd)
         {
             var p = Main.LocalPlayer;
@@ -2450,7 +2468,7 @@ namespace NekoTerrariaLink
             }
             int cx = (int)(p.Center.X / 16f), cy = (int)(p.Bottom.Y / 16f);
             int radius = (int)(cmd.GetNum("radius") > 0 ? cmd.GetNum("radius") : 30);
-            int wantType = (int)cmd.GetNum("tile_type");
+            int wantType = cmd.Has("tile_type") ? (int)cmd.GetNum("tile_type") : -1;
             var ores = new List<Dict>();
             for (int y = cy - 20; y <= cy + 40; y++)
             {
@@ -2461,8 +2479,7 @@ namespace NekoTerrariaLink
                     var t = Main.tile[x, y];
                     if (t == null || !t.HasTile) continue;
                     int type = t.TileType;
-                    if (Array.IndexOf(OreTileTypes, type) < 0) continue;
-                    if (wantType > 0 && type != wantType) continue;
+                    if (wantType >= 0 ? type != wantType : Array.IndexOf(OreTileTypes, type) < 0) continue;
                     ores.Add(new Dict { ["x"] = x, ["y"] = y, ["type"] = type,
                         ["dist"] = Math.Abs(x - cx) + Math.Abs(y - cy) });
                 }

@@ -170,7 +170,7 @@ class UndergroundExplorer:
                 continue
             from .item_npc_dict import tile_type_of
             try:
-                ores = await self.agent.mod.find_ore(radius=30, tile_type=tile_type_of(ore, iid))
+                ores = await self.agent.mod.find_ore(radius=30, tile_type=tile_type_of(ore, iid, getattr(self.agent, "registry", None)))
             except Exception:
                 ores = []
             if not ores:
