@@ -85,19 +85,27 @@ class TaskExecutor:
         # 真正取消：置取消位 + 取消协程 + 停下 mod 侧动作
         if self._current is None:
             return False
-        name = self._current.name
+        info = self._current
+        name = info.name
+        runner = self._task
         self._cancel.set()
         if self.agent and getattr(self.agent, "mining", None):
             self.agent.mining.cancel()
-        if self._task and not self._task.done():
-            self._task.cancel()
+        if runner and not runner.done():
+            runner.cancel()
             # 只等它真正停下，异常由 run() 那侧接住，这里不重复消费
             try:
-                await asyncio.wait([self._task], timeout=3)
+                await asyncio.wait([runner], timeout=5)
             except Exception:
                 pass
-        self._current = None
-        self._task = None
+        if self._current is info and (runner is None or runner.done()):
+            self._current = None
+            self._task = None
+        if self.agent and (runner is None or not runner.done()):
+            await self.agent.mod.stop_actions()
+        if runner is not None and not runner.done():
+            self._log(f"任务仍在退出：{name}", "warn")
+            return False
         self._log(f"任务被打断：{name}（{why}）", "warn")
         return True
 
@@ -116,21 +124,32 @@ class TaskExecutor:
                 return {"ok": False, "status": "busy", "output": f"正忙着「{cur}」，这条先不接"}
             if self._current is not None:
                 await self.cancel_current(f"被{source}的「{name}」接管")
+                if self._current is not None:
+                    return {"ok": False, "status": "busy", "output": "旧任务仍在退出，新任务尚未开始。"}
             self._cancel.clear()
             info = TaskInfo(name=name, source=source, steps=steps or [],
                             total_steps=len(steps or []))
             self._current = info
+            lt = getattr(self.agent, "longterm", None) if self.agent else None
+            if lt:
+                lt.request_yield()
+            async def _work():
+                try:
+                    if lt:
+                        await lt.wait_paused()
+                    return await coro_fn(info)
+                finally:
+                    # 清理完成才能释放前台，否则旧动作的停止命令会截断恢复的长期任务。
+                    if self.agent:
+                        await self.agent.mod.stop_actions()
             # 把实际工作放进独立 task，这样打断时取消的是工作本身而非调用方
-            inner = asyncio.ensure_future(coro_fn(info))
+            inner = asyncio.ensure_future(_work())
             self._task = inner
 
         self._log(f"开始任务：{name}", "task")
-        await self.notify("task_started", name=name, source=source, steps=steps)
         # 前台一开工，长期任务（跟随/挖矿）自动让路，避免抢操作权
-        lt = getattr(self.agent, "longterm", None) if self.agent else None
-        if lt:
-            lt.request_yield()
         try:
+            await self.notify("task_started", name=name, source=source, steps=steps)
             result = await inner
             if isinstance(result, dict):
                 out = result
@@ -141,6 +160,9 @@ class TaskExecutor:
                 out = {"ok": False, "status": "error",
                        "output": f"任务内部返回值异常（{result!r}）"}
         except asyncio.CancelledError:
+            if not inner.done():
+                inner.cancel()
+                await asyncio.gather(inner, return_exceptions=True)
             self._last = {"ok": False, "status": "cancelled", "output": f"「{name}」被打断了"}
             if self._current is info:
                 self._current = None
@@ -168,8 +190,18 @@ class TaskExecutor:
             if lt and not self.busy():
                 lt.release_yield()
 
-        out.setdefault("ok", True)
-        out.setdefault("status", "ok" if out.get("ok") else "failed")
+        # 成功必须显式声明；空 dict、缺字段、"false" 字符串均不能默认为成功。
+        out["ok"] = out.get("ok") is True
+        status = str(out.get("status") or ("ok" if out["ok"] else "unconfirmed"))
+        if status not in ("ok", "started"):
+            out["ok"] = False
+        elif not out["ok"]:
+            status = "unconfirmed"
+        out["status"] = status
+        if not out.get("output"):
+            out["output"] = "任务未提供可确认的结果"
+            out["ok"] = False
+            out["status"] = "unconfirmed"
         self._last = out
         self._log(f"任务结束：{name} → {out.get('status')}", "task")
         await self.notify("task_done", name=name, status=out.get("status"), result=out)
@@ -177,7 +209,8 @@ class TaskExecutor:
 
     def should_stop(self) -> bool:
         # 任务内部循环用它做协作式退出，保证能被主人随时叫停
-        return self._cancel.is_set()
+        # 取消位只属于被取消的前台任务，不能污染后续长期/空闲动作。
+        return self._current is not None and self._cancel.is_set()
 
     # ── 回调系统（v2.0 交互引擎挂钩） ───────────────────────
 

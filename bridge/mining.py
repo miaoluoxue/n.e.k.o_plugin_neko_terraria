@@ -36,7 +36,9 @@ class MiningEngine:
         """
         if self.agent is None:
             return -1, 0
-        iid = item_id(target_item)
+        iid = item_id(target_item, getattr(self.agent, "registry", None))
+        if iid <= 0:
+            return iid, 0
         mined = 0
         no_gain = 0
         # 初始背包基数
@@ -108,18 +110,16 @@ class MiningEngine:
 
         用于空闲挖矿（idle）等不重复 nav 的场景。返回挖到的数量（0 = 没挖到）。
         """
-        iid = item_id(ore)
-        before = -1
-        try:
-            self.agent._inv_full = await self.mod.get_inventory()
-            before = self._count_item(self.agent.get_inventory_sync(), iid)
-        except Exception:
-            pass
-        try:
-            await self.mod.navigate_stream_fire(tx, ty)
-            await asyncio.sleep(1.2)
-        except Exception:
-            pass
+        iid = item_id(ore, getattr(self.agent, "registry", None))
+        if iid <= 0:
+            return 0
+        # 未取得基数不能把已有存货计为新挖到的；让调用方报告读取失败。
+        self.agent._inv_full = await self.mod.get_inventory()
+        before = self._count_item(self.agent.get_inventory_sync(), iid)
+        if not await self.agent.navigate_to(tx, ty, timeout=15):
+            return 0
+        if self._stopped() or not await self.agent.life.select_tool("pick"):
+            return 0
         try:
             ok = await self.mod.dig_tile(tx, ty)
         except Exception:
@@ -127,24 +127,8 @@ class MiningEngine:
         if not ok:
             return 0
         await asyncio.sleep(0.8)
-        if self.agent:
-            try:
-                self.agent._inv_full = await self.mod.get_inventory()
-            except Exception:
-                pass
-        if before < 0:
-            # 基数不可用：重试一次读包确认，仍失败按 0 处理并诚实上报——
-            # 曾无条件 return 1（"做了挖掘动作就算挖到1个"），收获未证实即报数
-            try:
-                self.agent._inv_full = await self.mod.get_inventory()
-                after = self._count_item(self.agent.get_inventory_sync(), iid)
-                if after > 0:
-                    return max(0, after)
-            except Exception:
-                pass
-            if self.agent:
-                self.agent.log("挖掘完成但背包计数不可用，无法确认收获", "warn")
-            return 0
+        await self.mod.collect_items(radius=400)
+        self.agent._inv_full = await self.mod.get_inventory()
         after = self._count_item(self.agent.get_inventory_sync(), iid)
         return max(0, after - before)
 

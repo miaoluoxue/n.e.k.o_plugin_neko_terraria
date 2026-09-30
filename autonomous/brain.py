@@ -21,16 +21,11 @@ from .motivation import MotivationSystem
 
 LLM_THINK_PROMPT = (
     "你是{name}，一只在泰拉瑞亚世界里的猫娘——你会采矿、砍树、战斗、探索。\n"
-    "你现在闲着，用游戏里的角色看看周围该做什么：\n"
+    "你现在闲着，用游戏里角色的视角观察周围和主人的活动：\n"
     "{context}\n\n"
-    "选项：\n"
-    "1. 跟着主人（主人在附近就跟着）\n"
-    "2. 挖矿/采集（镐子+地下的方向）\n"
-    "3. 探索（附近没探过的区域）\n"
-    "4. 回血/整理（血量低或背包乱）\n"
-    "5. 继续发呆（什么都不做也行）\n\n"
-    "想采取游戏内行动就调 terraria_command 传一句完整自然语言；"
-    "想说话就自然开口。别长篇大论，1-2 句就够了！"
+    "可以分享眼前的新发现、准备物资的想法或陪主人聊一句，别编造游戏事实。\n"
+    "这是自主观察，不是主人指令：不要调用 terraria_command，也不要开始或改动任何任务。"
+    "只在确有值得分享的变化时自然说 1-2 句，没有就保持安静。"
 )
 
 
@@ -47,6 +42,9 @@ class AutonomousBrain:
         self.running = False
         self._tasks: list[asyncio.Task] = []
         self._busy = False
+        self._action_task = None
+        self._action_kind = ""
+        self._respawn_task = None
         self._last_llm_think = 0.0  # 上次 LLM 思考时间戳
 
         # v2.0: 交互引擎接管对话交互（直接传整个 cfg——
@@ -57,6 +55,8 @@ class AutonomousBrain:
             self.interaction = None
 
     async def start(self) -> None:
+        if self.running:
+            return
         self.running = True
         self._tasks = [
             asyncio.create_task(self._state_tick()),
@@ -106,8 +106,13 @@ class AutonomousBrain:
 
     async def stop(self) -> None:
         self.running = False
+        await self.cancel_actions()
         for t in self._tasks:
             t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        self.bus.unsubscribe("interrupt", self._on_interrupt)
+        self.bus.unsubscribe("combat_hit", self._on_combat_hit)
         # v0.7: 停止处境融合层
         if getattr(self, "situation", None):
             await self.situation.stop()
@@ -120,6 +125,41 @@ class AutonomousBrain:
         # v2.0: 停止交互引擎
         if self.interaction:
             await self.interaction.stop()
+
+    async def cancel_actions(self, kind: str = "") -> None:
+        """停止实际自主动作，不取消负责感知和陪聊的常驻循环。"""
+        tasks = []
+        if self._action_task and (not kind or kind == self._action_kind):
+            tasks.append(self._action_task)
+        if self._respawn_task and (not kind or kind == "follow"):
+            tasks.append(self._respawn_task)
+        tasks = [task for task in tasks if task is not asyncio.current_task() and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _autonomy_allowed(self, kind: str = "") -> bool:
+        check = getattr(self.agent, "autonomy_allowed", None)
+        return check(kind) if check else True
+
+    async def _run_action(self, coro, kind: str) -> Any:
+        self._action_kind = kind
+        task = asyncio.create_task(coro)
+        self._action_task = task
+        self._busy = True
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # 主人只取消动作时，感知循环继续；插件关闭时继续传播取消。
+            if asyncio.current_task().cancelling():
+                raise
+            return None
+        finally:
+            if self._action_task is task:
+                self._action_task = None
+                self._action_kind = ""
+                self._busy = False
 
     def occupied(self) -> bool:
         """有任务在跑就算占用：自主行为必须让位，不打断正在执行的任务。
@@ -139,9 +179,11 @@ class AutonomousBrain:
         interval = self.cfg.get("state_tick_interval_seconds", 1.0)
         while self.running:
             try:
+                state = self.agent.get_state()
                 # v2.2: AI 客户端未连接（boot 不再自动启动，等面板「连接游戏」）
                 # → 空转：不涨 boredom、不扣 Heart（否则用户没玩时依恋值狂掉）
-                if not getattr(self.agent, "running", False):
+                if (not getattr(self.agent, "running", False) or not state
+                        or state.get("alive") is False or int(state.get("hp", 0) or 0) <= 0):
                     await asyncio.sleep(interval)
                     continue
                 # 刺激源只看前台任务——长期任务（跟随/挖矿）是常态陪伴，不算"刺激"；
@@ -173,12 +215,13 @@ class AutonomousBrain:
                 state = self.agent.get_state()
                 # v2.2: AI 客户端未连接 → 空转（不自主行动，避免空 state 触发
                 # motivation gather → executor 挖矿失败刷屏）
-                if not getattr(self.agent, "running", False):
+                if (not getattr(self.agent, "running", False) or not state
+                        or state.get("alive") is False or int(state.get("hp", 0) or 0) <= 0):
                     await asyncio.sleep(interval)
                     continue
                 # P0 优先级守卫：自保（喝药/逃跑）无条件优先 + 长期任务中遇怪战斗
                 # 按生存循环惯例 主循环 P0 自保 > P1 战斗（不被任务占用抑制）
-                if await self._guard_check(state):
+                if await self._run_action(self._guard_check(state), "guard"):
                     await asyncio.sleep(interval)
                     continue
                 # 有前台任务在执行时其余自主行为让位（避免抢控制权）
@@ -195,8 +238,19 @@ class AutonomousBrain:
                 if self._has_longterm():
                     await asyncio.sleep(interval)
                     continue
-                drive = self.motivation.update(state, self.state.boredom)
-                await self._act_on_drive(drive, state)
+                idle = getattr(self.agent, "_idle_task", None)
+                if idle and not idle.done():
+                    await asyncio.sleep(interval)
+                    continue
+                # 动机层的 nearby_npcs 表示可交战目标，不能把兔子/城镇 NPC
+                # 或已经确认隔墙的怪物当成永远压过社交的战斗刺激。
+                target = self.agent.combat._pick_target(
+                    state, state.get("tile_x", 0), state.get("tile_y", 0))
+                drive_state = dict(state, nearby_npcs=[target] if target else [])
+                drive = self.motivation.update(drive_state, self.state.boredom)
+                kind = {"social": "follow", "combat": "guard", "gather": "chop"}.get(drive, drive)
+                if self._autonomy_allowed(kind):
+                    await self._run_action(self._act_on_drive(drive, state), kind)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -227,10 +281,13 @@ class AutonomousBrain:
         """
         if not state:
             return False
-        hp = int(state.get("hp", 100) or 100)
+        hp = int(state.get("hp", 0) or 0)
+        if hp <= 0 or state.get("alive") is False or getattr(self.agent, "_in_combat", False):
+            return False
         max_hp = int(state.get("max_life", 100) or 100) or 100
         ratio = hp / max_hp if max_hp > 0 else 1.0
-        enemies = [e for e in (state.get("nearby_npcs", []) or []) if e.get("damage", 0) > 0 and e.get("life", 0) > 0]
+        enemies = [e for e in (state.get("nearby_npcs", []) or [])
+                   if self.agent.combat.is_hostile(e)]
 
         handled = False
         # ── P0 自保 1：血量 <50% 先喝药（独立动作，不打断任务） ──
@@ -255,10 +312,25 @@ class AutonomousBrain:
                 dy = me_y - int(nearest.get("tile_y", me_y) or me_y)
                 dist = (dx * dx + dy * dy) ** 0.5
                 if dist < 12:
-                    step = max(abs(dx), abs(dy), 1)
-                    tx = me_x + (dx // step) * 8
-                    ty = me_y + (dy // step) * 8
-                    await self.agent.navigate_to(tx, ty, timeout=3)
+                    # 水平逃生，避免整数除法把分量截成 0，或向地下盲冲。
+                    tx = me_x + (8 if dx >= 0 else -8)
+                    lt = getattr(self.agent, "longterm", None)
+                    pause_owned = bool(lt and not lt.yielding())
+                    if pause_owned:
+                        lt.request_yield()
+                    self.agent._in_combat = True
+                    try:
+                        if pause_owned:
+                            await lt.wait_paused()
+                        await self.agent.mod.navigate_to(tx, me_y, timeout=3)
+                    finally:
+                        try:
+                            await self.agent.mod.stop_actions()
+                        finally:
+                            self.agent._in_combat = False
+                            ex = getattr(self.agent, "executor", None)
+                            if pause_owned and not (ex and ex.busy()):
+                                lt.release_yield()
                     self.agent.log("自保：血量危急，拉开距离", "warn")
                     handled = True
                     try:
@@ -273,10 +345,10 @@ class AutonomousBrain:
         # ── P1 战斗：无前台任务才打（P1 优先级，但可让路）。
         # 有主线任务时（如挖矿/砍树），途中遇敌由导航守卫（navigate_to 的 on_tick）
         # 停下先打再走；这里不打断主线，避免两条控制流抢操作权。
-        # v2.2: 有长期任务（跟随/挖矿/守点）→ 不主动打怪——主人明确指令优先于
-        # 自主战斗（"别打怪了来跟着我"），且 fight_nearest 会抢占操作权。
+        # 长期任务只响应近身威胁，防止为了追远处小怪抛下主人。
         if enemies and not handled:
-            if self._has_longterm():
+            # 主人暂停自主战斗时仅保留血量危急的逃生（上面的 P0 已处理）。
+            if not self._autonomy_allowed("guard"):
                 return handled
             ex = getattr(self.agent, "executor", None)
             fg_busy = bool(ex and ex.busy())
@@ -288,13 +360,31 @@ class AutonomousBrain:
                 except Exception:
                     pass
                 return handled  # 不占 fast_think
-            # 无任务：打（带 check_task，战斗中被主人新任务打断则放弃）
+            if self._has_longterm():
+                px, py = state.get("tile_x", 0), state.get("tile_y", 0)
+                enemies = [e for e in enemies
+                           if abs(e.get("tile_x", 0) - px) + abs(e.get("tile_y", 0) - py) <= 6]
+                if not enemies:
+                    return handled
+                state = dict(state, nearby_npcs=enemies)
+            if not self.agent.combat._pick_target(state, state.get("tile_x", 0), state.get("tile_y", 0)):
+                return handled
+            idle = getattr(self.agent, "_idle_task", None)
+            if idle and not idle.done():
+                idle.cancel()
+                await asyncio.gather(idle, return_exceptions=True)
             lt = getattr(self.agent, "longterm", None)
+            if lt and lt.yielding():
+                return handled
+            pause_owned = bool(lt and lt.busy_kinds())
+            if pause_owned:
+                lt.request_yield()
             try:
-                if lt:
-                    lt.request_yield()  # 长期任务让路，避免抢操作权
                 self._busy = True
                 try:
+                    if pause_owned:
+                        # 不只置标志：必须等正在用斧头/导航的动作退出再切武器。
+                        await lt.wait_paused()
                     await self.agent.combat.fight_nearest(
                         state, timeout=8, check_task=lambda: ex.busy() if ex else False
                     )
@@ -304,15 +394,19 @@ class AutonomousBrain:
             except Exception:
                 pass
             finally:
-                if lt:
+                # 主人前台已接管时，它拥有让路状态，由它完成后恢复长期任务。
+                if pause_owned and not (ex and ex.busy()):
                     lt.release_yield()
         return handled
 
     async def _act_on_drive(self, drive: str, state: Dict[str, Any]) -> None:
         await asyncio.sleep(self.timing.reaction_delay())
-        # 只被前台任务阻塞——长期任务（跟随/挖矿）不拦截自主行为
+        # 反应延迟期间主人可能已经下达长期任务，动作前必须重新检查。
         ex = getattr(self.agent, "executor", None)
-        if ex and ex.busy():
+        if (ex and ex.busy()) or self._has_longterm():
+            return
+        kind = {"social": "follow", "combat": "guard", "gather": "chop"}.get(drive, drive)
+        if not self._autonomy_allowed(kind):
             return
         if self.attention.should_drift():
             return
@@ -321,15 +415,17 @@ class AutonomousBrain:
         # #96: 只有社交驱动才跟随主人——否则有主人在场时 gather/explore/comfort
         # 全被 follow_player 抢占（前台任务占用 executor），挖矿/探索自主动机永不执行。
         if players and drive == "social":
-            ppos = (players[0]["tile_x"], players[0]["tile_y"])
-            await self.agent.follow_player(ppos)
-            if self.occupied():
+            if not self._autonomy_allowed("follow"):
                 return
+            ppos = (players[0]["tile_x"], players[0]["tile_y"])
+            distance = abs(ppos[0] - state.get("tile_x", 0)) + abs(ppos[1] - state.get("tile_y", 0))
+            if distance > 12:
+                await self.agent.mod.navigate_to(*ppos, timeout=5)
 
         if drive == "combat":
             self._busy = True
             try:
-                await self.agent.combat.fight_nearest(state)
+                await self.agent.combat.fight_nearest(state, check_task=lambda: bool(ex and ex.busy()) or self._has_longterm())
             finally:
                 self._busy = False
         elif drive == "comfort":
@@ -395,10 +491,10 @@ class AutonomousBrain:
                 if ex and ex.busy():
                     continue
 
-                # v2.2: 有长期任务在跑 → 不自主 LLM 决策（跟随/挖矿中猫娘
-                # 不该自己另起炉灶抢控制权，主人指令优先）
-                if self._has_longterm():
-                    continue
+                # 陪伴期间仍可观察和聊天，行动权限由正在执行的任务约束。
+                observing_only = self._has_longterm() or any(
+                    not self._autonomy_allowed(kind)
+                    for kind in ("", "chop", "mine", "follow", "guard", "fish", "explore"))
 
                 # 无聊度太低也没必要（阈值 0.6：只有明显无聊才自主思考，
                 # 曾 0.3——boredom 涨得快，60-120s 就推一条 respond，主人没说话时
@@ -418,6 +514,13 @@ class AutonomousBrain:
                 # 构造 LLM 思考请求
                 char_name = self.cfg.get("character_name", "neko") if self.cfg else "neko"
                 prompt = LLM_THINK_PROMPT.format(name=char_name, context=ctx)
+                if observing_only:
+                    prompt = (
+                        f"你是{char_name}，正在陪主人玩泰拉瑞亚。当前实测状态：\n{ctx}\n"
+                        "请观察附近环境和当前任务，必要时自然聊一句或提醒危险；"
+                        "不要调工具、不要另开任务，也不要重新开始主人已经叫停的动作。"
+                        "没有值得说的变化可以保持安静，不要编造进度或完成结果。"
+                    )
 
                 # v3.0: 统一走宿主 LLM 会话（mc 插件 nudge 模式）——
                 # 宿主 LLM 既能调工具又能说话，自主决策/解说三合一，
@@ -454,7 +557,7 @@ class AutonomousBrain:
 
     async def _deep_boredom_fallback(self) -> None:
         """极无聊时的资源收集兜底（规则层，不依赖 LLM）。"""
-        if self.occupied():
+        if self.occupied() or not self._autonomy_allowed("chop"):
             return
         if self.state.boredom > 0.9:
             await self._auto_task("无聊储备", [{"action": "gather", "item": "wood", "amount": 20}])
@@ -464,12 +567,14 @@ class AutonomousBrain:
     def _on_respawn(self) -> None:
 
         auto_return = self.cfg.get("auto_return_after_respawn", True)
-        if not auto_return:
+        if not auto_return or not self.running or not self._autonomy_allowed("follow"):
             return
 
         async def _navigate_back():
             # 等 agent 状态刷新一帧
             await asyncio.sleep(0.5)
+            if not self.running or self.occupied() or not self._autonomy_allowed("follow"):
+                return
             st = self.agent.get_state()
             players = st.get("nearby_players", []) or []
             if not players:
@@ -493,13 +598,15 @@ class AutonomousBrain:
                         ai_behavior="read",
                     )
 
-                await self.agent.navigate_to(ox, oy, timeout=30)
-                self.agent.log("复活后回到主人身边了", "info")
+                if await self.agent.navigate_to(ox, oy, timeout=30):
+                    self.agent.log("复活后回到主人身边了", "info")
             except Exception as e:
                 self.plugin.logger.warning(f"[brain] 复活后寻路失败: {e}")
 
         # 在事件循环中调度（回调在 _state_loop 线程内，ensure_future 安全）
-        asyncio.ensure_future(_navigate_back())
+        if self._respawn_task and not self._respawn_task.done():
+            self._respawn_task.cancel()
+        self._respawn_task = asyncio.create_task(_navigate_back())
 
     async def _on_combat_hit(self, data: Any) -> None:
         """受击即时响应：C# 推 combat_hit → 交互引擎立即惊呼。"""
@@ -512,6 +619,7 @@ class AutonomousBrain:
 
         data 格式：{"level": 1-4, "reason": "...", "task_name": "..."}
         """
+        await self.cancel_actions()
         self._busy = False
         self.state.boredom = 0.0
         self.motivation.scores.clear()
@@ -569,7 +677,7 @@ class AutonomousBrain:
         欠量已 fail 不会到 ok——绝不报"挖够 N"当实际只挖到几块）。
         """
         name = data.get("name", "任务")
-        status = str(data.get("status", "ok") or "ok").lower()
+        status = str(data.get("status", "unconfirmed") or "unconfirmed").lower()
         desc = f"「{name}」"
 
         result = data.get("result") or {}
@@ -591,7 +699,8 @@ class AutonomousBrain:
             return
 
         # ok / failed 分档 → 结构化事实行，交宿主 LLM 自动生成人话
-        if status == "ok":
+        confirmed = status == "ok" and result.get("ok") is True
+        if confirmed:
             # executor.run 一次 = 整个多步任务（agent.run_complex_task 的 _work
             # 内部循环全部 goal 才 task_done），不是"一步"——措辞避免误导
             # 宿主 LLM 以为只完成了其中一小步。
@@ -599,17 +708,20 @@ class AutonomousBrain:
             if out:
                 head += f"实测结果：{out}。"
             followup = "用猫娘语气向主人自然说说这次的结果（1-2句，只能依据上面事实）"
+        elif status == "started":
+            head = f"{desc}已启动，仍在进行中，尚未完成。实际情况：{out}。"
+            followup = "只说明已启动，不要说整个任务做完，不要从原任务名推断成果。"
         else:
             head = f"{desc}这个任务没有成功（{status}）。"
             if out:
                 head += f"实际情况：{out}。"
-            followup = "用猫娘语气向主人说说这次没成的事（1-2句，如实说，别找借口编原因）"
+            followup = "根据事实说明已做的部分与尚未确认的部分（1-2句）；不得说完成、收到、钓到，也不要自动重派。"
         try:
             await self.agent.speak(head + followup, ai_behavior="respond")
         except Exception:
             pass
 
-        if self._emitter:
+        if self._emitter and confirmed:
             goal_data = data.get("goal", {})
             gtype = goal_data.get("type", "")
             gtarget = goal_data.get("target", "")
@@ -617,7 +729,8 @@ class AutonomousBrain:
                 self._emitter.on_goal_completed(gtype, gtarget)
 
         if self.interaction:
-            await self.interaction.inject_event("task_done", intensity=0.5, description=desc, data=data)
+            if confirmed:
+                await self.interaction.inject_event("task_done", intensity=0.5, description=desc, data=data)
 
     async def _on_executor_task_started(self, data: Dict) -> None:
         name = data.get("name", "新任务")

@@ -1,6 +1,6 @@
-"""真人级战斗：走位拉扯 + 垫土 + 钩锁 + 黑名单，基于 mod 状态决策。
-- 所有移动通过 mod.navigate_to 实现
-- 伤害通过 mod.damage_npc 实现
+"""战斗：走位拉扯、武器挥动与不可达目标退让，基于 mod 状态决策。
+- 移动通过 mod.navigate_stream_fire 实现
+- 通过真实武器挥动造成伤害
 
 v0.11（A1）：战斗守卫不吞任务。fight_nearest 增加 yield 能力：
   check_task 存在时，一旦目标不可达/被隔墙/超时就返回 False（打不死就不打），
@@ -24,17 +24,28 @@ class CombatEngine:
         # ── 风筝参数（按生存循环惯例 KITE_IDEAL_DIST/KITE_TOO_CLOSE） ──
         self.kite_ideal_dist = 3.0  # 理想距离（曼哈顿）：站桩打
         self.kite_too_close = 1.0  # 过近：后退
-        self.kite_too_far = 8.0  # 过远：追击靠近
         self.max_height_gap = 10  # 超过此垂直差视为不可达（跳过）
         self.retreat_hp_ratio = 0.30  # 自身血量低于此比例 → 逃跑保命
 
-    def _blacklist_enemy(self, name: str, x: int, y: int, reason: str) -> None:
-        self._blacklist[(name, x, y)] = time.time() + self.blacklist_secs
+    @staticmethod
+    def _enemy_key(enemy: Dict[str, Any]) -> tuple:
+        # NPC 槽位 0 有效。坐标会随移动变化，不能用坐标识别同一只敌人。
+        return (enemy.get("slot", -1), enemy.get("type"), enemy.get("name", ""))
 
-    def _is_blacklisted(self, name: str, x: int, y: int) -> bool:
-        key = (name, x, y)
+    @staticmethod
+    def is_hostile(enemy: Dict[str, Any]) -> bool:
+        return (not enemy.get("friendly", False)
+                and not enemy.get("townNPC", enemy.get("town_npc", False))
+                and int(enemy.get("damage", 0) or 0) > 0
+                and int(enemy.get("life", 0) or 0) > 0)
+
+    def _blacklist_enemy(self, enemy: Dict[str, Any]) -> None:
+        self._blacklist[self._enemy_key(enemy)] = time.monotonic() + self.blacklist_secs
+
+    def _is_blacklisted(self, enemy: Dict[str, Any]) -> bool:
+        key = self._enemy_key(enemy)
         exp = self._blacklist.get(key, 0)
-        if exp and time.time() < exp:
+        if exp and time.monotonic() < exp:
             return True
         if key in self._blacklist:
             del self._blacklist[key]
@@ -49,6 +60,10 @@ class CombatEngine:
           为真 → 战斗中放弃（打不死就不打，不占任务槽，交给守卫方调度）。
           战斗优先但可让路。
         """
+        if not state or state.get("alive") is False or int(state.get("hp", 0) or 0) <= 0:
+            return False
+        if self.agent is not None and getattr(self.agent, "_in_combat", False):
+            return False
         px0 = int(state.get("tile_x", 0) or 0)
         py0 = int(state.get("tile_y", 0) or 0)
         target = self._pick_target(state, px0, py0)
@@ -62,8 +77,13 @@ class CombatEngine:
             return await self._fight_loop(state, timeout, check_task,
                                           px0, py0, target)
         finally:
-            if self.agent is not None:
-                self.agent._in_combat = False
+            try:
+                await self.mod.stop_actions()
+            except Exception:
+                pass
+            finally:
+                if self.agent is not None:
+                    self.agent._in_combat = False
 
     async def _fight_loop(self, state: Dict[str, Any], timeout: int,
                           check_task: Optional[Callable[[], bool]],
@@ -72,18 +92,22 @@ class CombatEngine:
         # 战斗前选好武器（近战/远程/魔法/召唤中伤害最高，陪玩真实感）
         try:
             life = getattr(self.agent, "life", None)
-            if life is not None:
-                await life.select_tool("weapon")
+            if life is not None and not await life.select_tool("weapon"):
+                self._blacklist_enemy(target)
+                return False
         except Exception:
-            pass
+            return False
 
-        slot = int(target.get("slot", 0) or 0)
-        start = time.time()
-        last_change = time.time()
-        while time.time() - start < timeout:
+        key = self._enemy_key(target)
+        start = last_change = time.monotonic()
+        last_hp = int(target.get("life", 0) or 0)
+        last_move = 0.0
+        moving = False
+        while time.monotonic() - start < timeout:
             # 重要任务优先：主人要求做的事 > 打小怪（不打折的主线）
             if check_task is not None and check_task():
-                await self.mod.navigate_to(px0, py0, timeout=1)  # 先归位，别飘太远
+                return False
+            if self.agent is not None and not getattr(self.agent, "running", True):
                 return False
 
             # ★ 每轮刷新状态：目标血量/位置是动态的（旧实现用静态快照，
@@ -92,16 +116,18 @@ class CombatEngine:
                 state = self.agent.get_state() if self.agent else state
             except Exception:
                 pass
-            px = int(state.get("tile_x", px0) or px0)
-            py = int(state.get("tile_y", py0) or py0)
+            px = int(state.get("tile_x", px0))
+            py = int(state.get("tile_y", py0))
 
-            # 从最新状态找目标（按 slot），死亡/消失 → 胜利
+            # 从最新状态找目标（按 slot），消失只代表脱离接触。
             cur = None
             for e in state.get("nearby_npcs", []) or []:
-                if int(e.get("slot", -1) or -1) == slot:
+                if self._enemy_key(e) == key:
                     cur = e
                     break
-            if cur is None or int(cur.get("life", 0) or 0) <= 0:
+            if cur is None:
+                return False  # 离开感知范围/状态丢失不能作为击杀证据
+            if int(cur.get("life", 0) or 0) <= 0:
                 # 战斗胜利，收集掉落物（打完不抢任务，掉落让主线收）
                 try:
                     collected = await self.mod.collect_items(radius=400)
@@ -115,8 +141,10 @@ class CombatEngine:
             hp = int(cur.get("life", 0) or 0)
 
             # 自身低血 → 保命（不恋战）
-            my_hp = int(state.get("hp", 100) or 100)
+            my_hp = int(state.get("hp", 0) or 0)
             my_max = int(state.get("max_life", 100) or 100) or 100
+            if state.get("alive") is False or my_hp <= 0:
+                return False
             if my_hp / my_max < self.retreat_hp_ratio:
                 if self.agent is not None:
                     await self.agent.heal_self()
@@ -125,49 +153,51 @@ class CombatEngine:
             dx = tx - px
             dy = ty - py
             dist = abs(dx) + abs(dy)
+            if abs(dy) > self.max_height_gap:
+                self._blacklist_enemy(cur)
+                return False
+
+            # 服务器的伤害结果可能在两次循环之间到达，必须跨轮比较血量。
+            if hp < last_hp:
+                last_change = time.monotonic()
+            last_hp = hp
+            if time.monotonic() - last_change > self.no_dmg_timeout:
+                self._blacklist_enemy(cur)
+                return False
 
             # ── 风筝走位 ──
+            destination = None
             if dist < self.kite_too_close:
                 # 过近 → 后退 3 格
                 away = -1 if dx > 0 else 1
-                await self.mod.navigate_to(px + away * 3, py, timeout=1)
-            elif dist > self.kite_too_far:
-                # 过远 → 追击靠近
-                await self.mod.navigate_to(tx, ty, timeout=1)
-            else:
-                # 理想距离：侧面站位打（目标上方则偏下，防止隔墙）
+                destination = (px + away * 3, py)
+            elif dist > self.kite_ideal_dist:
                 offset = -2 if tx > px else 2
-                target_y = ty + 1 if dy < -2 else ty
-                await self.mod.navigate_to(tx + offset, target_y, timeout=1)
+                destination = (tx + offset, ty)
+            # 移动与挥砍并行；原先每挥一次都等一秒导航超时，攻击会一直被拖住。
+            if destination is not None and time.monotonic() - last_move >= 0.8:
+                await self.mod.navigate_stream_fire(*destination)
+                last_move = time.monotonic()
+                moving = True
+            elif destination is None and moving:
+                await self.mod.stop_actions()
+                moving = False
             # 真实武器挥动：朝敌人 tile 坐标挥砍（方向由 C# 面向目标自动对准）
             await self.mod.use_item(tx, ty)
 
-            # 伤害后刷新状态读最新血量（联机伤害由服务器结算，缓存不刷新会拿到旧值）
-            new_hp = hp
+            await asyncio.sleep(0.3)
             try:
                 if self.agent:
                     await self.agent.refresh_state()
-                    st2 = self.agent.get_state()
-                else:
-                    st2 = state
-                for e in st2.get("nearby_npcs", []) or []:
-                    if int(e.get("slot", -1) or -1) == slot:
-                        new_hp = int(e.get("life", 0) or 0)
-                        break
             except Exception:
                 pass
-            if new_hp <= 0:
-                return True
-            # 隔墙判定：持续无伤 → 黑名单弃战
-            if new_hp < hp:
-                last_change = time.time()
-            if time.time() - last_change > self.no_dmg_timeout:
-                self._blacklist_enemy(cur.get("name", ""), tx, ty, "隔墙")
-                return False
-
-            await self._maybe_cover(px, py, ty)
-            await asyncio.sleep(0.3)
+        self._blacklist_enemy(target)
         return False
+
+    async def _maybe_cover(self, px: int, py: int, ty: int) -> None:
+        """坠落风险时在脚下垫土保命（x 用玩家当前位置）。"""
+        if abs(ty - py) > 10:
+            await self.mod.place_tile(px, py + 1, 0)
 
     def _pick_target(self, state: Dict[str, Any], px: int, py: int) -> Optional[Dict[str, Any]]:
         """选最近的可达敌人（跳过黑名单/高差过大的）。"""
@@ -175,13 +205,11 @@ class CombatEngine:
         best = None
         best_dist = 10**9
         for e in enemies:
-            if int(e.get("damage", 0) or 0) <= 0:
-                continue
-            if int(e.get("life", 0) or 0) <= 0:
+            if not self.is_hostile(e) or e.get("slot") is None or int(e.get("slot", -1)) < 0:
                 continue
             ex = int(e.get("tile_x", 0) or 0)
             ey = int(e.get("tile_y", 0) or 0)
-            if self._is_blacklisted(e.get("name", ""), ex, ey):
+            if self._is_blacklisted(e):
                 continue
             # 可达性：垂直差过大（悬崖上/深坑里）跳过
             if abs(ey - py) > self.max_height_gap:
@@ -191,8 +219,3 @@ class CombatEngine:
                 best_dist = d
                 best = e
         return best
-
-    async def _maybe_cover(self, px: int, py: int, ty: int) -> None:
-        """坠落风险时在脚下垫土保命（x 用玩家当前位置，不能写死 0）"""
-        if abs(ty - py) > 10:
-            await self.mod.place_tile(px, py + 1, 0)

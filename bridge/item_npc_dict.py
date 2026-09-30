@@ -72,30 +72,28 @@ def item_id(name: str, registry=None) -> int:
     2. 中文名经 recipe_book.CN_EN 翻成英文再查 registry
        （曾无此步：ITEM_IDS 全英文 key + registry 全英文，调用方传中文
        "铁矿"必 MISS → give/craft/火把全失效返回 -1）
-    3. registry 完全未加载时才回退 ITEM_IDS 硬编码
+    3. registry 未命中时回退已知的原版 ID（原版物品不一定出现在 mod 枚举里）
     """
     low = (name or "").strip().lower()
     if not low:
         return -1
     if registry is not None:
-        # registry 是否加载过（有任意 mod 表即认为权威可用）
-        loaded = any(registry.mods.values())
-        if loaded:
-            rid = registry.resolve(low)
-            if rid >= 0:
-                return rid
-            # 中文 → 英文（recipe_book 有中英对照）
-            try:
-                from .recipe_book import CN_EN
-                en = CN_EN.get((name or "").strip())
-                if en:
-                    rid2 = registry.resolve(en)
-                    if rid2 >= 0:
-                        return rid2
-            except Exception:
-                pass
-            return -1
-    # registry 未加载：回退硬编码（仅冷启动兜底）
+        rid = registry.resolve(low)
+        if rid >= 0:
+            return rid
+    # 中文转换也适用于首次入服、注册表尚未拉取的情况。
+    try:
+        from .recipe_book import CN_EN
+        en = CN_EN.get((name or "").strip())
+        if en:
+            if registry is not None:
+                rid2 = registry.resolve(en)
+                if rid2 >= 0:
+                    return rid2
+            low = en.lower()
+    except ImportError:
+        pass
+    # registry 未命中时仍可使用已知的原版物品 ID。
     iid = ITEM_IDS.get(low, -1)
     if iid >= 0:
         return iid

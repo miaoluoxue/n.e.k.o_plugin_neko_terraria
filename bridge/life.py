@@ -49,6 +49,9 @@ class LifeEngine:
         self.agent = agent
         self._last_chop = 0.0
         self._last_fish = 0.0
+        self.last_failure = ""
+        self.last_cast_count = 0
+        self._last_tool_warning = ""
 
     # ---------------- 工具选择 ----------------
 
@@ -59,7 +62,12 @@ class LifeEngine:
         - melee/ranged/magic/summon：指定武器类型
         返回是否选到。
         """
-        inv = self.agent.get_inventory_sync()
+        try:
+            inv = await self.agent.mod.get_inventory()
+            self.agent._inv_full = inv
+        except Exception as exc:
+            self.last_failure = f"无法读取背包，暂时不能确认工具：{exc}"
+            return False
         items = (inv.get("hotbar", []) or []) + (inv.get("inventory", []) or [])
 
         # 工具类（挖矿/砍树/钓鱼）
@@ -72,10 +80,17 @@ class LifeEngine:
                 slot = it.get("inv_slot")
                 if slot is None:
                     continue
-                name = str(it.get("name", "") or "")
-                if any(k in name for k in kws):
-                    await self.agent.mod.select_item(slot)
-                    return True
+                name = str(it.get("name", "") or "").lower()
+                attr = {"pick": "pick", "axe": "axe", "rod": "fishing_pole"}.get(kind)
+                has_attr = attr and int(it.get(attr, 0) or 0) > 0
+                if has_attr or any(k.lower() in name for k in kws):
+                    if await self.agent.mod.select_item(slot):
+                        self.last_failure = ""
+                        self._last_tool_warning = ""
+                        return True
+                    self.last_failure = "工具已找到，但切换工具未成功"
+                    return False
+            self.last_failure = "背包中没有" + {"pick": "镐子", "axe": "斧头", "rod": "钓竿"}[kind]
             return False
 
         # 战斗武器：按类型挑伤害最高
@@ -106,33 +121,39 @@ class LifeEngine:
                 best_dmg = dmg
                 best_slot = slot
         if best_slot is not None:
-            await self.agent.mod.select_item(best_slot)
-            return True
+            if await self.agent.mod.select_item(best_slot):
+                self.last_failure = ""
+                return True
+            self.last_failure = "切换武器未成功"
+            return False
+        self.last_failure = "背包中没有可用武器"
         return False
 
     # ---------------- 砍树 ----------------
 
     async def _say_no_tool(self, kind: str, msg: str) -> None:
-        """无执行条件情感交互：没工具时跟主人撒娇要（进程内说话，不静默）。"""
-        try:
-            await self.agent.send_chat(msg)
-        except Exception:
-            pass
-        self.agent.log(msg, "warn")
+        """记录可交给任务结果通道的事实；不在每轮循环刷游戏聊天。"""
+        if self.last_failure != self._last_tool_warning:
+            self.agent.log(self.last_failure or msg, "warn")
+            self._last_tool_warning = self.last_failure
 
-    async def chop_wood(self, target: int = 10) -> int:
+    async def _wait_for_body(self) -> None:
+        # 长期采集在前台动作/战斗中让路；不能仅在外层每批开始时检查。
+        while True:
+            lt = self.agent.longterm
+            is_longterm = lt.owns_current_action()
+            if not getattr(self.agent, "_in_combat", False) and not (is_longterm and lt.yielding()):
+                return
+            await asyncio.sleep(0.2)
+
+    async def chop_wood(self, target: int = 10, item_id: int = 9) -> int:
         """砍树收集木材。返回本次获得的数量（背包计数确认）。
 
         真实砍树：走过去 → 选斧头 → 朝树挥斧 → 收掉落 → 计数。
         人物必须真的走到树边（C# InReach 距离校验），挥斧砍下才算数。
         """
-        # 木材物品 id=9
-        iid = 9
-        try:
-            inv = self.agent.get_inventory_sync()
-            before = _count_id(inv, iid)
-        except Exception:
-            before = -1
+        iid = item_id  # 只统计指定木材，不能把普通木材算成其他木材。
+        self.last_failure = ""
 
         # 选斧头；没有就跟主人撒娇（无执行条件情感交互）
         if not await self.select_tool("axe"):
@@ -140,30 +161,48 @@ class LifeEngine:
                 "斧", "主人我没有斧头无法砍树喵，主人有也可以给我喵")
             return 0
 
+        before = _count_id(self.agent.get_inventory_sync(), iid)
+
         got = 0
         # 目标棵数约束：曾写死 range(4) 忽略 target 参数——主人说"砍5个木材"
         # 会砍 4 整棵（30+ 木材）。target 是"预期获得量"，按需砍到接近即可。
         # 简化按"至少砍到 target 棵树才算够"不成立（一棵树给 5-20 木材），
         # 故改为：最多砍 target 棵；配合背包计数——到账即停。
         max_trees = max(1, min(int(target or 4), 12))
+        unreachable = set()
         for _ in range(max_trees):
+            await self._wait_for_body()
             if self.agent.executor and self.agent.executor.should_stop():
                 break
             if target and 0 < target <= got:
                 break
             trees = await self.agent.mod.find_trees(radius=30)
+            trees = [t for t in trees if (t.get("x"), t.get("y")) not in unreachable]
             if not trees:
+                self.last_failure = "附近没有可到达的树木"
                 break
             tree = trees[0]
             tx, ty = int(tree.get("x", 0)), int(tree.get("y", 0))
             # 走过去（导航途中遇敌会先打再走）
             try:
-                await self.agent.navigate_to(tx, ty, timeout=15)
-            except Exception:
-                pass
+                if not await self.agent.navigate_to(tx, ty, timeout=15):
+                    self.agent.log(f"砍树：无法走到树旁 ({tx},{ty})，换下一棵", "warn")
+                    self.last_failure = "无法走到树旁"
+                    unreachable.add((tx, ty))
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.agent.log(f"砍树：移动到树旁失败：{exc}", "warn")
+                continue
             # 选好斧头，朝树根挥砍（真实挥斧，树真的会被砍倒）
-            await self.select_tool("axe")
+            if not await self.select_tool("axe"):
+                break
             for _ in range(12):
+                was_busy = getattr(self.agent, "_in_combat", False) or self.agent.longterm.yielding()
+                await self._wait_for_body()
+                if was_busy and not await self.select_tool("axe"):
+                    break
                 if self.agent.executor and self.agent.executor.should_stop():
                     break
                 try:
@@ -178,7 +217,8 @@ class LifeEngine:
             except Exception:
                 pass
             try:
-                inv2 = self.agent.get_inventory_sync()
+                inv2 = await self.agent.mod.get_inventory()
+                self.agent._inv_full = inv2
                 now = _count_id(inv2, iid)
                 if now > before + got:
                     got = now - before
@@ -196,12 +236,15 @@ class LifeEngine:
 
         # 计数
         try:
-            inv = self.agent.get_inventory_sync()
+            inv = await self.agent.mod.get_inventory()
+            self.agent._inv_full = inv
             after = _count_id(inv, iid)
         except Exception:
             after = -1
         if before >= 0 and after >= 0:
             got = max(0, after - before)
+        if got == 0 and not self.last_failure:
+            self.last_failure = "砍树后没有确认到新增木材"
         self.agent.log(f"砍树完成，获得 {got} 木材", "item")
         return got
 
@@ -216,6 +259,8 @@ class LifeEngine:
         - 特殊生物群系水域：丛林/雪地/腐化/神圣/地狱 特有鱼
         鱼饵（蚯蚓/萤火虫/龙虾）是消耗品，use_item 朝水会自动消耗背包鱼饵。
         """
+        self.last_cast_count = 0
+        self.last_failure = ""
         # 选钓竿；没有就跟主人撒娇
         if not await self.select_tool("rod"):
             await self._say_no_tool(
@@ -234,6 +279,7 @@ class LifeEngine:
             # 特殊群系下没水 → 放宽找水范围
             water = await self.agent.mod.find_water(radius=60)
         if not water:
+            self.last_failure = "附近没有水域，找不到钓鱼的地方"
             self.agent.log("附近没有水域，找不到钓鱼的地方~", "warn")
             return False
 
@@ -241,10 +287,12 @@ class LifeEngine:
         wx, wy = int(spot.get("x", 0)), int(spot.get("y", 0))
         # 走到水面旁的岸边
         shore_x = wx + 2  # 站水面格旁边
-        try:
-            await self.agent.navigate_to(shore_x, wy, timeout=15)
-        except Exception:
-            pass
+        if not await self.agent.navigate_to(shore_x, wy, timeout=15):
+            self.last_failure = "无法走到水边，尚未开始钓鱼"
+            return False
+        # 导航途中可能打过怪，重新换回钓竿才能抛竿。
+        if not await self.select_tool("rod"):
+            return False
 
         where = biome or "普通水域"
         self.agent.log(f"找个{where}水边甩一竿~", "life")
@@ -254,17 +302,24 @@ class LifeEngine:
                 break
             # 甩竿（use_item 朝水面，自动消耗背包鱼饵）
             try:
-                await self.agent.mod.use_item(wx, wy)
+                if not await self.agent.mod.use_item(wx, wy):
+                    self.last_failure = "抛竿命令未确认成功"
+                    break
             except Exception:
-                pass
+                self.last_failure = "抛竿命令失败"
+                break
             # 等鱼上钩
             await asyncio.sleep(2.5)
             # 收杆
             try:
-                await self.agent.mod.use_item(wx, wy)
+                if not await self.agent.mod.use_item(wx, wy):
+                    self.last_failure = "收竿命令未确认成功"
+                    break
             except Exception:
-                pass
+                self.last_failure = "收竿命令失败"
+                break
             cast_count += 1
+            self.last_cast_count = cast_count
             await asyncio.sleep(1.0)
             if self.agent.executor and self.agent.executor.should_stop():
                 break

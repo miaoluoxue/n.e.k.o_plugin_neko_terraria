@@ -16,7 +16,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from ..polish.human_timing import HumanTiming
-from .longterm import StandingTask
+from .longterm import LT_BLOCKED, StandingTask
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ class StandingJobs:
         self.agent = agent
         self._following: bool = False  # 迟滞带跟随状态：是否正在追主人
         self.timing = HumanTiming()    # v2.1: 人类化延迟
+        self._last_progress_notice: Dict[str, float] = {}
 
     # ── 交互引擎挂钩 ────────────────────────────
 
@@ -47,6 +48,10 @@ class StandingJobs:
         executor.notify("step_done") 会被 brain.py 的回调拦截，
         转入 InteractionEngine.inject_event("step_done")，推高 speech_urge。
         """
+        now = time.monotonic()
+        if now - self._last_progress_notice.get(kind, 0) < 15:
+            return
+        self._last_progress_notice[kind] = now
         try:
             exe = getattr(self.agent, "executor", None)
             if exe:
@@ -187,6 +192,7 @@ class StandingJobs:
                 if dist <= stop_at:
                     self._following = False
                     task.beat(f"追到主人身边了({int(dist)}格)")
+                    await self.agent.mod.stop_actions()
                     await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
                     continue
 
@@ -221,13 +227,21 @@ class StandingJobs:
                 break
 
             try:
+                if not await self.agent.life.select_tool("pick"):
+                    task.status = LT_BLOCKED
+                    task.beat(self.agent.life.last_failure)
+                    return
                 mining.reset()
                 _iid, got = await mining.mine_target(
                     ore, MINE_BATCH, self.agent.get_state())
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                empty_streak += 1
                 task.beat(f"挖不动：{e}")
+                if empty_streak >= 3:
+                    task.status = LT_BLOCKED
+                    return
                 await asyncio.sleep(self.timing.action_duration(1.5))
                 continue
 
@@ -241,21 +255,11 @@ class StandingJobs:
             else:
                 empty_streak += 1
                 task.beat(f"这附近没{ore}了")
-                # v2.1: 连续挖空 → 主动问主人（不阻塞挖矿循环，回答由 coordinator 匹配）
+                # 连续无进展就退出并走长期任务的受阻回报，不能无限重试。
                 if empty_streak >= 4:
-                    empty_streak = 0
-                    inq_mgr = getattr(self.agent, "inquiry", None)
-                    if inq_mgr and not inq_mgr.has_pending:
-                        inq = inq_mgr.ask(
-                            f"这附近挖不到{ore}了，换个地方还是继续挖？",
-                            options=["换个地方", "继续挖"], timeout=45.0)
-                        if inq:
-                            try:
-                                await self.agent.send_chat(inq.question)
-                            except Exception:
-                                pass
-                            # 后台等回答/超时，避免 pending 永久占位吞掉主人后续指令
-                            self._spawn_inquiry_wait(inq_mgr, inq)
+                    task.status = LT_BLOCKED
+                    task.beat(f"连续尝试后没有采集到{ore}，可能无矿点或路径不可达")
+                    return
                 await asyncio.sleep(self.timing.action_duration(1.0))
             await asyncio.sleep(self.timing.action_duration(0.3))
 
@@ -275,11 +279,20 @@ class StandingJobs:
                 break
 
             try:
-                got = await life.chop_wood(target=MINE_BATCH)
+                iid = self.agent.resolve_item(wood)
+                if iid <= 0:
+                    task.status = LT_BLOCKED
+                    task.beat(f"无法识别要收集的木材：{wood}")
+                    return
+                got = await life.chop_wood(target=MINE_BATCH, item_id=iid)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                empty_streak += 1
                 task.beat(f"砍不动：{e}")
+                if empty_streak >= 3:
+                    task.status = LT_BLOCKED
+                    return
                 await asyncio.sleep(self.timing.action_duration(1.5))
                 continue
 
@@ -292,22 +305,11 @@ class StandingJobs:
                     ore=wood, got=int(got), total=task.progress)
             else:
                 empty_streak += 1
-                task.beat(f"这附近没{wood}了")
-                # v2.1: 连续砍空 → 主动问主人（不阻塞砍树循环，回答由 coordinator 匹配）
-                if empty_streak >= 4:
-                    empty_streak = 0
-                    inq_mgr = getattr(self.agent, "inquiry", None)
-                    if inq_mgr and not inq_mgr.has_pending:
-                        inq = inq_mgr.ask(
-                            f"这附近砍不到{wood}了，换个地方还是继续砍？",
-                            options=["换个地方", "继续砍"], timeout=45.0)
-                        if inq:
-                            try:
-                                await self.agent.send_chat(inq.question)
-                            except Exception:
-                                pass
-                            # 后台等回答/超时，避免 pending 永久占位吞掉主人后续指令
-                            self._spawn_inquiry_wait(inq_mgr, inq)
+                reason = life.last_failure or f"砍树后没有确认到新增{wood}"
+                task.beat(reason)
+                if empty_streak >= 3 or any(w in reason for w in ("工具", "斧头", "背包")):
+                    task.status = LT_BLOCKED
+                    return
                 await asyncio.sleep(self.timing.action_duration(1.0))
             await asyncio.sleep(self.timing.action_duration(0.3))
 
@@ -321,7 +323,7 @@ class StandingJobs:
         3. 原地待命
         """
         lt = self.lt
-        hx, hy = self._me()
+        hx, hy = task.params.setdefault("home", self._me())
         guard_range = int(task.params.get("range", 15))  # 守护半径（从任务参数读取）
         task.note = f"守护半径{guard_range}格"
         combat = self.agent.combat
@@ -338,9 +340,7 @@ class StandingJobs:
                 enemies = state.get("nearby_npcs", [])
                 threat = None
                 for e in enemies:
-                    if int(e.get("damage", 0) or 0) <= 0:
-                        continue
-                    if int(e.get("life", 0) or 0) <= 0:
+                    if not combat.is_hostile(e):
                         continue
                     ex = int(e.get("tile_x", 0) or 0)
                     ey = int(e.get("tile_y", 0) or 0)
@@ -388,6 +388,8 @@ class StandingJobs:
         if kind == "mine" and target in WOOD_WORDS:
             kind = "chop"
             target = "木材"
+        if kind in ("mine", "chop"):
+            self.agent.mining.reset()
         table = {
             "follow": ("跟着主人", self.follow_loop),
             "mine": (f"一直挖{target or '矿'}", self.mine_loop),

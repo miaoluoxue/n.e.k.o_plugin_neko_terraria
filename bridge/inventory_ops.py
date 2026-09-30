@@ -98,9 +98,20 @@ class InventoryOps:
             return False
         if not await self.agent.navigate_to(chest["x"], chest["y"]):
             return False
+        before = await self.mod.get_inventory()
         ok = await self.mod.take_from_chest(chest["x"], chest["y"], iid, stack)
+        await self.mod.collect_items(radius=160, item_id=iid)
+        after = await self.mod.get_inventory()
+        self.agent._inv_full = after
+        def count(inv):
+            return sum(int(it.get("stack", 0) or 0) for k in ("hotbar", "inventory")
+                       for it in inv.get(k, []) if it.get("id") == iid)
+        actual = max(0, count(after) - count(before))
+        ok = ok and actual >= stack
         if ok:
-            self._log(f"从箱子({chest['x']},{chest['y']})取了 {name}×{stack}")
+            self._log(f"从箱子取物后确认背包新增 {name}×{actual}")
+        else:
+            self._log(f"箱子取物未达标：背包新增 {name}×{actual}，要求 {stack}", "warn")
         return ok
 
     # ---------------- 交互 ----------------

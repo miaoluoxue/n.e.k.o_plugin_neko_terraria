@@ -13,7 +13,11 @@ class MotivationSystem:
     def update(self, state: Dict, boredom: float) -> str:
         # 每帧重算：先归零（避免上帧状态残留），再按当前状态打分
         self.scores = {k: 0.0 for k in self.scores}
-        if len(state.get("nearby_npcs", [])) > 0:
+        if any(not npc.get("friendly", False)
+               and not npc.get("townNPC", npc.get("town_npc", False))
+               and int(npc.get("damage", 0) or 0) > 0
+               and int(npc.get("life", 0) or 0) > 0
+               for npc in (state.get("nearby_npcs", []) or [])):
             self.scores["combat"] = 0.9
         if boredom > 0.7:
             self.scores["explore"] = 0.8

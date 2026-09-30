@@ -195,13 +195,15 @@ class GameEventEmitter:
                 self._combat_damage_sum > 0 and self.interaction):
             dmg = self._combat_damage_sum
             kills = self._combat_kill_count
-            enemy = self._combat_enemy_name or "怪物"
+            enemy = self._combat_enemy_name
 
             if kills > 0 and dmg > max_hp * 0.3:
-                text = f"刚才和{enemy}打了一架，掉了{dmg}点血，不过干掉了{kills}只！"
+                text = f"刚才掉了{dmg}点血，不过记录到击败了{kills}只敌人。"
                 self._inject(EventType.COMBAT_SUMMARY, intensity=0.45, description=text)
             elif dmg > max_hp * 0.5:
-                text = f"呜哇刚才被{enemy}打得好惨...掉了{dmg}点血（剩余{cur_hp}）"
+                text = f"刚才掉了{dmg}点血（剩余{cur_hp}）。"
+                if enemy:
+                    text += f"附近有{enemy}，伤害来源尚未确认。"
                 self._inject(EventType.COMBAT_SUMMARY, intensity=0.55, description=text)
 
             self._combat_damage_sum = 0
@@ -284,6 +286,10 @@ class GameEventEmitter:
         # Boss 检测：从 nearby_npcs 识别（mod 不返回 boss_nearby 键）
         boss = ""
         for e in cur.get("nearby_npcs", []) or []:
+            if (e.get("friendly", False)
+                    or e.get("townNPC", e.get("town_npc", False))
+                    or int(e.get("life", 0) or 0) <= 0):
+                continue
             nm = str(e.get("name", "") or "").lower()
             if any(kw in nm for kw in BOSS_KEYWORDS):
                 boss = nm
@@ -384,9 +390,14 @@ class GameEventEmitter:
         best = None
         best_dist = float("inf")
         for n in (nearby or []):
+            if (n.get("friendly", False)
+                    or n.get("townNPC", n.get("town_npc", False))
+                    or int(n.get("damage", 0) or 0) <= 0
+                    or int(n.get("life", 0) or 0) <= 0):
+                continue
             name = str(n.get("name", "") or n.get("display_name", ""))
             dist = n.get("distance", float("inf"))
-            if name and dist < best_dist:
+            if name and (best is None or dist < best_dist):
                 best_dist = dist
                 best = name
         return best or ""

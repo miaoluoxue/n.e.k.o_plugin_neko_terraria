@@ -26,17 +26,19 @@ class ModLink:
     async def hook(self, x: int, y: int) -> None:
         await self.conn.request_mod({"cmd": "hook", "x": x, "y": y})
 
-    async def use_item(self, x: int = -1, y: int = -1) -> None:
+    async def use_item(self, x: int = -1, y: int = -1) -> bool:
         # 带目标坐标（tile 格）：让角色朝向/挥动方向对准目标（战斗/砍树/钓鱼用）
         cmd = {"cmd": "use_item"}
         if x >= 0:
             cmd["target_x"] = x
         if y >= 0:
             cmd["target_y"] = y
-        await self.conn.request_mod(cmd)
+        resp = await self.conn.request_mod(cmd)
+        return bool(resp and resp.get("ok"))
 
-    async def select_item(self, slot: int) -> None:
-        await self.conn.request_mod({"cmd": "select_item", "slot": slot})
+    async def select_item(self, slot: int) -> bool:
+        resp = await self.conn.request_mod({"cmd": "select_item", "slot": slot})
+        return bool(resp and resp.get("ok"))
 
     async def craft(self, item_name: str = "", item_id: int = -1,
                     amount: int = 1) -> int:
@@ -87,8 +89,8 @@ class ModLink:
     async def get_inventory(self) -> Dict[str, Any]:
         # 返回三大类：hotbar(手持栏) / equipped(装备栏) / inventory(主背包)
         resp = await self.conn.request_mod({"cmd": "get_inventory"})
-        if not resp:
-            return {"hotbar": [], "equipped": [], "inventory": []}
+        if not resp or resp.get("error") or resp.get("type") != "inventory":
+            raise ConnectionError("背包状态暂时不可用，不能据此判断缺少工具或物品")
         return {
             "hotbar": resp.get("hotbar", []),
             "equipped": resp.get("equipped", []),
@@ -169,111 +171,93 @@ class ModLink:
             if not isinstance(it, dict):
                 continue
             name = str(it.get("name", "") or "")
-            if "钓竿" in name or "钓竿" in name or "fishing" in name.lower():
-                return int(it.get("inv_slot", -1) or -1)
+            if (int(it.get("fishing_pole", 0) or 0) > 0 or "钓竿" in name
+                    or "鱼竿" in name or "fishing" in name.casefold()):
+                slot = it.get("inv_slot", -1)
+                return int(slot) if slot is not None else -1
         return -1
 
     async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
-        resp = await self.conn.request_mod(
-            {"cmd": "navigate_to", "x": x, "y": y, "timeout": timeout},
-            timeout=timeout + 5)
-        return bool(resp and resp.get("ok"))
+        # 普通导航和流式导航共用可取消的请求管理，爬升也能被 stop_actions 停止。
+        return await self.navigate_async(x, y, timeout=timeout)
 
     # ── v3.0: 流式导航──
     # C# 侧 BFS 寻路 + 逐点执行，通过 nav_* 事件流回传状态
     # （nav_moving/nav_arrived/nav_stuck/nav_timeout），Python 可中断/感知进度
 
+    async def stop_actions(self) -> bool:
+        """停止待发导航及 Mod 中的移动、攻击、挖掘和钩锁控制。"""
+        import asyncio
+
+        tasks = list(getattr(self, "_nav_tasks", set()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        resp = await self.conn.request_mod({"cmd": "stop_actions"}, timeout=3.0)
+        return bool(resp and resp.get("ok"))
+
+    def _track_navigation(self, task):
+        if not hasattr(self, "_nav_tasks"):
+            self._nav_tasks = set()
+        self._nav_tasks.add(task)
+        task.add_done_callback(self._nav_tasks.discard)
+        return task
+
     async def navigate_async(self, x: int, y: int, timeout: int = 20,
                              on_tick=None) -> bool:
-        """流式导航：发 navigate_stream，等 nav_arrived/stuck/timeout 事件确认真正到达。
-
-        ACK 只表示导航已启动，不代表到达——必须等最终 nav 事件。
-        on_tick: 等待期间每 ~0.5s 回调的异步函数。返回 True → 中断导航（返回 False）。
-          导航途中遇敌用：停下打怪，打完由外层决定是否重新导航（参考轮子插件）。
-        """
+        """等待对应 req_id 的最终导航结果，同时每半秒执行环境感知回调。"""
         import asyncio
-        import time as _time
-        callbacks = getattr(self, "_nav_callbacks", None)
-        if callbacks is None:
-            callbacks = set()
-            self._nav_callbacks = callbacks
-        done = asyncio.Event()
-        result = {"event": "nav_timeout"}
 
-        def on_nav(msg):
-            evt = msg.get("event", "")
-            if evt in ("nav_arrived", "nav_stuck", "nav_timeout"):
-                result["event"] = evt
-                done.set()
-
-        callbacks.add(on_nav)
+        request = self._track_navigation(asyncio.create_task(self.conn.request_mod(
+            {"cmd": "navigate_stream", "x": x, "y": y, "timeout": timeout},
+            timeout=timeout + 5)))
         try:
-            resp = await self.conn.request_mod(
-                {"cmd": "navigate_stream", "x": x, "y": y, "timeout": timeout},
-                timeout=timeout + 5)
-            # 导航未启动（no_path/连接问题）直接失败，不等事件
-            if resp is None or not resp.get("ok"):
-                return False
-            deadline = _time.time() + timeout + 5
             while True:
-                remaining = deadline - _time.time()
-                if remaining <= 0:
-                    result["event"] = "nav_timeout"
-                    break
-                try:
-                    await asyncio.wait_for(done.wait(),
-                                           timeout=min(0.5, remaining))
-                    if result["event"] in ("nav_arrived", "nav_stuck",
-                                           "nav_timeout"):
-                        break
-                    done.clear()
-                except asyncio.TimeoutError:
-                    done.clear()
-                # 等待期间对外部开放：让调用方感知环境（遇敌可中断）
+                done, _ = await asyncio.wait({request}, timeout=0.5)
+                if done:
+                    if request.cancelled():
+                        return False
+                    resp = request.result()
+                    return bool(resp and resp.get("ok"))
                 if on_tick is not None:
                     try:
-                        interrupt = await on_tick()
-                        if interrupt:
-                            # 发一条新导航接管 C# 路径代际，清掉旧路径
-                            try:
-                                await self.conn.request_mod(
-                                    {"cmd": "navigate_stream", "x": x, "y": y,
-                                     "timeout": 1}, timeout=1)
-                            except Exception:
-                                pass
+                        if await on_tick():
+                            await self.stop_actions()
                             return False
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         pass
-            return result["event"] == "nav_arrived"
-        except asyncio.TimeoutError:
-            return False
+        except asyncio.CancelledError:
+            await self.stop_actions()
+            raise
         finally:
-            callbacks.discard(on_nav)
+            if not request.done():
+                request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
 
     async def navigate_stream_fire(self, x: int, y: int) -> None:
-        """流式导航 fire-and-forget：发 navigate_stream 不等事件/ACK。
-
-        跟随场景用：每轮实时更新目标（C# 侧路径代际接管，旧任务不误清），
-        C# 侧全程走完才回 ACK——这里不阻塞等待，发完立即返回，
-        调用方（follow_loop）每轮不再被 1.5s 超时拖住。
-        """
+        """替换上次后台导航；保存任务供停止操作取消，避免残留请求继续接管。"""
         import asyncio
-        conn = self.conn
+
+        previous = getattr(self, "_nav_fire_task", None)
+        if previous is not None and not previous.done():
+            if getattr(self, "_nav_fire_target", None) == (x, y):
+                return
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
 
         async def _fire():
             try:
-                await conn.request_mod(
+                await self.conn.request_mod(
                     {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
-                    timeout=1.5)
+                    timeout=25.0)
             except Exception:
                 pass
 
-        try:
-            asyncio.get_running_loop().create_task(_fire())
-        except Exception:
-            pass
+        self._nav_fire_target = (x, y)
+        self._nav_fire_task = self._track_navigation(asyncio.create_task(_fire()))
 
     def _on_nav_event(self, msg: dict) -> None:
         """agent 转发 nav_* 事件到此（connection → agent._handle_mod_event → 这里）。"""
@@ -305,7 +289,7 @@ class ModLink:
         resp = await self.conn.request_mod({"cmd": "get_capabilities"})
         return resp if resp else {}
 
-    async def collect_items(self, radius: int = 600) -> int:
+    async def collect_items(self, radius: int = 600, item_id: Optional[int] = None) -> int:
         """收集附近掉落物品
 
         Args:
@@ -314,8 +298,10 @@ class ModLink:
         Returns:
             收集到的物品数量
         """
-        resp = await self.conn.request_mod(
-            {"cmd": "collect_items", "radius": radius}, timeout=5.0)
+        cmd = {"cmd": "collect_items", "radius": radius}
+        if item_id is not None and item_id > 0:
+            cmd["item_id"] = int(item_id)
+        resp = await self.conn.request_mod(cmd, timeout=5.0)
         return int(resp.get("collected", 0)) if resp else 0
 
     async def dig_tile(self, x: int, y: int, timeout: float = 5.0) -> bool:
@@ -374,12 +360,16 @@ class ModLink:
             "life": p.get("hp", 0),
             "x": p.get("x", 0), "y": p.get("y", 0),
             "tile_x": p.get("tileX", 0), "tile_y": p.get("tileY", 0),
+            "alive": p.get("alive", p.get("hp", 0) > 0),
             "velocity_x": p.get("velocityX", 0), "velocity_y": p.get("velocityY", 0),
             "grounded": p.get("grounded", True),
             "nearby_npcs": [
                 {"name": n.get("name", ""), "slot": n.get("slot", 0),
-                 "life": n.get("life", 0), "tile_x": n.get("tileX", 0),
-                 "tile_y": n.get("tileY", 0), "damage": n.get("damage", 0)}
+                 "type": n.get("type", 0), "life": n.get("life", 0),
+                 "alive": n.get("alive", n.get("life", 0) > 0),
+                 "friendly": n.get("friendly", False), "townNPC": n.get("townNPC", False),
+                 "tile_x": n.get("tileX", 0), "tile_y": n.get("tileY", 0),
+                 "damage": n.get("damage", 0)}
                 for n in npcs
             ],
             "nearby_players": [

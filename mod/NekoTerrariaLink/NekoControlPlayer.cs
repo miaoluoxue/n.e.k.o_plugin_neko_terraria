@@ -32,6 +32,19 @@ namespace NekoTerrariaLink
         public int navGen;   // 路径代际：fire-and-forget 导航防旧任务误清新路径
         public int digTargetX = -1, digTargetY = -1;   // 原生物品挖掘目标（挖掘目标修正）
 
+        internal void StopControls()
+        {
+            navGen++;
+            navPath = null;
+            navIdx = moveDir = jumpTicks = useTicks = hookTicks = _jumpFrames = 0;
+            useSlot = digTargetX = digTargetY = -1;
+            Player.controlLeft = Player.controlRight = Player.controlJump = false;
+            Player.controlDown = Player.controlUseItem = Player.controlHook = false;
+        }
+
+        private bool IsControlled => Player.whoAmI == Main.myPlayer
+            && NekoTerrariaLink.Instance?.HasBridgeClient == true;
+
         // ── 导航控制注入 ──
         // 联机模式下移动由服务器结算：客户端通过 NetMessage.SendData(13)（control 包）
         // 把 control 状态发给服务器。PreUpdateMovement（UpdateMovement 开头）注入的
@@ -41,12 +54,14 @@ namespace NekoTerrariaLink
         public override void SetControls()
         {
             var p = Player;
+            if (!IsControlled) return;
             // AI 角色只响应注入，不响应真实键盘：AI 窗口被点击/激活时，
             // 玩家的按键（WASD/空格）不得同时控制 AI 角色。
             p.controlLeft = p.controlRight = p.controlJump = p.controlDown = false;
+            p.controlUseItem = p.controlHook = false;
             try
             {
-                if (_diagFrame % 60 == 0)
+                if (_diagFrame++ % 60 == 0)
                 {
                     ModContent.GetInstance<NekoTerrariaLink>().Logger.Info(
                         $"[SC] called nav={navPath != null} idx={navIdx} moveDir={moveDir} " +
@@ -54,7 +69,7 @@ namespace NekoTerrariaLink
                         $"mount={p.mount.Active} hook={p.grappling[0]} hasFocus={Main.hasFocus}");
                 }
                 // 移动改为 velocity 直驱（PreUpdateMovement）——SetControls 只负责键盘隔离
-                if (_diagFrame % 60 == 0)
+                if (_diagFrame % 60 == 1)
                 {
                     ModContent.GetInstance<NekoTerrariaLink>().Logger.Info(
                         $"[SC] 注入后 cL={p.controlLeft} cR={p.controlRight} cJ={p.controlJump}");
@@ -73,12 +88,23 @@ namespace NekoTerrariaLink
         public override void PostUpdateRunSpeeds()
         {
             var p = Player;
-            if (p.whoAmI != Main.myPlayer) return;
+            if (!IsControlled) return;
+            // 与 LumiBridge 相同，在 ResetControls 之后、原生物品/移动逻辑之前注入。
+            p.controlUseItem = useTicks > 0;
+            p.controlHook = hookTicks > 0;
+            if (useTicks > 0)
+            {
+                if (useSlot >= 0 && useSlot < p.inventory.Length) p.selectedItem = useSlot;
+                AimAtTarget();
+                useTicks--;
+            }
+            if (hookTicks > 0) hookTicks--;
             if (navPath != null && navIdx < navPath.Count)
             {
                 int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
                 var g = navPath[navIdx];
-                if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2)
+                if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2
+                    && (g.Jump == 0 || py <= g.Y))
                 {
                     navIdx++;
                     if (navIdx >= navPath.Count)
@@ -95,7 +121,7 @@ namespace NekoTerrariaLink
                 else if (dx > 0) p.controlRight = true;
 
                 // 跳跃：路径点编码 Jump 高度 → 帧表精确按帧（mod 原生能力）
-                if (dy < -2 && _jumpFrames <= 0 && g.Jump > 0)
+                if (dy < 0 && _jumpFrames <= 0 && g.Jump > 0 && p.velocity.Y == 0f)
                 {
                     var tbl = JumpFrameTable();
                     int h = Math.Min(g.Jump + (NekoTerrariaLink.IsPlatform(g.X, g.Y + 1) ? 2 : 0), tbl.Length - 1);
@@ -121,6 +147,7 @@ namespace NekoTerrariaLink
         public override void PreUpdateMovement()
         {
             var p = Player;
+            if (!IsControlled) return;
             if (navPath != null && navIdx < navPath.Count)
             {
                 if (_diagFrame++ % 60 == 0)
@@ -132,13 +159,6 @@ namespace NekoTerrariaLink
                 }
                 NavStepVelocity(p);   // 后备 velocity 直驱（control 注入为主）
             }
-            if (useTicks > 0)
-            {
-                if (useSlot >= 0) p.selectedItem = useSlot;
-                p.controlUseItem = true;
-                useTicks--;
-            }
-            if (hookTicks > 0) { p.controlHook = true; hookTicks--; }
             // 面向目标：近战挥动/挖掘方向对准目标（战斗时人物不动也朝怪方向砍）
             if (digTargetX >= 0 && digTargetY >= 0)
             {
@@ -155,7 +175,8 @@ namespace NekoTerrariaLink
             if (navPath == null || navIdx >= navPath.Count) return;
             int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
             var g = navPath[navIdx];
-            if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2)
+            if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2
+                && (g.Jump == 0 || py <= g.Y))
             {
                 navIdx++;
                 if (navIdx >= navPath.Count)
@@ -215,13 +236,23 @@ namespace NekoTerrariaLink
         /// 配合 controlUseItem 使用原生物品（镐子动画/消耗/工具属性）。</summary>
         public override bool PreItemCheck()
         {
-            if (Player.whoAmI != Main.myPlayer) return true;
-            if (digTargetX >= 0 && digTargetY >= 0)
+            if (!IsControlled) return true;
+            if (Player.controlUseItem && digTargetX >= 0 && digTargetY >= 0)
             {
+                AimAtTarget();
                 Player.tileTargetX = digTargetX;
                 Player.tileTargetY = digTargetY;
             }
             return true;
+        }
+
+        private void AimAtTarget()
+        {
+            if (digTargetX < 0 || digTargetY < 0) return;
+            Main.mouseX = (int)(digTargetX * 16f + 8f - Main.screenPosition.X);
+            Main.mouseY = (int)(digTargetY * 16f + 8f - Main.screenPosition.Y);
+            int dx = digTargetX - (int)(Player.Center.X / 16f);
+            if (dx != 0) Player.direction = Math.Sign(dx);
         }
 
         public override void OnHurt(Player.HurtInfo info)

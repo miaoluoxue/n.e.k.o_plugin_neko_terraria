@@ -45,7 +45,6 @@ class GoalToolsMixin:
         # 完成/进度由 brain 的 executor 回调（task_done/step_done）异步推回宿主
         # LLM——对齐 minecraft 插件的 minecraft_task 模式，LLM 回合不被长任务
         # 阻塞（"挖10个铁"可能耗时几十秒，同步 await 会让宿主 LLM 工具回合挂死）。
-        import asyncio
         self._agent.logger.info(f"[llm_command] 📥 收到指令(受理): {text}")
 
         async def _dispatch() -> None:
@@ -67,6 +66,9 @@ class GoalToolsMixin:
                 res = await self._agent.command(text, source="owner")
             except Exception as e:
                 self._agent.logger.warning(f"[llm_command] 执行异常: {e}")
+                await self._agent.speak(
+                    f"[指令受阻] 「{text}」未能执行：{e}。请如实向主人说明，不要自动重派。",
+                    ai_behavior="respond")
                 return
             mode = str(res.get("mode", "") or "")
             if mode == "chat":
@@ -86,7 +88,8 @@ class GoalToolsMixin:
                 # 无 executor 事件 → read 回读，让宿主 LLM 如实知道"没做/做不了"
                 try:
                     await self._agent.speak(
-                        f"[指令结果] {out}", ai_behavior="read")
+                        f"[指令受阻] {out}。请根据事实向主人说明原因，不要自动重派旧任务。",
+                        ai_behavior="respond")
                 except Exception:
                     pass
                 return
@@ -100,13 +103,13 @@ class GoalToolsMixin:
                 pass
 
         try:
-            asyncio.get_running_loop().create_task(_dispatch())
+            self._agent._spawn_background_task(_dispatch())
         except Exception as e:
             self._agent.logger.warning(f"[llm_command] 派发失败: {e}")
             return Ok({"output": f"指令派发失败喵（{e}）"})
         return Ok({
-            "output": f"✅ 已受理：『{text}』。任务正在执行，进度/结果会随系统消息汇报，"
+            "output": f"已收到：『{text}』，正在解析，尚未确认可执行。实际进度/结果会随系统消息汇报，"
                       f"不要自行宣称完成。",
-            "status": "running",
+            "status": "accepted",
             "note": "fire-and-forget：本工具立即返回，真实结果稍后异步到达。"
         })

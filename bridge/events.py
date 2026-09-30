@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from .executor import SRC_AUTO
+
 RETREAT_HP_RATIO = 0.5
 
 
@@ -33,9 +35,11 @@ class EventResponder:
     async def _on_boss_spawned(self, data: Any) -> None:
         name = data.get("name", "未知Boss") if isinstance(data, dict) else "未知Boss"
         st = self.agent.get_state()
-        hp = int(st.get("hp", 100) or 100)
+        hp = int(st.get("hp", 0) or 0)
         mx = int(st.get("max_life", 100) or 100) or 100
         self._remember("世界-Boss出现", f"{name} 出现了")
+        if not st or hp <= 0 or st.get("alive") is False:
+            return
         if mx and hp / mx < RETREAT_HP_RATIO:
             await self._push(f"主人，{name}出现了！我只有{hp}/{mx}血，先躲远点保命~")
             await self._retreat(name, st)
@@ -55,6 +59,8 @@ class EventResponder:
         bx, by = None, None
         best_d = 1 << 30
         for n in (st.get("nearby_npcs", []) or []):
+            if hasattr(self.agent, "combat") and not self.agent.combat.is_hostile(n):
+                continue
             nx = int(n.get("tile_x", n.get("tileX", 0)) or 0)
             ny = int(n.get("tile_y", n.get("tileY", 0)) or 0)
             nm = str(n.get("name", "") or "")
@@ -67,13 +73,23 @@ class EventResponder:
         if bx is None or by is None:
             return  # 状态里没有敌人信息，不乱跑
         # 反方向跑开（远离 Boss）
-        dx = (mx - bx) or 1
-        dy = (my - by) or 0
-        norm = max(abs(dx), abs(dy), 1)
-        tx = mx + (dx // norm) * 15
-        ty = my + (dy // norm) * 15
+        tx = mx + (15 if mx >= bx else -15)
+        ty = my
         try:
-            await self.agent.mod.navigate_async(tx, ty, timeout=6)
+            cancel = getattr(self.agent, "cancel_autonomous_actions", None)
+            if cancel:
+                await cancel()
+
+            async def retreat_work(_info):
+                current = self.agent.get_state()
+                if not current or int(current.get("hp", 0) or 0) <= 0:
+                    return {"ok": False, "output": "角色当前无法移动"}
+                moved = await self.agent.mod.navigate_async(tx, ty, timeout=6)
+                return {"ok": moved, "output": "已拉开距离" if moved else "撤退路线受阻"}
+
+            # 事件响应也使用受管任务槽，主人喊停能取消，长期动作会先让路。
+            if not self.agent.executor.busy():
+                await self.agent.executor.run("躲避Boss", retreat_work, source=SRC_AUTO)
         except Exception:
             pass
 

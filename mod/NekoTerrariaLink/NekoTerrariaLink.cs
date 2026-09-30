@@ -29,12 +29,16 @@ namespace NekoTerrariaLink
 
         private TcpListener _listener;
         private Thread _listenThread;
+        private volatile bool _running;
+        private volatile TcpClient _activeClient;
+        private int _navigationGeneration;
         private readonly object _lock = new object();
         private readonly Queue<(string, NetworkStream)> _cmdQueue = new();
         private readonly object _cmdLock = new object();
 
         // 当前活跃的 Python 客户端流（事件推送目标）；ListenLoop accept/断开时更新
         private volatile NetworkStream _activeStream = null;
+        internal bool HasBridgeClient => _activeStream != null;
 
         // ── 事件监控状态（PostUpdate 每帧 edge 检测） ──
         private bool _prevAlive = false;        // 上帧玩家存活
@@ -71,6 +75,7 @@ namespace NekoTerrariaLink
         public override void Load()
         {
             Instance = this;
+            _running = true;
             // 诊断：确认程序集内类型（排查 ModSystem/ModPlayer 未注册）
             try
             {
@@ -161,7 +166,11 @@ namespace NekoTerrariaLink
 
         public override void Unload()
         {
+            _running = false;
             try { _listener?.Stop(); } catch { }
+            try { _activeClient?.Close(); } catch { }
+            Interlocked.Increment(ref _navigationGeneration);
+            try { StopActions(); } catch { }
             _activeStream = null;
             Instance = null;
         }
@@ -271,7 +280,9 @@ namespace NekoTerrariaLink
                                 ["life"] = npc.life,
                                 ["tileX"] = (int)(npc.Center.X / 16),
                                 ["tileY"] = (int)(npc.Center.Y / 16),
-                                ["damage"] = npc.damage });
+                                ["damage"] = npc.damage, ["type"] = npc.type,
+                                ["friendly"] = npc.friendly, ["townNPC"] = npc.townNPC,
+                                ["alive"] = npc.life > 0 });
                     }
                 }
                 // 附近玩家（300 格内，非自身，坐标有效）
@@ -577,47 +588,54 @@ namespace NekoTerrariaLink
 
         private void ListenLoop()
         {
-            while (true)
+            while (_running)
             {
+                NetworkStream stream = null;
                 try
                 {
                     Logger.Info("[TCP] 等待 Python 桥接客户端连接...");
                     using var client = _listener.AcceptTcpClient();
+                    _activeClient = client;
+                    client.NoDelay = true;
+                    client.SendTimeout = 3000;
                     Logger.Info("[TCP] 客户端已连接");
 
                     // ── 握手：先发 welcome，让 Python 确认字节流是干净的 ──
-                    var stream = client.GetStream();
-                    _activeStream = stream;   // 事件推送目标（volatile）
+                    stream = client.GetStream();
                     SendRawUtf8(stream, "{\"welcome\":true}\n");
+                    _activeStream = stream;   // 握手完成后才允许并行推送事件
                     Logger.Info("[TCP] 已发送 welcome 握手");
 
-                    var buf = new byte[4096];
-                    var sb = new StringBuilder();
-                    int n;
-                    while ((n = stream.Read(buf, 0, buf.Length)) > 0)
+                    // StreamReader 保留跨 TCP 包的 UTF-8 解码状态，中文不会被截断。
+                    using var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, true);
+                    string line;
+                    while (_running && (line = reader.ReadLine()) != null)
                     {
-                        // 诊断：打印收到的原始字节（前200字符），方便排查串行化问题
-                        string rawChunk = Encoding.UTF8.GetString(buf, 0, Math.Min(n, 200));
-                        Logger.Info($"[TCP] 收到 {n} 字节: 【{rawChunk.Replace("\n","\\n").Replace("\r","\\r")}】");
-                        sb.Append(Encoding.UTF8.GetString(buf, 0, n));
-                        string text = sb.ToString();
-                        int idx;
-                        while ((idx = text.IndexOf('\n')) >= 0)
-                        {
-                            string line = text.Substring(0, idx).Trim();
-                            text = text.Substring(idx + 1);
-                            if (line.Length > 0) HandleLine(line, stream);
-                        }
-                        sb.Clear(); sb.Append(text);
+                        line = line.Trim();
+                        if (line.Length > 0) HandleLine(line, stream);
                     }
                     if (ReferenceEquals(_activeStream, stream))
                         _activeStream = null;
+                    _activeClient = null;
                     Logger.Info("[TCP] 客户端已断开，等待重连...");
                 }
                 catch (Exception ex)
                 {
+                    if (!_running) break;
                     Logger.Warn($"[TCP] 连接异常: {ex.Message}");
                     Thread.Sleep(500);
+                }
+                finally
+                {
+                    if (ReferenceEquals(_activeStream, stream)) _activeStream = null;
+                    _activeClient = null;
+                    int generation = Interlocked.Increment(ref _navigationGeneration);
+                    if (_running)
+                        Main.QueueMainThreadAction(() =>
+                        {
+                            if (generation == Volatile.Read(ref _navigationGeneration) && _activeStream == null)
+                                StopActions();
+                        });
                 }
             }
         }
@@ -630,12 +648,19 @@ namespace NekoTerrariaLink
 
         // #6: 把改世界/玩家/物品的命令投到主线程执行，避免 TCP 后台线程
         // 操作 Terraria 主线程数据（WorldGen/QuickSpawnItem/player.armor 等）导致崩溃。
-        private void RunOnMain(NetworkStream s, long reqId, Func<bool> fn)
+        private void RunOnMain(NetworkStream s, long reqId, Func<bool> fn, bool expires = true)
         {
+            long deadline = expires ? Environment.TickCount64 + 3000 : long.MaxValue;
             Main.QueueMainThreadAction(() =>
             {
                 try
                 {
+                    if (!ReferenceEquals(_activeStream, s)) return;
+                    if (Environment.TickCount64 >= deadline)
+                    {
+                        SendAck(s, reqId, false);
+                        return;
+                    }
                     SendAck(s, reqId, fn());
                 }
                 catch
@@ -666,7 +691,14 @@ namespace NekoTerrariaLink
                     if (rid > 0 && d.GetValue("type") != "event")
                         Logger.Info($"[Send] req_id={rid} len={bytes.Length}");
                 }
-                catch { }
+                catch
+                {
+                    if (ReferenceEquals(_activeStream, s))
+                    {
+                        _activeStream = null;
+                        try { _activeClient?.Close(); } catch { }
+                    }
+                }
             }
         }
 
@@ -755,12 +787,19 @@ namespace NekoTerrariaLink
 
                 switch (type)
                 {
-                    // #6: 只改 ModPlayer 字段（move/hook）后台线程安全，保留原样；
-                    // 操作世界/玩家/物品/箱子的命令必须投主线程。
-                    case "move": SendAck(stream, reqId, Move(cmd)); break;
+                    // 玩家控制与世界/背包修改统一由主线程执行。
+                    case "move":
+                        Interlocked.Increment(ref _navigationGeneration);
+                        RunOnMain(stream, reqId, () => Move(cmd));
+                        break;
+                    case "stop_actions":
+                    case "cancel_navigate":
+                        Interlocked.Increment(ref _navigationGeneration);
+                        RunOnMain(stream, reqId, StopActions, expires: false);
+                        break;
                     case "place_tile": RunOnMain(stream, reqId, () => PlaceTile(cmd)); break;
                     case "break_tile": RunOnMain(stream, reqId, () => BreakTile(cmd)); break;
-                    case "hook": SendAck(stream, reqId, Hook(cmd)); break;
+                    case "hook": RunOnMain(stream, reqId, () => Hook(cmd)); break;
                     case "use_item": RunOnMain(stream, reqId, () => UseItem(cmd)); break;
                     case "select_item": RunOnMain(stream, reqId, () => SelectItem(cmd)); break;
                     case "craft": CraftAsync(stream, reqId, cmd); break;
@@ -819,6 +858,7 @@ namespace NekoTerrariaLink
             var dirs = cmd.GetArray("dirs") ?? new List<string> { cmd.GetValue("direction") };
             var ctrl = Main.LocalPlayer?.GetModPlayer<NekoControlPlayer>();
             if (ctrl == null) return false;
+            ctrl.StopControls();
             ctrl.moveDir = 0;
             foreach (var d in dirs)
             {
@@ -831,6 +871,15 @@ namespace NekoTerrariaLink
                     case "down": case "stop": ctrl.moveDir = 0; break;
                 }
             }
+            return true;
+        }
+
+        private bool StopActions()
+        {
+            var player = Main.LocalPlayer;
+            var ctrl = player?.GetModPlayer<NekoControlPlayer>();
+            if (ctrl == null) return false;
+            ctrl.StopControls();
             return true;
         }
 
@@ -932,7 +981,9 @@ namespace NekoTerrariaLink
         private bool SelectItem(Dict cmd)
         {
             int slot = (int)cmd.GetNum("slot");
-            Main.LocalPlayer.selectedItem = slot;
+            var player = Main.LocalPlayer;
+            if (player == null || slot < 0 || slot >= player.inventory.Length) return false;
+            player.selectedItem = slot;
             return true;
         }
 
@@ -1191,12 +1242,13 @@ namespace NekoTerrariaLink
         {
             int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
             int timeout = (int)(cmd.GetNum("timeout") > 0 ? cmd.GetNum("timeout") : 15);
-            Task.Run(() => NavigateSync(s, tx, ty, timeout, reqId));
+            int generation = Interlocked.Increment(ref _navigationGeneration);
+            Task.Run(() => NavigateSync(s, tx, ty, timeout, reqId, generation));
         }
 
-        private void NavigateSync(NetworkStream s, int tx, int ty, int timeout, long reqId)
+        private void NavigateSync(NetworkStream s, int tx, int ty, int timeout, long reqId, int generation)
         {
-            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: false);
+            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: false, generation);
         }
 
         /// <summary>导航监控（带兜底）：后台线程监控 + 主线程 BFS。
@@ -1208,11 +1260,11 @@ namespace NekoTerrariaLink
         /// 2. 后台循环只监控（读 player.Center 可接受旧值，不会崩）
         /// 3. 全程 try/catch：任何异常都回错误响应（reason=nav_exception），不再静默
         /// </summary>
-        private void MonitorNav(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents)
+        private void MonitorNav(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents, int generation)
         {
             try
             {
-                MonitorNavInner(s, tx, ty, timeout, reqId, streamEvents);
+                MonitorNavInner(s, tx, ty, timeout, reqId, streamEvents, generation);
             }
             catch (Exception ex)
             {
@@ -1223,7 +1275,7 @@ namespace NekoTerrariaLink
             }
         }
 
-        private void MonitorNavInner(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents)
+        private void MonitorNavInner(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents, int generation)
         {
             var player = Main.LocalPlayer;
             if (player == null)
@@ -1250,13 +1302,17 @@ namespace NekoTerrariaLink
             {
                 try
                 {
+                    if (generation != Volatile.Read(ref _navigationGeneration)) return;
+                    ctrl.navPath = null;
+                    ctrl.moveDir = 0;
                     path = FindPathAStar(sx, sy, tx, tyFeet);
+                    if (generation != Volatile.Read(ref _navigationGeneration)) return;
                     if (path != null && path.Count > 0)
                     {
                         ctrl.navPath = path;
                         ctrl.navIdx = 0;
                         ctrl.jumpTicks = 0;
-                        ctrl.navGen++;   // 路径代际：新导航接管（fire-and-forget 防旧任务误清）
+                        ctrl.navGen = generation;
                     }
                 }
                 catch (Exception ex)
@@ -1264,11 +1320,17 @@ namespace NekoTerrariaLink
                     bfsError = true;
                     bfsErr = ex.Message;
                 }
-                bfsDone = true;
+                finally { Volatile.Write(ref bfsDone, true); }
             });
-            for (int i = 0; i < 300 && !bfsDone; i++) Thread.Sleep(10);  // 最多等 3s
-            if (!bfsDone)
+            for (int i = 0; i < 300 && !Volatile.Read(ref bfsDone); i++) Thread.Sleep(10);
+            if (generation != Volatile.Read(ref _navigationGeneration))
             {
+                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "cancelled" });
+                return;
+            }
+            if (!Volatile.Read(ref bfsDone))
+            {
+                Interlocked.CompareExchange(ref _navigationGeneration, generation + 1, generation);
                 Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "bfs_timeout" });
                 return;
             }
@@ -1292,7 +1354,7 @@ namespace NekoTerrariaLink
             if (streamEvents) SendNavEvent(s, "nav_started", sx, sy);
 
             // ── 后台监控循环（只读 player.Center，可接受旧值） ──
-            int myGen = ctrl.navGen;   // 本任务代际：被新导航接管时不清理路径
+            int myGen = generation;
             int steps = 0, maxSteps = timeout * 10;
             int stuckCounter = 0, lastPx = 0, lastPy = 0;
             while (steps < maxSteps)
@@ -1300,8 +1362,9 @@ namespace NekoTerrariaLink
                 // #8: 被新导航接管（代际变化）→ 立即退出本线程，不再发 nav_* 事件。
                 // 否则僵尸监控线程会在后续 20s 内继续推 nav_moving/stuck/arrived，
                 // 导致 Python 侧 navigate_async 跨导航互相误判到达/超时，且 TCP 事件风暴。
-                if (ctrl.navGen != myGen)
+                if (ctrl.navGen != myGen || myGen != Volatile.Read(ref _navigationGeneration))
                 {
+                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "cancelled" });
                     return;
                 }
                 int px = (int)(player.Center.X / 16), py = (int)(player.Bottom.Y / 16);
@@ -1319,7 +1382,7 @@ namespace NekoTerrariaLink
                     int dir = tx > px ? 1 : -1;
                     if (!IsStandable(px + dir, py + 1))
                     {
-                        if (!TryBridge(px, py, dir)) TryHook(dir);
+                        if (!TryBridge(px, py, dir, myGen)) TryHook(dir, myGen);
                     }
                 }
                 // 卡住：5s 基本未动（波动<=1格容忍撞墙抖动）→ stuck；中途垫土一次
@@ -1334,7 +1397,7 @@ namespace NekoTerrariaLink
                         Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "stuck", ["x"] = px, ["y"] = py });
                         return;
                     }
-                    if (stuckCounter == 25) TryStepUp(px, py);
+                    if (stuckCounter == 25) TryStepUp(px, py, myGen);
                 }
                 else { stuckCounter = 0; lastPx = px; lastPy = py; }
                 Thread.Sleep(100);
@@ -1356,12 +1419,13 @@ namespace NekoTerrariaLink
         {
             int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
             int timeout = (int)(cmd.GetNum("timeout") > 0 ? cmd.GetNum("timeout") : 20);
-            Task.Run(() => NavigateStreamSync(s, tx, ty, timeout, reqId));
+            int generation = Interlocked.Increment(ref _navigationGeneration);
+            Task.Run(() => NavigateStreamSync(s, tx, ty, timeout, reqId, generation));
         }
 
-        private void NavigateStreamSync(NetworkStream s, int tx, int ty, int timeout, long reqId)
+        private void NavigateStreamSync(NetworkStream s, int tx, int ty, int timeout, long reqId, int generation)
         {
-            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: true);
+            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: true, generation);
         }
 
         /// <summary>推导航状态事件（走现有事件通道，Python 侧 bus.fire 分发）。</summary>
@@ -1423,7 +1487,7 @@ namespace NekoTerrariaLink
         /// <summary>该格可站立（feet 语义：脚下有实心或平台支撑）。</summary>
         internal static bool IsStandable(int x, int y)
         {
-            return IsSolid(x, y + 1) || IsPlatform(x, y + 1);
+            return (IsSolid(x, y + 1) || IsPlatform(x, y + 1)) && BodyFits(x, y);
         }
 
         /// <summary>2x3 体宽检查：站立行 + 上方两行在该列无实心。</summary>
@@ -1595,12 +1659,10 @@ namespace NekoTerrariaLink
         {
             if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) return false;
             var t = Main.tile[x, y];
-            if (t == null || !t.HasTile) return false;
+            if (t == null || !t.HasTile || t.IsActuated) return false;
             int type = t.TileType;
-            // 门（10/11/388/389）、平台（19）、笼子（51/52/382/385/387）可穿过（三分类）
-            if (type == 10 || type == 11 || type == 19 || type == 51 || type == 52
-                || type == 382 || type == 385 || type == 387 || type == 388 || type == 389) return false;
-            return true;
+            // 按实际碰撞表规划：闭门不能穿过，装饰物/绳索不会被当作墙。
+            return Main.tileSolid[type] && !Main.tileSolidTop[type];
         }
 
         /// <summary>OneWay 平台（可站立、可按↓穿过）——按生存循环惯例 的 Tile 三分类。</summary>
@@ -1608,17 +1670,18 @@ namespace NekoTerrariaLink
         {
             if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) return false;
             var t = Main.tile[x, y];
-            if (t == null || !t.HasTile) return false;
+            if (t == null || !t.HasTile || t.IsActuated) return false;
             return Main.tileSolid[t.TileType] && Main.tileSolidTop[t.TileType];
         }
 
-        private bool TryBridge(int px, int py, int dir)
+        private bool TryBridge(int px, int py, int dir, int generation)
         {
             int bx = px + dir, by = py + 1;
             if (IsStandable(bx, by)) return false;
             bool placed = false;
             Main.QueueMainThreadAction(() =>
             {
+                if (generation != Volatile.Read(ref _navigationGeneration)) return;
                 placed = WorldGen.PlaceTile(bx, by, 0, false, false, -1, 0);
                 if (placed) SyncTile(bx, by, 0);   // 联机广播铺路
             });
@@ -1626,12 +1689,13 @@ namespace NekoTerrariaLink
             return placed;
         }
 
-        private bool TryStepUp(int px, int py)
+        private bool TryStepUp(int px, int py, int generation)
         {
             bool placed = false;
             int ty = py + 1;   // 实际垫土的目标 y
             Main.QueueMainThreadAction(() =>
             {
+                if (generation != Volatile.Read(ref _navigationGeneration)) return;
                 if (!IsStandable(px, py + 1))
                 {
                     placed = WorldGen.PlaceTile(px, py + 1, 0, false, false, -1, 0);
@@ -1648,13 +1712,17 @@ namespace NekoTerrariaLink
             return placed;
         }
 
-        private bool TryHook(int dir)
+        private bool TryHook(int dir, int generation)
         {
-            var player = Main.LocalPlayer;
-            if (player == null || !HasHook(player)) return false;
-            player.controlHook = true;
-            Thread.Sleep(400);
-            player.controlHook = false;
+            if (generation != Volatile.Read(ref _navigationGeneration)) return false;
+            Main.QueueMainThreadAction(() =>
+            {
+                if (generation != Volatile.Read(ref _navigationGeneration)) return;
+                var player = Main.LocalPlayer;
+                if (player == null || !HasHook(player)) return;
+                var ctrl = player.GetModPlayer<NekoControlPlayer>();
+                if (ctrl != null) ctrl.hookTicks = 24;
+            });
             return true;
         }
 
@@ -1686,26 +1754,40 @@ namespace NekoTerrariaLink
             // 之前是 QuickSpawnItem 凭空生成（作弊），不检查/扣除材料。
             // Recipe/背包主线程数据（命令在监听线程执行）
             int id = (int)cmd.GetNum("item_id");
-            int amount = (int)(cmd.GetNum("amount") > 0 ? cmd.GetNum("amount") : 1);
+            int amount = cmd.Has("amount") ? (int)cmd.GetNum("amount") : 1;
+            if (id <= 0 || id >= ItemLoader.ItemCount || amount <= 0)
+            {
+                SendCraft(s, reqId, 0);
+                return;
+            }
+            long deadline = Environment.TickCount64 + 5000;
             Main.QueueMainThreadAction(() =>
             {
                 int crafted = 0;
                 try
                 {
+                    if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline)
+                    { SendCraft(s, reqId, 0); return; }
                     var player = Main.LocalPlayer;
                     if (player == null) { Send(s, new Dict { ["req_id"] = reqId, ["crafted"] = 0 }); return; }
-                    // 查配方
+                    // 必须是原生当前可用配方（站台、环境、Mod 条件均参与判断）。
+                    Recipe.FindRecipes();
                     Recipe recipe = null;
-                    for (int i = 0; i < Recipe.numRecipes; i++)
+                    int recipeIndex = -1;
+                    for (int i = 0; i < Main.numAvailableRecipes; i++)
                     {
-                        var r = Main.recipe[i];
+                        int index = Main.availableRecipe[i];
+                        var r = Main.recipe[index];
                         if (r != null && r.createItem != null && r.createItem.type == id)
-                        { recipe = r; break; }
+                        { recipe = r; recipeIndex = index; break; }
                     }
                     if (recipe == null) { Send(s, new Dict { ["req_id"] = reqId, ["crafted"] = 0 }); return; }
-                    // 连续合成，每次检查材料够才扣
-                    for (int n = 0; n < amount; n++)
+                    // amount 和 crafted 都是物品数量。配方按整批制作，允许最后一批超出目标。
+                    if (recipe.createItem.stack <= 0) { SendCraft(s, reqId, 0); return; }
+                    while (crafted < amount)
                     {
+                        Recipe.FindRecipes();
+                        if (!Main.availableRecipe.Take(Main.numAvailableRecipes).Contains(recipeIndex)) break;
                         bool enough = true;
                         foreach (var ing in recipe.requiredItem)
                         {
@@ -1731,8 +1813,9 @@ namespace NekoTerrariaLink
                         var created = new Item();
                         created.SetDefaults(recipe.createItem.type);
                         created.stack = recipe.createItem.stack;
-                        player.QuickSpawnItem(Src, created, created.stack);
-                        crafted++;
+                        int dropIndex = player.QuickSpawnItem(Src, created, created.stack);
+                        if (dropIndex < 0 || dropIndex >= Main.maxItems || !Main.item[dropIndex].active) break;
+                        crafted += created.stack;
                     }
                 }
                 catch { }
@@ -1744,13 +1827,29 @@ namespace NekoTerrariaLink
         {
             int inv = (int)cmd.GetNum("inv"), equip = (int)cmd.GetNum("equip");
             var player = Main.LocalPlayer;
-            if (inv >= 0 && inv < player.inventory.Length)
+            if (player == null || inv < 0 || inv >= player.inventory.Length || equip < 0 || equip >= 3)
+                return false;
+            var item = player.inventory[inv];
+            if (item == null || item.type <= 0 || ArmorSlotFor(item) != equip)
+                return false;
+            try
             {
-                var item = player.inventory[inv];
+                // Swap with the old armor so equipping never duplicates or destroys items.
+                var old = player.armor[equip].Clone();
                 player.armor[equip] = item.Clone();
+                player.inventory[inv] = old;
                 return true;
             }
-            return false;
+            catch { return false; }
+        }
+
+        private static int ArmorSlotFor(Item item)
+        {
+            if (item == null) return -1;
+            if (item.headSlot >= 0) return 0;
+            if (item.bodySlot >= 0) return 1;
+            if (item.legSlot >= 0) return 2;
+            return -1;
         }
 
         private bool GiveItem(Dict cmd)
@@ -1792,11 +1891,13 @@ namespace NekoTerrariaLink
                 var entry = new Dict {
                     ["id"] = it.type, ["stack"] = it.stack, ["inv_slot"] = i,
                     ["name"] = it.Name, ["defense"] = it.defense,
+                    ["armor_type"] = ArmorSlotFor(it),
                     // 工具/武器属性：use(melee/ranged/magic/tool…) + 伤害/镐力/斧力
                     ["use"] = ItemUse(it),
                     ["damage"] = it.damage,
                     ["pick"] = it.pick,
                     ["axe"] = it.axe,
+                    ["fishing_pole"] = it.fishingPole,
                 };
                 if (i >= 0 && i < 10) hotbar.Add(entry);
                 else if (i >= 10 && i < 50) inv.Add(entry);
@@ -1821,18 +1922,18 @@ namespace NekoTerrariaLink
         private bool DropItem(Dict cmd)
         {
             int slot = (int)cmd.GetNum("slot");
-            int stack = (int)(cmd.GetNum("stack") > 0 ? cmd.GetNum("stack") : 1);
+            int stack = cmd.Has("stack") ? (int)cmd.GetNum("stack") : 1;
             var player = Main.LocalPlayer;
-            if (slot < 0 || slot >= player.inventory.Length) return false;
+            if (player == null || slot < 0 || slot >= player.inventory.Length || stack <= 0) return false;
             var item = player.inventory[slot];
-            if (item.type == 0) return false;
+            if (item == null || item.type <= 0 || item.stack < stack) return false;
             var drop = item.Clone();
-            drop.stack = Math.Min(stack, item.stack);
-            player.inventory[slot].stack -= drop.stack;
+            drop.stack = stack;
+            // TryDroppingSingleItem 清空传入的克隆；生成成功后再扣源槽，异常不能吞掉原物品。
+            player.TryDroppingSingleItem(Src, drop);
+            player.inventory[slot].stack -= stack;
             if (player.inventory[slot].stack <= 0)
                 player.inventory[slot].SetDefaults(0);
-            Item d = drop;
-            player.TryDroppingSingleItem(Src, d);
             return true;
         }
 
@@ -1840,10 +1941,16 @@ namespace NekoTerrariaLink
         /// 返回拾取数量；radius 为像素半径（与 Python 端语义一致）。</summary>
         private void RunOnMainCollect(NetworkStream s, long reqId, Dict cmd)
         {
+            long deadline = Environment.TickCount64 + 5000;
             Main.QueueMainThreadAction(() =>
             {
                 try
                 {
+                    if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline)
+                    {
+                        Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["collected"] = 0 });
+                        return;
+                    }
                     int n = CollectItems(cmd);
                     Send(s, new Dict { ["req_id"] = reqId, ["ok"] = true, ["collected"] = n });
                 }
@@ -1857,6 +1964,7 @@ namespace NekoTerrariaLink
         private int CollectItems(Dict cmd)
         {
             int radius = (int)(cmd.GetNum("radius") > 0 ? cmd.GetNum("radius") : 600);
+            int wantedType = (int)cmd.GetNum("item_id");
             var player = Main.LocalPlayer;
             if (player == null) return 0;
             float px = player.Center.X, py = player.Center.Y;
@@ -1866,19 +1974,25 @@ namespace NekoTerrariaLink
             {
                 var it = Main.item[i];
                 if (it == null || !it.active || it.type <= 0) continue;
+                if (wantedType > 0 && it.type != wantedType) continue;
                 float dx = it.Center.X - px, dy = it.Center.Y - py;
                 if (dx * dx + dy * dy > rr * rr) continue;
                 // 让物品进背包（玩家靠近自动拾取）
                 try
                 {
-                    if (player.CanAcceptItemIntoInventory(it))
-                    {
-                        player.GetItem(player.whoAmI, it, GetItemSettings.InventoryEntityToPlayerInventorySettings);
-                        collected++;
-                    }
+                    if (!player.CanAcceptItemIntoInventory(it)) continue;
+                    int originalStack = it.stack;
+                    // GetItem 返回未装入的剩余堆叠。先用副本尝试拾取，未接收的仍留在地面。
+                    var remainder = player.GetItem(player.whoAmI, it.Clone(),
+                        GetItemSettings.InventoryEntityToPlayerInventorySettings);
+                    int left = remainder == null || remainder.IsAir ? 0 : remainder.stack;
+                    int taken = originalStack - left;
+                    if (taken <= 0) continue;
+                    it.stack = left;
+                    if (left == 0) it.active = false;
+                    collected += taken; // 物品数量，不是掉落堆叠数量。
                 }
-                catch { }
-                it.active = false;
+                catch { continue; }
                 if (Main.netMode == NetmodeID.MultiplayerClient)
                     NetMessage.SendData(MessageID.SyncItem, -1, -1, null, i, 0f, 0f, 0f, 0, 0, 0);
             }
@@ -1984,21 +2098,24 @@ namespace NekoTerrariaLink
             int slot = (int)cmd.GetNum("slot");
             int stack = (int)(cmd.GetNum("stack") > 0 ? cmd.GetNum("stack") : 1);
             var player = Main.LocalPlayer;
+            if (player == null || slot < 0 || slot >= player.inventory.Length) return false;
             int idx = OpenChestNear(x, y);
             if (idx < 0) return false;
             try
             {
                 var src = player.inventory[slot];
-                if (src.type == 0) return false;
+                if (src == null || src.type == 0 || src.stack <= 0) return false;
                 var chest = Main.chest[idx];
                 for (int k = 0; k < chest.item.Length; k++)
                 {
                     var ci = chest.item[k];
-                    if (ci.type == 0)
+                    if (ci == null || ci.type == 0)
                     {
                         var nw = src.Clone();
                         nw.stack = Math.Min(stack, src.stack);
                         chest.item[k] = nw;
+                        src.stack -= nw.stack;
+                        if (src.stack <= 0) src.SetDefaults(0);
                         SyncChest(idx, k);
                         return true;
                     }
@@ -2021,24 +2138,31 @@ namespace NekoTerrariaLink
         {
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
             int id = (int)cmd.GetNum("item_id");
-            int stack = (int)(cmd.GetNum("stack") > 0 ? cmd.GetNum("stack") : 1);
+            int stack = cmd.Has("stack") ? (int)cmd.GetNum("stack") : 1;
             var player = Main.LocalPlayer;
+            if (player == null || id <= 0 || stack <= 0) return false;
             int idx = OpenChestNear(x, y);
             if (idx < 0) return false;
             try
             {
                 var chest = Main.chest[idx];
+                if (chest == null || chest.item.Where(it => it != null && it.type == id).Sum(it => it.stack) < stack)
+                    return false;
+                int remaining = stack;
                 for (int k = 0; k < chest.item.Length; k++)
                 {
                     var it = chest.item[k];
-                    if (it.type != id || it.stack <= 0) continue;
-                    int take = Math.Min(stack, it.stack);
+                    if (it == null || it.type != id || it.stack <= 0) continue;
+                    int take = Math.Min(remaining, it.stack);
                     var got = it.Clone(); got.stack = take;
-                    player.QuickSpawnItem(Src, got, take);
+                    int dropIndex = player.QuickSpawnItem(Src, got, take);
+                    if (dropIndex < 0 || dropIndex >= Main.maxItems || !Main.item[dropIndex].active)
+                        return false;
                     it.stack -= take;
+                    remaining -= take;
                     if (it.stack <= 0) it.SetDefaults(0);
                     SyncChest(idx, k);
-                    return true;
+                    if (remaining == 0) return true;
                 }
                 return false;
             }
@@ -2212,17 +2336,21 @@ namespace NekoTerrariaLink
                 try
                 {
                     var byMod = new Dictionary<string, List<Dict>>();
-                    for (int i = 0; i < ItemLoader.ItemCount; i++)
+                    for (int i = 1; i < ItemLoader.ItemCount; i++)
                     {
                         var modItem = ItemLoader.GetItem(i);
-                        if (modItem == null || modItem.Name == null || modItem.Name.Length == 0) continue;
-                        string modName = modItem.Mod == null ? "Terraria" : modItem.Mod.Name;
+                        string modName = modItem == null ? "Terraria" : modItem.Mod.Name;
                         var itemInst = new Item();
                         itemInst.SetDefaults(i);
+                        string name = modItem?.Name ?? ItemID.Search.GetName(i);
+                        if (string.IsNullOrWhiteSpace(name)) name = itemInst.Name;
+                        if (string.IsNullOrWhiteSpace(name)) continue;
                         if (!byMod.ContainsKey(modName))
                             byMod[modName] = new List<Dict>();
                         byMod[modName].Add(new Dict {
-                            ["id"] = i, ["name"] = modItem.Name, ["use"] = ItemUse(itemInst), ["tags"] = ItemTags(itemInst),
+                            ["id"] = i, ["name"] = name,
+                            ["aliases"] = new List<string> { itemInst.Name },
+                            ["use"] = ItemUse(itemInst), ["tags"] = ItemTags(itemInst),
                         });
                     }
                     var mods = new List<Dict>();
@@ -2605,6 +2733,8 @@ namespace NekoTerrariaLink
                             ["name"] = npc.TypeName, ["slot"] = i, ["life"] = npc.life,
                             ["tileX"] = (int)(npc.Center.X / 16), ["tileY"] = (int)(npc.Center.Y / 16),
                             ["damage"] = npc.damage,
+                            ["type"] = npc.type, ["friendly"] = npc.friendly,
+                            ["townNPC"] = npc.townNPC, ["alive"] = npc.life > 0,
                         });
                 }
             }
@@ -2639,6 +2769,7 @@ namespace NekoTerrariaLink
                     ["tileX"] = (int)(p.Center.X / 16), ["tileY"] = (int)(p.Center.Y / 16),
                     ["velocityX"] = p.velocity.X, ["velocityY"] = p.velocity.Y,
                     ["grounded"] = p.velocity.Y == 0, ["selectedItem"] = p.selectedItem,
+                    ["alive"] = p.statLife > 0, ["active"] = p.active,
                     ["biome"] = BiomeName(p), ["buffs"] = buffs,
                     ["movement_state"] = MovementState(p),
                     ["brightness"] = Math.Round(brightness, 2),

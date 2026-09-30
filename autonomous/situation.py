@@ -53,6 +53,8 @@ class SituationEngine:
         self.last_situation = ""
 
     async def start(self) -> None:
+        if self.running:
+            return
         self.running = True
         self._task = asyncio.create_task(self._loop())
 
@@ -60,6 +62,7 @@ class SituationEngine:
         self.running = False
         if self._task:
             self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
     async def _loop(self) -> None:
@@ -114,7 +117,8 @@ class SituationEngine:
             state = self.agent.get_state()
         except Exception:
             pass
-        if not state:
+        if (not state or not getattr(self.agent, "running", False)
+                or state.get("alive") is False or int(state.get("hp", 0) or 0) <= 0):
             return
 
         report = {}
@@ -216,11 +220,23 @@ class SituationEngine:
         if behavior not in ("run_to_owner", "stick", "stay"):
             return
         agent = self.agent
+        if not self.running or not getattr(agent, "running", False):
+            return
+        ex = getattr(agent, "executor", None)
+        if ((ex and ex.busy()) or getattr(agent, "_in_combat", False)
+                or getattr(self.brain, "_busy", False)):
+            return
+        allow = getattr(agent, "autonomy_allowed", None)
+        if allow and not allow("follow"):
+            return
         lt = getattr(agent, "longterm", None)
         if lt is None:
             return
         # 已有跟随任务：交给 follow_loop 的距离分层，不重复干预
         if lt.get("follow") is not None:
+            return
+        # 处境层只负责陪伴意图，不能在主人已下达挖矿/砍树/守点时抢占长期槽。
+        if lt.busy_kinds():
             return
 
         if behavior in ("run_to_owner", "stick"):

@@ -23,7 +23,7 @@ MINE_WORDS = ("挖", "采", "开采", "砍")
 
 # 明确要求停止
 STOP_WORDS = ("别跟", "不用跟", "停下", "别挖", "停止", "歇着", "不用挖",
-              "别守", "结束任务", "停手", "别砍", "不用砍", "别砍了")
+              "别守", "结束任务", "取消任务", "停手", "别砍", "不用砍", "别砍了", "先停")
 
 # 表示"一直/持续"的强化词
 FOREVER_WORDS = ("一直", "持续", "不停", "一路", "继续")
@@ -100,16 +100,19 @@ def parse(text: str) -> Intent:
 
     # 1) 先看是不是喊停（"别停下/不要停止"这类否定不算停止）
     neg_stop = any(w in low for w in ("别停下", "不要停", "别停止", "不要停止", "别停手"))
-    if not neg_stop and any(w in low for w in STOP_WORDS):
+    english_stop = re.match(r"^(?:please\s+)?(?:stop|cancel|halt)\b", t.lower())
+    if not neg_stop and (any(w in low for w in STOP_WORDS) or low in ("停", "别动") or english_stop):
         kind = ""
-        if any(w in low for w in ("跟", "跟着")):
+        if any(w in low.lower() for w in ("跟", "follow")):
             kind = "follow"
-        elif "砍" in low:
+        elif any(w in low.lower() for w in ("砍", "chop")):
             kind = "chop"  # "别砍了/不用砍"→ 停砍树（长期砍树注册为 chop）
-        elif any(w in low for w in MINE_WORDS):
+        elif any(w in low.lower() for w in (*MINE_WORDS, "mining", "digging")):
             kind = "mine"
-        elif any(w in low for w in ("守",)):
+        elif any(w in low.lower() for w in ("守", "guard")):
             kind = "guard"
+        elif any(w in low.lower() for w in ("钓", "fish")):
+            kind = "fish"
         return Intent(mode="stop", kind=kind, raw=t, reason="主人喊停")
 
     # 2) 跟随：天生长期（先查贴身模式，再查普通跟随）

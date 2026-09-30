@@ -20,7 +20,7 @@ class EquipmentManager:
 
         mod 契约（C# SendInventory）：hotbar/inventory 条目带 inv_slot + defense；
         equipped 条目带 armor_slot + defense。装备命令 equip_item(inv_slot, armor_slot)。
-        防具槽位限定 0-2（头/胸/腿），不碰饰品槽。
+        物品的 armor_type 由 Mod 按头/胸/腿槽识别；只在对应槽位比较防御。
         """
         inv = await self._all_items()
         worn_def: Dict[int, int] = {}      # 已穿防具槽 → 防御
@@ -33,44 +33,42 @@ class EquipmentManager:
         candidates = [i for i in inv
                       if i.get("inv_slot") is not None
                       and i.get("armor_slot") is None
+                      and i.get("armor_type") in (0, 1, 2)
                       and int(i.get("defense", 0) or 0) > 0]
-        candidates.sort(key=lambda i: -int(i.get("defense", 0) or 0))
         ok = True
-        for item in candidates:
+        changed = False
+        for item in sorted(candidates, key=lambda i: -int(i.get("defense", 0) or 0)):
             d = int(item.get("defense", 0) or 0)
-            # 优先替换防御更低的已穿槽位
-            target = None
-            for slot, worn_d in sorted(worn_def.items(), key=lambda kv: kv[1]):
-                if d > worn_d:
-                    target = slot
-                    break
-            # 否则穿到空防具槽
-            if target is None:
-                used = set(worn_def)
-                for s in range(3):
-                    if s not in used:
-                        target = s
-                        break
-            if target is None:
+            target = int(item["armor_type"])
+            if d <= worn_def.get(target, 0):
                 continue
             if await self.mod.equip_item(item["inv_slot"], target):
                 worn_def[target] = d
+                changed = True
             else:
                 ok = False
-        return ok
+        return ok and changed
 
     async def give_to_player(self, item_id: int, stack: int = 1) -> bool:
-        return await self.mod.give_item(item_id, stack)
+        return await self.drop_for_player(item_id, stack)
 
     async def drop_for_player(self, item_id: int, stack: int = 1) -> bool:
-        # 在背包里找到该物品，丢到脚下让玩家拾取
+        # 跨堆叠转交；数量不够时不先丢一部分再声称全部交付。
+        if item_id <= 0 or stack <= 0:
+            return False
         inv = await self._all_items()
-        for it in inv:
-            if it.get("id") == item_id and it.get("stack", 0) > 0:
-                slot = it.get("inv_slot")
-                if slot is None:
-                    continue  # equipped 条目无 inv_slot，跳过
-                return await self.mod.drop_item(slot, stack)
+        slots = [it for it in inv if it.get("id") == item_id
+                 and it.get("inv_slot") is not None and it.get("stack", 0) > 0]
+        if sum(it["stack"] for it in slots) < stack:
+            return False
+        remaining = stack
+        for it in slots:
+            take = min(remaining, it["stack"])
+            if not await self.mod.drop_item(it["inv_slot"], take):
+                return False
+            remaining -= take
+            if remaining == 0:
+                return True
         return False
 
     async def use_by_name(self, name: str, resolve) -> bool:

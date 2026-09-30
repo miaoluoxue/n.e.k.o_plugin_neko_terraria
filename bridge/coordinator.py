@@ -30,10 +30,21 @@ class TaskCoordinator:
         self.timing = HumanTiming()  # v2.1: 人类化延迟
         # 长期任务去重：同类指令在窗口内重复触发（双路径/重复下发）不重启
         self._last_longterm: tuple = (None, None, 0.0)
+        self._command_epoch = 0
+        self._pending_commands: set[asyncio.Task] = set()
 
     def set_llm_call(self, llm_call) -> None:
         """设置 LLM 调用函数，启用 LLM 意图解析。"""
         self._intent_parser._llm_call = llm_call
+
+    def cancel_pending_commands(self) -> None:
+        """断线、关闭或喊停时，尚在解析/排队的旧命令也必须失效。"""
+        self._command_epoch += 1
+        for task in list(self._pending_commands):
+            if task is not asyncio.current_task():
+                task.cancel()
+        self._last_longterm = (None, None, 0.0)
+        self.agent.tasks.cancel_pending()
 
     @property
     def lt(self):
@@ -49,7 +60,27 @@ class TaskCoordinator:
 
     # ---------------- 主入口 ----------------
     async def handle(self, text: str, source: str = SRC_OWNER) -> Dict[str, Any]:
+        task = asyncio.current_task()
+        self._pending_commands.add(task)
+        try:
+            return await self._handle(text, source)
+        finally:
+            self._pending_commands.discard(task)
+
+    async def _handle(self, text: str, source: str) -> Dict[str, Any]:
         """解析并派发一句指令。"""
+        # 停止是控制指令，不能被待决询问吞掉，也不能等 LLM 才停。
+        from .intent import parse
+        immediate = parse(text)
+        if source == SRC_OWNER and immediate.mode == "stop":
+            self.cancel_pending_commands()
+            inquiry = getattr(self.agent, "inquiry", None)
+            if inquiry:
+                inquiry.cancel_all()
+            result = await self._do_stop(immediate)
+            result["mode"] = "stop"
+            return result
+        epoch = self._command_epoch
         # 陪伴：主人开口了 → 通知交互引擎刷新静默计时
         if source == SRC_OWNER:
             try:
@@ -117,6 +148,9 @@ class TaskCoordinator:
             pass
 
         result = await self._intent_parser.parse(text)
+        if epoch != self._command_epoch:
+            return {"ok": False, "status": "cancelled", "mode": "stop",
+                    "output": "这条指令已被后来的停止指令取消。"}
         self.agent.log(f"[coordinator.handle] 📋 解析结果: mode={result.mode}, kind={result.kind}, target={result.target}", "info")
 
         # 记录到上下文（用于"继续"/"再来点"等指代理解）
@@ -130,7 +164,7 @@ class TaskCoordinator:
                 pass
 
         # 处理打断级别
-        if result.interrupt_level > 0 and result.mode != "chat":
+        if result.interrupt_level > 0 and result.mode not in ("chat", "stop"):
             await self._handle_interrupt(result)
 
         # 推给主程序 LLM，以完整角色人设自然回应
@@ -149,6 +183,12 @@ class TaskCoordinator:
         返回统一带 mode 标记（fire-and-forget 的 llm_command 靠它判别哪些
         是 executor 已覆盖的 finite、哪些需即时回读给宿主 LLM）。
         """
+        if source == SRC_OWNER and result.mode in ("finite", "longterm"):
+            kind = result.kind
+            if kind == "mine" and result.target in ("木材", "木", "木头", "树", "wood"):
+                kind = "chop"
+            self.agent.allow_autonomy(kind)
+            await self.agent.cancel_autonomous_actions()
         if result.mode == "stop":
             self.agent.log("[coordinator] 🛑 执行 stop", "info")
             r = await self._do_stop(result)
@@ -239,37 +279,50 @@ class TaskCoordinator:
 
     # ---------------- 停止 ----------------
     async def _do_stop(self, it) -> Dict[str, Any]:
+        # 先禁止空闲循环立即重启同类动作，显式的新指令会解除对应限制。
+        self.agent.suppress_autonomy(it.kind)
+        await self.agent.cancel_autonomous_actions(it.kind)
+        self.agent.inquiry.cancel_all()
         if it.kind:
             # 长期砍树任务注册为 chop（start() 里 mine+木材 归一化而来），
             # 而"别砍了"intent 解析 kind=mine → 两个 key 都要查
             t = self.lt.get(it.kind)
             if t is None and it.kind == "mine":
                 t = self.lt.get("chop")
-            if t is None:
-                # 停的可能是前台有限任务（如"挖10个铁"进行中）→ 校验名称匹配再停
-                cur = self.executor.current()
-                if cur and self._stop_matches(it, cur):
-                    await self.agent.interrupt_current("主人喊停")
-                    return {"ok": True, "output": "好的，我不做了~"}
-                return {"ok": True, "output": "我本来就没在做这个呀~"}
-            name = t.name
-            await self.lt.stop(t.kind, "主人喊停")
-            return {"ok": True, "output": f"好的，不{name}了~"}
+            stopped = []
+            cur = self.executor.current()
+            if cur and self._stop_matches(it, cur):
+                if await self.agent.interrupt_current("主人喊停"):
+                    stopped.append(cur["name"])
+            if t is not None:
+                if await self.lt.stop(t.kind, "主人喊停"):
+                    stopped.append(t.name)
+            await self.agent.mod.stop_actions()
+            return {"ok": True, "status": "stopped",
+                    "output": "已停止：" + "、".join(stopped) if stopped else "当前没有对应的运行任务。"}
         # 没指明停什么：全停
-        names = await self.lt.stop_all("主人喊停")
-        if self.executor.current():
-            await self.agent.interrupt_current("主人喊停")
+        result = await self.agent.stop_everything("主人喊停")
+        names = result["longterm_stopped"]
+        if result["foreground_cancelled"]:
+            names.append("当前任务")
         if names:
             return {"ok": True, "output": "好的，" + "、".join(names) + " 都停下了~"}
         return {"ok": True, "output": "我现在什么都没在做哦~"}
 
-    @staticmethod
-    def _stop_matches(it, cur: Dict[str, Any]) -> bool:
+    def _stop_matches(self, it, cur: Dict[str, Any]) -> bool:
         """前台任务名是否与停止意图的 kind 匹配，避免"别守了"误停挖矿。"""
         kind = it.kind or ""
+        goal = getattr(self.agent.tasks, "_current", None)
+        if goal is not None:
+            goal_kind = goal.goal_type
+            if goal_kind == "mine" and goal.target in ("木材", "木", "木头", "树", "wood"):
+                goal_kind = "chop"
+            if goal_kind == kind:
+                return True
         name = str(cur.get("name", "") or "")
-        table = {"follow": ("跟", "跟随"), "mine": ("挖", "矿", "采"),
-                 "chop": ("砍", "树", "木"), "guard": ("守",)}
+        table = {"follow": ("跟", "跟随", "follow"), "mine": ("挖", "矿", "采", "mine"),
+                 "chop": ("砍", "树", "木", "chop"), "guard": ("守", "guard"),
+                 "fish": ("钓", "fish"), "combat": ("战斗", "打", "combat")}
         kw = table.get(kind)
         if not kw:
             return True  # kind 未知：保守停前台
@@ -277,6 +330,10 @@ class TaskCoordinator:
 
     # ---------------- 长期任务 ----------------
     async def _do_longterm(self, it) -> Dict[str, Any]:
+        import re
+        if re.search(r"(?:\d+|[一二两三四五六七八九十百]+)\s*棵", it.raw or "") and it.kind in ("chop", "mine"):
+            return {"ok": False, "status": "unconfirmed", "mode": "longterm",
+                    "output": "当前只能核验木材数量，不能核验树的棵数；没有把棵数改成木材数量执行。"}
         # 去重：同类指令 8 秒内重复触发（双路径/重复下发）→ 不重启，返回已在进行
         now = time.time()
         last_kind, last_target, last_ts = self._last_longterm
@@ -292,6 +349,10 @@ class TaskCoordinator:
 
         self.agent.log(f"[coordinator] 🟢 _do_longterm() 开始: kind={it.kind}, target={it.target}", "info")
         await asyncio.sleep(self.timing.command_delay())
+        await self.executor.cancel_current("主人新长期任务接管")
+        if self.executor.busy():
+            return {"ok": False, "status": "busy", "mode": "longterm",
+                    "output": "旧任务仍在退出，长期任务尚未启动。"}
         res = await self.jobs.start(it.kind, target=it.target,
                                     amount=it.amount, reason=it.reason)
         try:
@@ -327,7 +388,7 @@ class TaskCoordinator:
         it.steps = LLMIntentParser._normalize_steps(steps)
         # 人类化延迟：pre_reply 已发，"好的喵~"说了 → 停顿一下再动手
         await asyncio.sleep(self.timing.command_delay())
-        return await self.run_foreground(it.steps, it.reason or it.raw, source)
+        return await self.run_foreground(it.steps, it.raw or it.reason, source)
 
     async def _run_explore(self, it, source: str) -> Dict[str, Any]:
         """探索直达：把 explore 步骤直接交给 task_chain 执行（真下挖/真移动），
@@ -342,7 +403,8 @@ class TaskCoordinator:
                         report_fail="探索没成功，主人")
             async def _work(info):
                 ok = await self.agent.tasks.run_one(goal)
-                return {"ok": ok, "output": "探索回来啦~" if ok else "探索没走成，主人"}
+                return {"ok": ok, "output": (goal.evidence or "已到达本次探索选定位置，未确认返回起点")
+                        if ok else (goal.report_fail or "探索目标未达成")}
 
             return await self.executor.run(
                 f"探索{target}", _work, source=source,

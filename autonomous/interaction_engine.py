@@ -67,7 +67,9 @@ class SceneClassifier:
         # 成 combat → 猫娘站在 NPC 旁永远战斗场景高频碎碎念战斗话题。
         # 口径对齐 combat.py / brain._guard_check 的 damage>0 and life>0）
         enemies = [e for e in nearby
-                   if int(e.get("damage", 0) or 0) > 0
+                   if not e.get("friendly", False)
+                   and not e.get("townNPC", e.get("town_npc", False))
+                   and int(e.get("damage", 0) or 0) > 0
                    and int(e.get("life", 0) or 0) > 0]
         hp = state.get("hp", 100)
         max_hp = state.get("max_life", state.get("max_hp", 100))

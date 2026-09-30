@@ -35,11 +35,13 @@ class UndergroundExplorer:
         self._visited: set = set()
         self._start_y = 0
         self._start_time = 0.0
+        self.last_result = ""
 
     # ---------------- 主入口 ----------------
 
     async def explore(self, direction: int = 1, max_time: float = EXPLORE_MAX_TIME) -> bool:
         """执行一次地下探索。返回是否挖到了东西/下到了深处。"""
+        self.last_result = ""
         st = self.agent.get_state()
         self._start_y = int(st.get("tile_y", 0) or 0)
         self._start_time = time.time()
@@ -137,7 +139,9 @@ class UndergroundExplorer:
         self.agent.log(
             f"地下探索结束：下挖{max_depth_reached}格，挖到{ore_n}次矿，捡了{collected_total}个掉落",
             "nav")
-        return max_depth_reached >= EXPLORE_MIN_DEPTH or mined_total > 0
+        self.last_result = f"最深处比起点低 {max_depth_reached} 格，确认采矿 {mined_total} 个"
+        # 地表捡到一块矿不能作为“地下探索完成”的证据。
+        return max_depth_reached >= EXPLORE_MIN_DEPTH
 
     # ---------------- 下挖 ----------------
 

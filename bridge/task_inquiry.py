@@ -80,12 +80,16 @@ class TaskInquiry:
         text = (user_text or "").strip()
         if not text:
             return None
+        from .intent import parse
+        if parse(text).mode == "stop":
+            return None
+        text = text.lower().strip(" 。！!，,？?")
 
         auto_words = {"继续", "可以", "好", "行", "随便", "你决定", "你来",
                        "go ahead", "ok", "yes", "sure", "continue",
                        "换个地方", "换地方"}
-        hold_words = {"等等", "停", "先别", "等一下", "等等先", "hold",
-                       "wait", "stop", "先停", "别急", "等会"}
+        hold_words = {"等等", "先别", "等一下", "等等先", "hold",
+                       "wait", "别急", "等会"}
         deny_words = {"不是", "不要", "不用", "算了", "先不做", "不了", "不对",
                        "别做", "停手", "没有", "no", "nope"}
 
@@ -95,29 +99,35 @@ class TaskInquiry:
             # 先试询问自带 options（"换个地方"/"继续挖"这类精确回答）
             if inquiry.options:
                 opt = next((o for o in inquiry.options
-                            if o and (o == text or o in text)), None)
+                            if o and o.lower() == text), None)
                 if opt:
                     inquiry.answer = opt
                     inquiry.resolved = True
                     self._pending.remove(inquiry)
                     return inquiry
-            if text in auto_words or any(w in text for w in auto_words):
+            if text in auto_words:
                 inquiry.answer = "auto（主人让猫娘自己决定）"
                 inquiry.resolved = True
                 self._pending.remove(inquiry)
                 return inquiry
-            if any(w in text for w in hold_words):
+            if text in hold_words:
                 inquiry.answer = "hold（主人让等一下）"
                 inquiry.resolved = True
                 self._pending.remove(inquiry)
                 return inquiry
-            if any(w in text for w in deny_words):
+            if text in deny_words:
                 inquiry.answer = "deny（主人否定了）"
                 inquiry.resolved = True
                 self._pending.remove(inquiry)
                 return inquiry
 
         return None  # 都不像回答 → 放行，按新指令解析
+
+    def cancel_all(self) -> None:
+        for inquiry in self._pending:
+            inquiry.answer = "cancelled"
+            inquiry.resolved = True
+        self._pending.clear()
 
     def check_timeouts(self) -> List[Inquiry]:
         """检查超时询问，自动决策并返回。"""

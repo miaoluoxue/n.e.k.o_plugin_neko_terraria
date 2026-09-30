@@ -61,16 +61,14 @@ class UpgradeEngine:
     async def _check_and_craft(self) -> int:
         made = 0
         # 1. 先穿上背包里已有更好的（auto_equip 两次跑不出新装备就 skip）
-        if await self.agent.equip.auto_equip():
-            made += 1
+        await self.agent.equip.auto_equip()
         # 2. 武器/镐/防具
         recipes = await self._recipes()
         if recipes:
-            await self._try_craft_upgrades(recipes)
+            made += await self._try_craft_upgrades(recipes)
             # 合成后如果出了更好的防具再穿一次（原 auto_equip 拿不到刚合成的）
             try:
-                if await self.agent.equip.auto_equip():
-                    made += 1
+                await self.agent.equip.auto_equip()
             except Exception:
                 pass
         return made
@@ -143,11 +141,12 @@ def _cur(cat: str, weapon: int, pick: int, defense: int) -> int:
 
 def _best_stat(inv: Dict[str, Any], key: str) -> int:
     best = 0
-    for it in inv.get("equipped", []) or []:
-        try:
-            best = max(best, int(it.get(key, 0) or 0))
-        except Exception:
-            pass
+    for slot in ("hotbar", "inventory", "equipped"):
+        for it in inv.get(slot, []) or []:
+            try:
+                best = max(best, int(it.get(key, 0) or 0))
+            except Exception:
+                pass
     return best
 
 

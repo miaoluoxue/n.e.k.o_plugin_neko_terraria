@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <BuildMod>false</BuildMod>
+    <OutputTmlReferences>true</OutputTmlReferences>
+    <TmlDirectory Condition="'$(TmlDirectory)' == ''">E:/SteamLibrary/steamapps/common/tModLoader</TmlDirectory>
+  </PropertyGroup>
+  <Import Project="$(TmlDirectory)/tMLMod.targets" />
+  <ItemGroup>
+    <Compile Include="../../mod/NekoTerrariaLink/*.cs" Link="Mod/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

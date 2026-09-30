@@ -45,40 +45,34 @@ class Connection:
         # 读循环意外死亡时自动重建
         self._ensure_read_loop()
 
-        is_low = cmd.get("cmd") in LOW_PRIORITY_CMDS
-        if is_low:
-            # 低优命令让高优（move/navigate/战斗/send_chat）先发一拍
-            await asyncio.sleep(0.15)
-
-        async with self._mod_lock:
-            self._req_seq = (self._req_seq + 1) & 0xFFFF
-            req_id = self._req_seq
-            cmd = dict(cmd)
-            cmd["req_id"] = req_id
-
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future = loop.create_future()
-            self._pending[req_id] = fut
-            log.info(
-                f"[conn] request_mod req_id={req_id} cmd={cmd.get('cmd')} "
-                f"loop_id={id(loop)} reader_id={id(self._mod_reader)}"
-            )
-            sent = await self._send_mod_raw(cmd)
-
-        # 发送失败：立即返回，不让命令空等 timeout（#5 次生问题）
-        if not sent:
-            self._pending.pop(req_id, None)
-            return None
-
-        # 锁已释放，等待响应（独立读循环按 req_id 分发）
+        req_id = None
+        fut = None
+        writer = self._mod_writer
         try:
-            resp = await asyncio.wait_for(fut, timeout=timeout)
-            return resp
+            # 总超时涵盖排队和 drain；旧实现只限制等回复，会永远堵在发送锁。
+            async with asyncio.timeout(timeout):
+                if cmd.get("cmd") in LOW_PRIORITY_CMDS:
+                    await asyncio.sleep(0.15)
+                async with self._mod_lock:
+                    if writer is not self._mod_writer:
+                        return None  # 断线前排队的旧动作不能发送到新连接
+                    self._req_seq += 1
+                    req_id = self._req_seq
+                    cmd = dict(cmd, req_id=req_id)
+                    fut = asyncio.get_running_loop().create_future()
+                    self._pending[req_id] = fut
+                    log.debug("[conn] request req_id=%s cmd=%s pending=%s", req_id, cmd.get("cmd"), len(self._pending))
+                    if not await self._send_mod_raw(cmd):
+                        return None
+                return await fut
         except asyncio.TimeoutError:
             log.warning(f"[conn] request_mod(req_id={req_id}, cmd={cmd.get('cmd')}) 超时({timeout}s)")
             return None
         finally:
-            self._pending.pop(req_id, None)
+            if req_id is not None:
+                self._pending.pop(req_id, None)
+            if fut is not None and not fut.done():
+                fut.cancel()
 
     # ===== 9877 Mod 接口通道 =====
 
@@ -160,13 +154,16 @@ class Connection:
             log.warning("[conn] _send_mod_raw 失败: _mod_writer 为 None")
             return False
         data = (json.dumps(cmd) + "\n").encode("utf-8")
+        writer = self._mod_writer
         try:
-            self._mod_writer.write(data)
-            await self._mod_writer.drain()
-            log.info(f"[conn] 已发送: {cmd.get('cmd')} req_id={cmd.get('req_id')}")
+            writer.write(data)
+            await asyncio.wait_for(writer.drain(), timeout=1.5)
+            log.debug(f"[conn] 已发送: {cmd.get('cmd')} req_id={cmd.get('req_id')}")
             return True
-        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        except (TimeoutError, ConnectionResetError, BrokenPipeError, OSError) as e:
             log.warning(f"[conn] _send_mod_raw 连接错误: {e}")
+            if writer is self._mod_writer:
+                self.close()
             return False
         except Exception as e:
             log.error(f"[conn] _send_mod_raw 异常: {type(e).__name__}: {e}")
@@ -183,28 +180,26 @@ class Connection:
             f"loop_id={id(asyncio.get_running_loop())}"
         )
         while True:
-            if not self._mod_reader:
+            if my_reader is None or my_reader is not self._mod_reader:
                 log.warning("[conn] 读循环退出: _mod_reader 为 None")
                 break
             try:
-                line = await self._mod_reader.readline()
+                line = await my_reader.readline()
             except asyncio.CancelledError:
                 raise  # close() 取消读循环，正常退出
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 log.warning(f"[conn] _read_loop 连接错误: {e}")
                 break
             except Exception as e:
-                # 非连接类异常（RuntimeError 等）不退出——退出会杀死读循环，
-                # 导致所有后续请求静默超时。打日志后继续。
-                log.error(f"[conn] _read_loop 异常(继续): {type(e).__name__}: {e}")
-                await asyncio.sleep(0.1)
-                continue
+                # 超长/损坏帧或双 reader 错误不能在同一坏流里无限重试。
+                log.error(f"[conn] _read_loop 异常(断开): {type(e).__name__}: {e}")
+                break
             if not line:
                 # EOF：对端关闭
                 log.warning("[conn] _read_loop EOF，连接已关闭")
                 break
             try:
-                log.info(f"[conn] 读到行: {line[:100]!r}")
+                log.debug(f"[conn] 读到行: {line[:100]!r}")
                 resp = json.loads(line.decode("utf-8"))
                 if not isinstance(resp, dict):
                     continue
@@ -252,7 +247,8 @@ class Connection:
 
     def on_message(self, callback: Callable) -> None:
         """注册事件回调。模组主动推送的 type="event" 消息会被派发到此。"""
-        self._event_callbacks.append(callback)
+        if callback not in self._event_callbacks:
+            self._event_callbacks.append(callback)
 
     def _dispatch_event(self, msg: dict) -> None:
         """将事件消息派发给所有注册的回调。"""

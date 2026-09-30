@@ -7,6 +7,7 @@
 只有真的无路可走才回报"做不了"，并且要说清楚缺什么、想让主人怎么帮。
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -150,6 +151,11 @@ class TaskBrain:
         p = StepPlan()
         # 优先用「想」补全后的步骤
         src = (assess.steps if assess and assess.steps else steps)
+        if re.search(r"(?:\d+|[一二两三四五六七八九十百]+)\s*棵", goal_text) and any(
+                s.get("action") in ("chop", "mine") for s in src):
+            p.blocked = True
+            p.blocked_reason = "当前砍树只能核验木材数量，尚不能核验树的棵数；未把棵数改成木材数量执行"
+            return p
         src = self._dedupe(src, p)
 
         for s in src:
@@ -160,8 +166,6 @@ class TaskBrain:
             if action == "explore":
                 # 探索：goal_type 用 "explore"，走 task_chain 探索闭环（真下挖/真移动）
                 tgt = item or "地下"
-                if tgt in ("附近", "目标", ""):
-                    tgt = "地下"
                 p.goals.append(Goal(goal_type="explore", target=tgt, amount=amt,
                                     reason=goal_text,
                                     report_fail="探索没成功，主人"))
@@ -228,7 +232,7 @@ class TaskBrain:
                 p.outline.append(f"给主人{item}x{amt}")
             elif action == "follow":
                 p.goals.append(Goal(goal_type="follow", target="", reason=goal_text))
-                p.outline.append("回到主人身边")
+                p.outline.append("启动长期跟随（不代表已到达）")
             elif action == "combat":
                 # 战斗：goal_type 用 "combat"（task_chain 有现成 fight_nearest 分支）
                 p.goals.append(Goal(goal_type="combat", target=item or "",

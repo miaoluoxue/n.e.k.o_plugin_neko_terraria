@@ -38,6 +38,18 @@ def _me(st) -> Tuple[int, int]:
     return int(st.get("tile_x", 0) or 0), int(st.get("tile_y", 0) or 0)
 
 
+def _allowed(agent, kind: str = "") -> bool:
+    check = getattr(agent, "autonomy_allowed", None)
+    if check and not check(kind):
+        return False
+    ex = getattr(agent, "executor", None)
+    lt = getattr(agent, "longterm", None)
+    brain = getattr(getattr(agent, "plugin", None), "_autonomous_brain", None)
+    return not (getattr(agent, "_in_combat", False)
+                or getattr(brain, "_busy", False)
+                or (ex and ex.busy()) or (lt and lt.busy_kinds()))
+
+
 def _owner(st, my_name: str = "") -> Optional[Tuple[int, int]]:
     """最近的非自身玩家（残留槽位过滤）。my_name=猫娘角色名用于排除自身。
 
@@ -98,7 +110,7 @@ async def _pack_torch(agent) -> None:
 async def idle_drudge(agent, st: Dict[str, Any]) -> None:
     """每轮状态刷新时跑一次。st 为最新状态快照。"""
     ctx = agent._idle_ctx
-    if not st:
+    if not st or st.get("alive") is False or not _allowed(agent):
         return
     # 自爆保护：血量过低不主动搞事
     hp = int(st.get("hp", 0) or 0)
@@ -114,6 +126,9 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
         pass
     owner = _owner(st, my_name)
     if owner is None:
+        if ctx.get("_following"):
+            ctx["_following"] = False
+            await agent.mod.stop_actions()
         return  # 单人模式不主动搞事（等主人）
 
     mx, my = _me(st)
@@ -133,8 +148,15 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
         except Exception as e:
             agent.log(f"基地逻辑异常: {e}", "warn")
 
+    if not _allowed(agent):
+        return
     # ── P0 追随（迟滞带，防抖） ──
-    if not ctx.get("_following"):
+    if not _allowed(agent, "follow"):
+        was_following = ctx.get("_following", False)
+        ctx["_following"] = False
+        if was_following:
+            await agent.mod.stop_actions()
+    elif not ctx.get("_following"):
         if dist >= FOLLOW_TRIGGER_DIST:
             ctx["_following"] = True
             if _should_talk(ctx, "follow", "追"):
@@ -142,6 +164,7 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
     else:
         if dist <= FOLLOW_STOP_DIST:
             ctx["_following"] = False
+            await agent.mod.stop_actions()
 
     if ctx.get("_following"):
         try:
@@ -151,7 +174,7 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
         return  # 本秒在追，不干别的
 
     # ── P1 周期矿井：就近扫矿，挖 1-3 块（进度由背包增量确认） ──
-    if ctx["cycle"] % MINE_SCAN_INTERVAL == 0 and dist < 40:
+    if ctx["cycle"] % MINE_SCAN_INTERVAL == 0 and dist < 40 and _allowed(agent, "mine"):
         try:
             await _mine_job(agent, st, mx, my)
         except asyncio.CancelledError:
@@ -174,7 +197,8 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
 
     # ── P1.6 陪伴式生活小动作：砍树/钓鱼（什么任务用什么工具） ──
     life = getattr(agent, "life", None)
-    if life is not None and ctx["cycle"] % 30 == 0 and dist < 30:
+    if (life is not None and ctx["cycle"] % 30 == 0 and dist < 30
+            and _allowed(agent, "chop") and _allowed(agent, "fish")):
         try:
             await life.do_something()
         except asyncio.CancelledError:
@@ -203,8 +227,11 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
 
 async def _mine_job(agent, st: Dict[str, Any], mx: int, my: int) -> None:
     """扫一圈矿，挖 1-3 块目标矿石（进度由背包增量确认，杜绝假完成）。"""
+    agent.mining.reset()
     n = 0
     for ore in MINE_TARGETS:
+        if not _allowed(agent, "mine"):
+            return
         iid = agent.resolve_item(ore)
         if iid < 0:
             continue
@@ -220,6 +247,8 @@ async def _mine_job(agent, st: Dict[str, Any], mx: int, my: int) -> None:
         d = abs(mine.get("x", 0) - mx) + abs(mine.get("y", 0) - my)
         if d > MINE_MAX_DIST:
             continue
+        if not _allowed(agent, "mine"):
+            return
         try:
             got = await agent.mining.mine_ore_inplace(ore, mine["x"], mine["y"])
         except Exception as e:

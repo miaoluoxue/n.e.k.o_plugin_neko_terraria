@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from ..autonomous.event_bus import get_event_bus
@@ -79,12 +80,17 @@ class TerrariaAgent:
 
         self.upgrade = UpgradeEngine(self)
         self._state: Dict[str, Any] = {}
+        self._last_state_push = 0.0
         self._in_combat: bool = False  # 战斗中标志：防止导航遇敌检查自我嵌套
         self._inv_full: Dict[str, Any] = {"hotbar": [], "equipped": [], "inventory": []}
         self._chests: List[Dict[str, Any]] = []
         self._world_info: Dict[str, Any] = {}
         self._log: List[Dict[str, Any]] = []
         self._running = False
+        self._background_tasks: set[asyncio.Task] = set()
+        self._idle_task: Optional[asyncio.Task] = None
+        self._suppressed_actions: set[str] = set()
+        self._autonomy_paused_until = 0.0
         # 防重入：boot 与 nt_connect 可能同时调 start()，并发会启动两个 tML 进程、
         # 覆盖 self.process 导致 boot 卡死。只允许一个 start 真正执行。
         self._start_lock = asyncio.Lock()
@@ -210,10 +216,16 @@ class TerrariaAgent:
 
         self._running = True
         self.events.bind()
-        asyncio.create_task(self.tasks.run_loop())
-        asyncio.create_task(self._state_loop())
-        asyncio.create_task(self._auto_register())
+        self._spawn_background_task(self.tasks.run_loop())
+        self._spawn_background_task(self._state_loop())
+        self._spawn_background_task(self._auto_register())
         return True
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _ensure_mod_connected(self) -> bool:
         """确保已连接到 AI Mod 的 TCP 端口，未连接则尝试重连。"""
@@ -235,10 +247,11 @@ class TerrariaAgent:
     async def refresh_state(self) -> Dict[str, Any]:
         """立即刷新状态"""
         player_name = self._character_name()
+        requested_at = time.monotonic()
         st = await self.mod.get_state(player_name)
-        if st:
+        if st and self._last_state_push <= requested_at:
             self._state = st
-        return self._state
+        return self.get_state()
 
     def log(self, msg: str, kind: str = "info") -> None:
         # 内存环形日志，供前端静默刷新展示
@@ -258,6 +271,8 @@ class TerrariaAgent:
         await asyncio.sleep(self.cfg.get("auto_register_delay_seconds", 25.0))
         try:
             mods = await self.mod.enum_items()
+            if not mods or not self._running:
+                return
             diff = self.registry.sync_from_enum(mods)
             if diff["added"]:
                 self.log(f"认识了新 mod：{', '.join(diff['added'])}", "info")
@@ -274,6 +289,17 @@ class TerrariaAgent:
 
     async def stop(self) -> None:
         self._running = False
+        startup = self._start_task
+        if startup and startup is not asyncio.current_task() and not startup.done():
+            startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
+        await self.stop_everything("Agent 停止")
+        tasks = list(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
         self.launcher.close()
         self.conn.close()
 
@@ -295,16 +321,25 @@ class TerrariaAgent:
         fallback_interval = max(3, int(self.cfg.get("state_fallback_poll_seconds", 5) or 5))
         while self._running:
             loop_count += 1
+            if not self.conn.is_mod_connected():
+                await self.stop_everything("游戏连接已断开")
+                self._state.clear()
+                self._inv_full = {"hotbar": [], "equipped": [], "inventory": []}
+                await asyncio.sleep(2)
+                if not self._running:
+                    break
+                if not await self._ensure_mod_connected():
+                    continue
             try:
                 # 兜底轮询（低频繁）：推送为主，这里只在游戏状态事件尚未填缓存时补一次，
                 # 并承担死亡/复活/联机检测（推送是主通道，轮询是保险）
                 if loop_count == 1 or loop_count % fallback_interval == 0:
+                    requested_at = time.monotonic()
                     st = await self.mod.get_state(player_name)
                     if st:
-                        # 只补缺失字段，不覆盖推送的实时数据（避免旧响应盖新推送）
-                        for k, v in st.items():
-                            if k not in self._state:
-                                self._state[k] = v
+                        # 推送中断时轮询必须更新旧字段；有更新推送则保留更新的快照。
+                        if self._last_state_push <= requested_at:
+                            self._state.update(st)
                         # ── 死亡/复活检测（基于推送的缓存血量） ──
                         hp = st.get("hp", -1)
 
@@ -344,7 +379,7 @@ class TerrariaAgent:
                             for cb in self.respawn_callbacks:
                                 try:
                                     if asyncio.iscoroutinefunction(cb):
-                                        asyncio.ensure_future(cb())
+                                        self._spawn_background_task(cb())
                                     else:
                                         cb()
                                 except Exception:
@@ -403,9 +438,11 @@ class TerrariaAgent:
             except Exception:
                 idle_drudge = None
             busy = self.coordinator.status().get("busy")
-            if idle_drudge is not None and not busy:
+            if idle_drudge is not None and not busy and self.autonomy_allowed():
                 try:
-                    await idle_drudge(self, st)
+                    # 状态维护不应被长达数十秒的空闲动作阻塞。
+                    if not getattr(self, "_idle_task", None) or self._idle_task.done():
+                        self._idle_task = self._spawn_background_task(idle_drudge(self, st))
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -413,7 +450,8 @@ class TerrariaAgent:
 
             # 英雄成长（v0.10）：周期扫配方合成升级装备
             try:
-                if not busy:
+                if (not self.coordinator.status().get("busy") and self.autonomy_allowed()
+                        and not self._in_combat and (not getattr(self, "_idle_task", None) or self._idle_task.done())):
                     await self.upgrade.consider()
             except asyncio.CancelledError:
                 raise
@@ -486,6 +524,7 @@ class TerrariaAgent:
         # v3.0: mod 统一推送全量游戏状态（血量/位置/敌人/玩家/时间，2s 一次）
         elif event == "game_state":
             try:
+                self._last_state_push = time.monotonic()
                 pl = msg.get("player", {}) or {}
                 self._state["hp"] = int(pl.get("hp", self._state.get("hp", 0)))
                 self._state["max_life"] = int(pl.get("max_life", self._state.get("max_life", 100)))
@@ -556,7 +595,6 @@ class TerrariaAgent:
         for t in assess.thoughts:
             self.log(f"  思考：{t}", "task")
         if not assess.doable:
-            await self.send_chat(f"主人，{assess.say()}~")
             # v2.1: 需要主人提供信息（缺材料/目标模糊）→ 发起决策询问，带答案重试一次
             if not _retried and self.inquiry and assess.need_from_owner:
                 inq = self.inquiry.ask(
@@ -566,9 +604,10 @@ class TerrariaAgent:
                     timeout=30.0,
                 )
                 if inq:
-                    await self.send_chat(inq.question)
+                    await self.speak(f"[任务询问] {inq.question} 请根据实际困难向主人询问。")
                     ans = await self.inquiry.wait_answer(inq)
-                    if ans not in ("auto", "hold", "timeout"):
+                    rejected = ans.startswith(("deny", "hold", "timeout", "cancelled")) or ans == "先不做"
+                    if not rejected:
                         self.log(f"主人回答：{ans}，带答案重试任务", "task")
                         return await self.run_complex_task(
                             steps, f"{goal_text}（主人说：{ans}）", source, dry_run=dry_run, _retried=True
@@ -608,6 +647,7 @@ class TerrariaAgent:
         async def _work(info):
             info.phase = "act"
             done_bits = []
+            started_only = False
             for i, g in enumerate(plan.goals):
                 if self.executor.should_stop():
                     return {"ok": False, "status": "cancelled", "output": f"做到第{i + 1}步被叫停了"}
@@ -625,14 +665,19 @@ class TerrariaAgent:
                     await self.send_chat(f"主人，{msg}，我停下来等你~")
                     return {
                         "ok": False,
-                        "status": "step_failed",
+                        "status": g.outcome if g.outcome in ("partial", "unconfirmed") else "step_failed",
                         "phase": "act",
-                        "output": f"在第{i + 1}步「{info.note}」停下：{msg}",
+                        "output": ("已确认的前序结果：" + "、".join(done_bits) + "。" if done_bits else "")
+                                  + f"在第{i + 1}步「{info.note}」停下：{msg}。整个任务尚未完成。",
                     }
                 # 完成播报用实测数（g.actual），不 echo 计划里的目标数——
                 # 曾 plan.say() 报"挖铁矿x10 完成"，实际可能只挖到几块。
                 done_desc = self._step_done_text(g)
+                started_only = started_only or g.outcome == "started"
                 done_bits.append(done_desc)
+                if g.outcome == "started" and i < len(plan.goals) - 1:
+                    return {"ok": False, "status": "unconfirmed", "phase": "act",
+                            "output": "、".join(done_bits) + "；当前步骤仅启动，尚未完成，后续依赖步骤未执行。"}
                 try:
                     await self.send_chat(f"{done_desc}~")
                 except Exception:
@@ -640,19 +685,21 @@ class TerrariaAgent:
             tail = "、".join(done_bits) if done_bits else plan.say()
             # output 是纯事实（不含"做完啦"等硬编码台词）——由
             # brain._on_executor_task_done 交宿主 LLM 自动生成汇报
-            return {"ok": True, "status": "ok", "phase": "act",
+            return {"ok": True, "status": "started" if started_only else "ok", "phase": "act",
                     "output": tail}
 
         return await self.executor.run(goal_text or "多步任务", _work, source=source, steps=plan.outline)
 
     @staticmethod
     def _step_done_text(g: "Goal") -> str:
-        """单步完成的人话（用实测数）。g.actual<=0 视为无数量语义的动作。
-
-        goal.actual 由 task_chain 各分支写入（背包计数/真做成数）。
-        fish 等无法计数的目标 actual 保持默认 → 只报动作名不报数量。
-        """
+        """只汇报已核验结果；数量未知或仅启动时不能退化成通用“完成”。"""
+        if g.outcome != "completed":
+            return g.evidence or g.report_fail or "结果尚未确认"
+        if g.evidence:
+            return g.evidence
         name = g.goal_type
+        if name == "follow":
+            return "长期跟随已启动"
         if g.target and g.goal_type in ("mine", "chop", "craft", "gather",
                                         "fetch", "give", "fish"):
             name = f"{g.goal_type} {g.target}"
@@ -664,7 +711,9 @@ class TerrariaAgent:
             return f"{name}只做到{act}个"
         if act > 0:
             return f"{name}完成（{act}个）"
-        return f"{name}完成"
+        if g.goal_type in ("mine", "chop", "craft", "gather", "fetch", "give", "fish", "combat"):
+            return f"{name}数量未确认"
+        return f"{name}已执行并核验"
 
     async def command(self, text: str, source: str = SRC_OWNER) -> Dict[str, Any]:
         """自然语言统一入口：自动判断长期任务/有限任务/喊停并派发。"""
@@ -694,9 +743,43 @@ class TerrariaAgent:
 
     async def stop_everything(self, why: str = "主人喊停") -> Dict[str, Any]:
         """全停：前台任务 + 所有长期任务。"""
+        self.suppress_autonomy()
+        self.coordinator.cancel_pending_commands()
+        await self.cancel_autonomous_actions()
         fg = await self.executor.cancel_current(why)
         names = await self.longterm.stop_all(why)
+        self.inquiry.cancel_all()
+        await self.mod.stop_actions()
         return {"ok": True, "foreground_cancelled": fg, "longterm_stopped": names}
+
+    @staticmethod
+    def _action_kind(kind: str) -> str:
+        return {"木材": "chop", "wood": "chop", "dig": "mine"}.get(kind, kind)
+
+    def suppress_autonomy(self, kind: str = "") -> None:
+        if kind:
+            self._suppressed_actions.add(self._action_kind(kind))
+        else:
+            self._autonomy_paused_until = time.monotonic() + 30.0
+
+    def allow_autonomy(self, kind: str = "") -> None:
+        self._autonomy_paused_until = 0.0
+        if kind:
+            self._suppressed_actions.discard(self._action_kind(kind))
+
+    def autonomy_allowed(self, kind: str = "") -> bool:
+        return (self._running and self.conn.is_mod_connected()
+                and not self._is_dead and time.monotonic() >= self._autonomy_paused_until
+                and self._action_kind(kind) not in self._suppressed_actions)
+
+    async def cancel_autonomous_actions(self, kind: str = "") -> None:
+        idle = getattr(self, "_idle_task", None)
+        if idle and idle is not asyncio.current_task() and not idle.done():
+            idle.cancel()
+            await asyncio.gather(idle, return_exceptions=True)
+        brain = getattr(self.plugin, "_autonomous_brain", None)
+        if brain:
+            await brain.cancel_actions(kind)
 
     async def send_chat(self, text: str) -> None:
         """通过 Mod 发送聊天消息（A5：加保护，发不出去不炸线程）"""
@@ -724,6 +807,8 @@ class TerrariaAgent:
             pass
 
     def get_state(self) -> Dict[str, Any]:
+        if not self.conn.is_mod_connected():
+            return {}
         return self._state
 
     def remember(self, key: str, value: str, category: str = "fact") -> None:
@@ -807,8 +892,6 @@ class TerrariaAgent:
 
         ok = await self._nav_with_fight(x, y, timeout)
         self.log(f"走到 ({x},{y}) " + ("成功" if ok else "失败/超时"), "nav")
-        if not ok:
-            await self.send_chat(f"主人，我过不去 ({x},{y})，卡住了，等你想想办法~")
         return ok
 
     async def _nav_with_fight(self, x: int, y: int, timeout: int,
@@ -826,12 +909,13 @@ class TerrariaAgent:
                 st = self.get_state()
             except Exception:
                 return False
-            enemies = [e for e in (st.get("nearby_npcs", []) or [])
-                       if e.get("damage", 0) > 0 and e.get("life", 0) > 0]
-            if not enemies:
+            target = self.combat._pick_target(
+                st, int(st.get("tile_x", 0)), int(st.get("tile_y", 0)))
+            if not target:
                 return False
             fought["yes"] = True
-            self.log(f"导航途中遇敌（{len(enemies)}只），先打再走", "combat")
+            self.log(f"导航途中遇敌（{target.get('name', '敌人')}），先打再走", "combat")
+            await self.mod.stop_actions()
             await self.combat.fight_nearest(st, timeout=6)
             return True  # 打断本次导航，由外层重发导航续走
 
@@ -864,7 +948,7 @@ class TerrariaAgent:
                 self.log("爬升被打断", "warn")
                 return False
             self.log(f"第{i + 1}/{len(plan.legs)}段：{leg.method} → ({leg.tx},{leg.ty})", "nav")
-            ok = await self.mod.navigate_to(leg.tx, leg.ty, timeout=1)
+            ok = await self._nav_with_fight(leg.tx, leg.ty, timeout=12)
             if not ok:
                 await self.send_chat(f"主人，我卡在第{i + 1}段了（{leg.method}到 {leg.tx},{leg.ty}），上不去啦~")
                 self.log(f"第{i + 1}段失败，中止爬升", "warn")
@@ -885,14 +969,11 @@ class TerrariaAgent:
 
     # --- 物品/箱子：实现在 InventoryOps，这里保留原有调用签名 ---
     async def get_inventory(self) -> Dict[str, Any]:
-        return await self.items.get_inventory()
+        return await self.refresh_inventory()
 
     async def refresh_inventory(self) -> Dict[str, Any]:
         """按需刷新背包缓存（C# 不推背包，需要时主动拉取）。"""
-        try:
-            self._inv_full = await self.mod.get_inventory()
-        except Exception:
-            pass
+        self._inv_full = await self.mod.get_inventory()
         return self._inv_full
 
     def get_inventory_sync(self) -> Dict[str, Any]:

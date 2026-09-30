@@ -27,13 +27,13 @@ class ModItemRegistry:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 self.mods[data.get("mod", f.stem)] = {
-                    i["name"]: i["id"] for i in data.get("items", [])
+                    name: i["id"] for name, i in self._entries(data.get("items", []))
                 }
                 self.uses[data.get("mod", f.stem)] = {
-                    i["name"]: i.get("use", "misc") for i in data.get("items", [])
+                    name: i.get("use", "misc") for name, i in self._entries(data.get("items", []))
                 }
                 self.tags[data.get("mod", f.stem)] = {
-                    i["name"]: i.get("tags", ["misc"]) for i in data.get("items", [])
+                    name: i.get("tags", ["misc"]) for name, i in self._entries(data.get("items", []))
                 }
             except Exception:
                 pass
@@ -41,13 +41,16 @@ class ModItemRegistry:
     def sync_from_enum(self, mods: List[Dict[str, Any]]) -> Dict[str, List[str]]:
         # 增量同步：新增/更新写入，消失的 mod 删除对应文件，返回变更
         result: Dict[str, List[str]] = {"added": [], "updated": [], "removed": []}
+        # A failed/empty enumeration is ambiguous; it must not erase a valid cache.
+        if not mods:
+            return result
         with self._lock:
             seen: Set[str] = set()
             for m in mods:
                 name = m.get("mod", "Unknown")
-                items = {i["name"]: i["id"] for i in m.get("items", [])}
-                uses = {i["name"]: i.get("use", "misc") for i in m.get("items", [])}
-                tags = {i["name"]: i.get("tags", ["misc"]) for i in m.get("items", [])}
+                items = {n: i["id"] for n, i in self._entries(m.get("items", []))}
+                uses = {n: i.get("use", "misc") for n, i in self._entries(m.get("items", []))}
+                tags = {n: i.get("tags", ["misc"]) for n, i in self._entries(m.get("items", []))}
                 seen.add(name)
                 if name not in self.mods:
                     result["added"].append(name)
@@ -85,15 +88,25 @@ class ModItemRegistry:
             pass
 
     def resolve(self, name: str) -> int:
-        low = name.lower().replace("_", " ")  # iron_ore → iron ore（匹配 "Iron Ore"）
+        low = self._normalize(name)
         for items in self.mods.values():
             if low in items:
                 return items[low]
-        # 部分物品名带括号/变体，尝试子串（rare）；失败回 -1
         return -1
 
+    @staticmethod
+    def _normalize(name: str) -> str:
+        return "".join((name or "").lower().replace("_", "").split())
+
+    @classmethod
+    def _entries(cls, items):
+        for item in items:
+            for name in [item["name"], *item.get("aliases", [])]:
+                if name:
+                    yield cls._normalize(name), item
+
     def use_of(self, name: str) -> str:
-        low = name.lower()
+        low = self._normalize(name)
         for uses in self.uses.values():
             if low in uses:
                 return uses[low]
@@ -107,7 +120,7 @@ class ModItemRegistry:
             for name, iid in items.items():
                 if u.get(name, "misc") == use:
                     out.append(iid)
-        return out
+        return list(dict.fromkeys(out))
 
     def find_by_tag(self, tag: str) -> List[int]:
         # 按用途标签找物品 id（如 "heal" 找所有加血物品）
@@ -117,11 +130,11 @@ class ModItemRegistry:
             for name, iid in items.items():
                 if tag in t.get(name, []):
                     out.append(iid)
-        return out
+        return list(dict.fromkeys(out))
 
     def describe(self, name: str) -> Dict[str, Any]:
         # 返回某物品的用途信息：id / use / tags
-        low = name.lower()
+        low = self._normalize(name)
         for mod, items in self.mods.items():
             if low in items:
                 u = self.uses.get(mod, {})
@@ -131,4 +144,4 @@ class ModItemRegistry:
         return {"id": -1, "use": "misc", "tags": ["misc"]}
 
     def mod_list(self) -> List[Dict[str, Any]]:
-        return [{"mod": k, "count": len(v)} for k, v in self.mods.items()]
+        return [{"mod": k, "count": len(set(v.values()))} for k, v in self.mods.items()]
