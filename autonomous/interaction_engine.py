@@ -431,6 +431,9 @@ class InteractionEngine:
         if not getattr(self.agent, "running", False):
             return
         state = self._get_state()
+        if not state or state.get("alive") is False or state.get("hp", 1) <= 0:
+            self.owner.update({})
+            return
         longterm_kinds = self._get_longterm_kinds()
         current_name = self._get_current_task_name()
 
@@ -505,7 +508,7 @@ class InteractionEngine:
         # #95: read 是"上下文数据"（任务进度/画面感知/目标状态），不应被说话冷却拦截——
         # 否则猫娘正在干活时所有 read 感知全被吞，宿主 LLM 看不到进行中的事。
         # blind 是紧急短句（低延迟）也不受冷却限制。只有 respond（主动开口）受冷却约束。
-        if behavior == "respond" and time.time() < self._speech_cooldown_until:
+        if not urgent and behavior == "respond" and time.time() < self._speech_cooldown_until:
             return
 
         # v0.7 静默窗：主人刚说话，非紧急不打扰（blind 危险短句例外）
@@ -517,7 +520,7 @@ class InteractionEngine:
         if behavior in ("respond", "blind"):
             from ..llm.throttle import get_throttle
             throttle = get_throttle()
-            prio = "emergency" if behavior == "blind" else "normal"
+            prio = "emergency" if urgent or behavior == "blind" else "normal"
             if not throttle.acquire(source="interaction_speech", priority=prio):
                 # 被限流 → 转为 read 模式（不强制 LLM 响应）；blind 限流直接放弃
                 if behavior == "blind":
@@ -526,12 +529,8 @@ class InteractionEngine:
 
         # v2.1: respond 话语做"不完美"后处理（手滑/结巴/忘词/语气词），
         #       read 是上下文数据不加工
-        if behavior == "respond" and self.imperfections:
-            try:
-                text = self.imperfections.jitter_text(
-                    text, intensity=self.imperfections.intensity)
-            except Exception:
-                pass
+        # 此处传递的是事实和生成要求，不是 LLM 的最终台词。
+        # 随机插字会破坏物品名、数量和指令，语气交给宿主人设生成。
         # 走 agent.speak：优先宿主 push_message（LLM 人设润色），
         # 失败/不可用时 respond 降级为游戏内聊天（send_chat）——保证不静默。
         # 这是"情感交互有声音"的兜底关键：宿主没接 push_message 时猫娘也会开口。
@@ -545,7 +544,7 @@ class InteractionEngine:
             if behavior == "respond" and delivered:
                 self._urge = 0.0  # 说过话了，冲动值清零
                 self._speech_cooldown_until = time.time() + self.timing.reaction_delay()
-            if delivered:
+            if delivered and behavior in ("respond", "blind"):
                 self._last_speech_ts = time.time()
             elif behavior == "respond" and getattr(self.agent, "running", False):
                 # 宿主推送失败时给游戏内一条短兜底，避免任务结果/危险提示完全丢失。
@@ -792,11 +791,11 @@ class InteractionEngine:
 
         immediate_respond = {
             "danger_found", "hp_low", "low_hp", "hp_crash", "boss_nearby",
-            "drowning", "in_lava", "falling", "boss_killed", "combat_hit",
+            "drowning", "in_lava", "falling", "combat_hit",
         }
         # v3.0: task_done/task_interrupted 不再强制说话——fire-and-forget 的
         # 完成 cue 已由 brain._on_executor_task_done 统一推给宿主 LLM，避免双响
-        task_respond = {"goal_completed", "goal_failed"}
+        task_respond = {"goal_completed", "goal_failed", "boss_killed"}
         task_read = {"task_done", "task_interrupted"}
         goal_read = {"goal_set", "equipment_upgraded", "inventory_full"}
         explore_read = {
@@ -854,28 +853,13 @@ class InteractionEngine:
                 await self.push_speech(danger_blind[etype], behavior="blind")
                 return
 
-            # 全局限流检查（紧急事件用 emergency 优先级）
-            from ..llm.throttle import get_throttle
-            throttle = get_throttle()
-            if not throttle.acquire(source="interaction_emergency", priority="emergency"):
-                # 紧急事件被限流 → 只推高 urge，不立即说话
-                self._urge = min(1.0, self._urge + 0.6)
-                return
-
             await self.push_speech(
                 f"[紧急事件] {merged}\n立刻用猫娘语气紧急警告（1句话，10字以内）",
                 behavior="respond", urgent=True)
 
         elif etype in task_respond:
-            mood_type = "proud" if "complete" in etype or "done" in etype else "tired"
+            mood_type = "proud" if etype in ("goal_completed", "boss_killed") else "tired"
             self.mood.trigger(mood_type, intensity)
-
-            # 限流检查
-            from ..llm.throttle import get_throttle
-            throttle = get_throttle()
-            if not throttle.acquire(source="interaction_task", priority="normal"):
-                self._urge = min(1.0, self._urge + 0.4)
-                return
 
             await self.push_speech(
                 f"[任务事件] {desc}\n用猫娘语气汇报/吐槽（1句话，20字以内）",
@@ -921,11 +905,6 @@ class InteractionEngine:
 
         elif etype in scene_say_respond:
             # 画面触发的第一反应：直接说出口（respond 走主 LLM 人设润色）
-            from ..llm.throttle import get_throttle
-            throttle = get_throttle()
-            if not throttle.acquire(source="interaction_scene", priority="normal"):
-                self._urge = min(1.0, self._urge + 0.3)
-                return
             await self.push_speech(
                 f"[画面心情] {desc}\n用猫娘语气说出这句话（不超过15字，保持原意）",
                 behavior="respond")
@@ -977,15 +956,20 @@ class InteractionEngine:
                        "follow", "build", "travel"}
         if self.scene.name in safe_scenes and self.scene.prev in ("combat", "boss"):
             desc = self._danger_desc
-            task = self._danger_task
+            state = self._get_state()
+            if (not state or state.get("alive") is False or state.get("hp", 0) <= 0
+                    or state.get("in_lava")
+                    or (state.get("in_water") and int(state.get("breath", 200) or 0) < 50)):
+                return
+            # 当前任务可能已被主人取消/替换，不能播报旧任务即将恢复。
+            task = self._get_current_task_name() or ""
             self._danger_desc = ""
             self._danger_ts = 0.0
             self._danger_task = ""
-            task_note = f"，继续{task}" if task else ""
+            task_note = f"，当前任务是{task}" if task else "，当前没有前台任务"
             await self.push_speech(
-                f"[危险解除] 刚才{desc}，现在安全了{task_note}——"
-                f"用猫娘语气自然吐槽一句（20字内，如"
-                f"'吓死我啦~ 可恶的小白终于甩掉他了{task_note}！'）",
+                f"[危险变化] 刚才{desc}，当前附近未检测到敌怪{task_note}。"
+                "自然回应一句，只描述已知状态，不宣称绝对安全或自行恢复旧任务。",
                 behavior="respond")
 
     def owner_silence_seconds(self) -> float:

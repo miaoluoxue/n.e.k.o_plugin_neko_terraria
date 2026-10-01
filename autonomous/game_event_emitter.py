@@ -214,13 +214,15 @@ class GameEventEmitter:
     def _check_mining_events(self, cur: Dict, prev: Dict, now: float) -> None:
         if now - self._last_mine_time < self._mining_cooldown:
             return
-        # 热键栏数据源：agent 背包快照（mod get_state 不返回 hotbar_slots）
+        # 使用整份背包数量；在快捷栏和主背包之间移物不代表获得新矿石。
         hotbar: List[Dict] = []
         try:
             inv = self.agent.get_inventory_sync() if self.agent else {}
-            hotbar = (inv or {}).get("hotbar", []) or []
+            if not inv:
+                return
+            hotbar = (inv.get("hotbar", []) or []) + (inv.get("inventory", []) or [])
         except Exception:
-            pass
+            return
         current: Dict[str, int] = {}
         for slot in hotbar:
             if not isinstance(slot, dict):
@@ -246,7 +248,7 @@ class GameEventEmitter:
                 if self.interaction:
                     self._inject(
                         EventType.ORE_FOUND, intensity=0.25,
-                        description=f"咦，发现了 {ore}！挖一下～")
+                        description=f"背包中的{ore}数量增加，当前共{count}个；来源未确认。")
                 return
         self._mining_ore_counts = current
 

@@ -1946,10 +1946,11 @@ namespace NekoTerrariaLink
         {
             bool IsHook(Item item)
             {
-                if (item == null || item.IsAir || item.shoot <= 0
-                    || item.shoot >= ContentSamples.ProjectilesByType.Length) return false;
-                var sample = ContentSamples.ProjectilesByType[item.shoot];
-                return sample != null && sample.aiStyle == 7;
+                if (item == null || item.IsAir || item.shoot <= 0) return false;
+                // ProjectilesByType is a sparse dictionary: projectile ids are not
+                // guaranteed to be contiguous, and the collection has no Length.
+                return ContentSamples.ProjectilesByType.TryGetValue(item.shoot, out var sample)
+                    && sample != null && sample.aiStyle == 7;
             }
             // Hooks can be equipped in the dedicated equipment slot without
             // occupying inventory. Ignore empty stale item entries.
@@ -2202,11 +2203,13 @@ namespace NekoTerrariaLink
         private void RunOnMainCollect(NetworkStream s, long reqId, Dict cmd)
         {
             long deadline = Environment.TickCount64 + 5000;
+            int actionGeneration = Volatile.Read(ref _actionGeneration);
             Main.QueueMainThreadAction(() =>
             {
                 try
                 {
-                    if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline)
+                    if (!ReferenceEquals(_activeStream, s) || Environment.TickCount64 >= deadline
+                        || actionGeneration != Volatile.Read(ref _actionGeneration))
                     {
                         Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["collected"] = 0 });
                         return;
@@ -2502,31 +2505,36 @@ namespace NekoTerrariaLink
                         for (int i = 0; i < chest.item.Length; i++) SyncChest(idx, i);
                     }
                 }
-                int remaining = stack;
-                for (int k = 0; k < chest.item.Length; k++)
+                try
                 {
-                    var it = chest.item[k];
-                    if (it == null || it.type != id || it.stack <= 0) continue;
-                    int take = Math.Min(remaining, it.stack);
-                    var got = it.Clone(); got.stack = take;
-                    var remainder = player.GetItem(
-                        player.whoAmI, got,
-                        GetItemSettings.InventoryEntityToPlayerInventorySettings);
-                    if (remainder != null && !remainder.IsAir && remainder.stack > 0)
+                    int remaining = stack;
+                    for (int k = 0; k < chest.item.Length; k++)
                     {
-                        RestoreSnapshots();
-                        return false;
+                        var it = chest.item[k];
+                        if (it == null || it.type != id || it.stack <= 0) continue;
+                        int take = Math.Min(remaining, it.stack);
+                        var got = it.Clone(); got.stack = take;
+                        var remainder = player.GetItem(
+                            player.whoAmI, got,
+                            GetItemSettings.InventoryEntityToPlayerInventorySettings);
+                        if (remainder != null && !remainder.IsAir && remainder.stack > 0)
+                            break;
+                        it.stack -= take;
+                        remaining -= take;
+                        if (it.stack <= 0) it.SetDefaults(0);
+                        SyncChest(idx, k);
+                        if (remaining == 0)
+                        {
+                            if (Main.netMode == NetmodeID.MultiplayerClient)
+                                SyncInventory(player);
+                            return true;
+                        }
                     }
-                    it.stack -= take;
-                    remaining -= take;
-                    if (it.stack <= 0) it.SetDefaults(0);
-                    SyncChest(idx, k);
-                    if (remaining == 0)
-                    {
-                        if (Main.netMode == NetmodeID.MultiplayerClient)
-                            SyncInventory(player);
-                        return true;
-                    }
+                }
+                catch
+                {
+                    // A modded GetItem/stack hook can throw after changing the
+                    // inventory. The failed command must undo those changes too.
                 }
                 RestoreSnapshots();
                 return false;

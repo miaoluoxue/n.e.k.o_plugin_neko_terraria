@@ -241,11 +241,6 @@ class CombatEngine:
         self._blacklist_enemy(target)
         return False
 
-    async def _maybe_cover(self, px: int, py: int, ty: int) -> None:
-        """坠落风险时在脚下垫土保命（x 用玩家当前位置）。"""
-        if abs(ty - py) > 10:
-            await self.mod.place_tile(px, py + 1, 0)
-
     def _pick_target(self, state: Dict[str, Any], px: int, py: int) -> Optional[Dict[str, Any]]:
         """选最近的可达敌人（跳过黑名单/高差过大的）。"""
         enemies = state.get("nearby_npcs", []) or []
