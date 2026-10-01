@@ -1388,14 +1388,14 @@ namespace NekoTerrariaLink
                 // #8: 被新导航接管（代际变化）→ 立即退出本线程，不再发 nav_* 事件。
                 // 否则僵尸监控线程会在后续 20s 内继续推 nav_moving/stuck/arrived，
                 // 导致 Python 侧 navigate_async 跨导航互相误判到达/超时，且 TCP 事件风暴。
-                if (ctrl.navGen != myGen || myGen != Volatile.Read(ref _navigationGeneration))
+                if (Volatile.Read(ref ctrl.navGen) != myGen || myGen != Volatile.Read(ref _navigationGeneration))
                 {
                     Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "cancelled" });
                     return;
                 }
                 int px = (int)(player.Center.X / 16), py = (int)(player.Bottom.Y / 16);
                 // 路径走完（ModPlayer 置空）且贴近目标 → 到达（须为本人路径，代际未变）
-                if (ctrl.navGen == myGen && ctrl.navPath == null && Math.Abs(px - tx) <= 1 && Math.Abs(py - tyFeet) <= 2)
+                if (Volatile.Read(ref ctrl.navGen) == myGen && ctrl.navPath == null && Math.Abs(px - tx) <= 1 && Math.Abs(py - tyFeet) <= 2)
                 {
                     if (streamEvents) SendNavEvent(s, "nav_arrived", px, py);
                     Send(s, new Dict { ["req_id"] = reqId, ["ok"] = true, ["x"] = px, ["y"] = py });
@@ -1418,7 +1418,7 @@ namespace NekoTerrariaLink
                     stuckCounter++;
                     if (stuckCounter > 50)
                     {
-                        if (ctrl.navGen == myGen) ctrl.navPath = null;
+                        QueueClearNavigation(ctrl, myGen);
                         if (streamEvents) SendNavEvent(s, "nav_stuck", px, py);
                         Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "stuck", ["x"] = px, ["y"] = py });
                         return;
@@ -1429,10 +1429,28 @@ namespace NekoTerrariaLink
                 Thread.Sleep(100);
                 steps++;
             }
-            if (ctrl.navGen == myGen) ctrl.navPath = null;
+            QueueClearNavigation(ctrl, myGen);
             int fx = (int)(player.Center.X / 16), fy = (int)(player.Center.Y / 16);
             if (streamEvents) SendNavEvent(s, "nav_timeout", fx, fy);
             Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "timeout", ["x"] = fx, ["y"] = fy });
+        }
+
+        /// <summary>后台导航监控不能直接写 ModPlayer 的路径状态。
+        /// 所有清理都排回主线程，并再次校验 generation，避免旧导航线程
+        /// 把新导航刚写入的路径清掉。</summary>
+        private void QueueClearNavigation(NekoControlPlayer ctrl, int generation)
+        {
+            Main.QueueMainThreadAction(() =>
+            {
+                try
+                {
+                    if (generation != Volatile.Read(ref _navigationGeneration)) return;
+                    if (Volatile.Read(ref ctrl.navGen) != generation) return;
+                    ctrl.navPath = null;
+                    ctrl.moveDir = 0;
+                }
+                catch { }
+            });
         }
 
         // ══════════════════════════════════════════════════════════
@@ -1871,8 +1889,44 @@ namespace NekoTerrariaLink
             var item = new Item();
             item.SetDefaults(id);
             if (item.type <= 0 || item.IsAir) return false;
-            item.stack = stack;
-            player.QuickSpawnItem(Src, item, stack);
+            // give_item 的契约是物品进入背包。QuickSpawnItem 在背包满时
+            // 可能把物品丢到世界，不能把这种结果回报成成功；先计算完整
+            // 容量，再一次性写入已有堆叠和空槽，避免部分生成。
+            int capacity = 0;
+            for (int i = 0; i < player.inventory.Length; i++)
+            {
+                var existing = player.inventory[i];
+                if (existing == null || existing.type == 0)
+                    capacity += item.maxStack;
+                else if (existing.type == id && existing.stack < existing.maxStack)
+                    capacity += existing.maxStack - existing.stack;
+                if (capacity >= stack) break;
+            }
+            if (capacity < stack) return false;
+
+            int remaining = stack;
+            for (int i = 0; i < player.inventory.Length && remaining > 0; i++)
+            {
+                var existing = player.inventory[i];
+                if (existing == null || existing.type == 0) continue;
+                if (existing.type != id || existing.stack >= existing.maxStack) continue;
+                int add = Math.Min(remaining, existing.maxStack - existing.stack);
+                existing.stack += add;
+                remaining -= add;
+            }
+            for (int i = 0; i < player.inventory.Length && remaining > 0; i++)
+            {
+                var existing = player.inventory[i];
+                if (existing != null && existing.type != 0) continue;
+                int add = Math.Min(remaining, item.maxStack);
+                var placed = item.Clone();
+                placed.stack = add;
+                player.inventory[i] = placed;
+                remaining -= add;
+            }
+            if (remaining != 0) return false;
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
             return true;
         }
 
@@ -1944,8 +1998,9 @@ namespace NekoTerrariaLink
             if (item == null || item.type <= 0 || item.stack < stack) return false;
             var drop = item.Clone();
             drop.stack = stack;
-            // TryDroppingSingleItem 清空传入的克隆；生成成功后再扣源槽，异常不能吞掉原物品。
-            player.TryDroppingSingleItem(Src, drop);
+            // 只有实际生成掉落物后才扣源槽；否则会出现“丢弃失败但物品被扣除”。
+            bool dropped = player.TryDroppingSingleItem(Src, drop);
+            if (!dropped) return false;
             player.inventory[slot].stack -= stack;
             if (player.inventory[slot].stack <= 0)
                 player.inventory[slot].SetDefaults(0);
@@ -2111,7 +2166,9 @@ namespace NekoTerrariaLink
             // 直接操作箱子物品槽（最稳，不依赖 Chest 的 put API 重载差异）
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
             int slot = (int)cmd.GetNum("slot");
-            int stack = (int)(cmd.GetNum("stack") > 0 ? cmd.GetNum("stack") : 1);
+            int requested = cmd.Has("stack") ? (int)cmd.GetNum("stack") : 1;
+            if (requested <= 0) return false;
+            int stack = requested;
             var player = Main.LocalPlayer;
             if (player == null || slot < 0 || slot >= player.inventory.Length) return false;
             int idx = OpenChestNear(x, y);
@@ -2119,32 +2176,57 @@ namespace NekoTerrariaLink
             try
             {
                 var src = player.inventory[slot];
-                if (src == null || src.type == 0 || src.stack <= 0) return false;
+                if (src == null || src.type == 0 || src.stack < stack) return false;
                 var chest = Main.chest[idx];
+                if (chest == null || chest.item == null) return false;
+
+                // 先做完整容量预检，避免箱子只能放一部分时扣掉玩家背包
+                // 却仍返回 ok=true。随后再按多个槽位分批写入。
+                int capacity = 0;
+                for (int k = 0; k < chest.item.Length; k++)
+                {
+                    var ci = chest.item[k];
+                    if (ci == null || ci.type == 0)
+                    {
+                        capacity += src.maxStack;
+                    }
+                    else if (ci.type == src.type && ci.stack < ci.maxStack)
+                    {
+                        capacity += ci.maxStack - ci.stack;
+                    }
+                    if (capacity >= stack) break;
+                }
+                if (capacity < stack) return false;
+
+                int remaining = stack;
                 for (int k = 0; k < chest.item.Length; k++)
                 {
                     var ci = chest.item[k];
                     if (ci == null || ci.type == 0)
                     {
                         var nw = src.Clone();
-                        nw.stack = Math.Min(stack, src.stack);
+                        nw.stack = Math.Min(remaining, Math.Min(src.stack, nw.maxStack));
+                        if (nw.stack <= 0) continue;
                         chest.item[k] = nw;
                         src.stack -= nw.stack;
-                        if (src.stack <= 0) src.SetDefaults(0);
+                        remaining -= nw.stack;
                         SyncChest(idx, k);
-                        return true;
+                        if (remaining <= 0) break;
+                        continue;
                     }
                     if (ci.type == src.type && ci.stack < ci.maxStack)
                     {
-                        int add = Math.Min(stack, Math.Min(src.stack, ci.maxStack - ci.stack));
+                        int add = Math.Min(remaining, Math.Min(src.stack, ci.maxStack - ci.stack));
+                        if (add <= 0) continue;
                         ci.stack += add;
                         src.stack -= add;
-                        if (src.stack <= 0) src.SetDefaults(0);
+                        remaining -= add;
                         SyncChest(idx, k);
-                        return true;
+                        if (remaining <= 0) break;
                     }
                 }
-                return false;
+                if (src.stack <= 0) src.SetDefaults(0);
+                return remaining == 0;
             }
             finally { player.chest = -1; }
         }

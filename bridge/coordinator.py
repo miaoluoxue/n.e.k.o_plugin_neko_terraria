@@ -279,19 +279,27 @@ class TaskCoordinator:
 
     # ---------------- 停止 ----------------
     async def _do_stop(self, it) -> Dict[str, Any]:
+        # 砍树长期任务在 standing_jobs 中使用 canonical kind=chop。
+        # 部分解析路径仍会把“停止砍树/别砍了”标成 mine，必须在所有
+        # 抑制、取消、前台匹配和长期任务查找前统一，否则停止后 idle
+        # 循环可能马上重新启动砍树。
+        stop_kind = it.kind or ""
+        raw = str(getattr(it, "raw", "") or "").casefold()
+        if stop_kind == "mine" and any(word in raw for word in ("砍", "树", "木材", "木头", "wood", "chop")):
+            stop_kind = "chop"
         # 先禁止空闲循环立即重启同类动作，显式的新指令会解除对应限制。
-        self.agent.suppress_autonomy(it.kind)
-        await self.agent.cancel_autonomous_actions(it.kind)
+        self.agent.suppress_autonomy(stop_kind)
+        await self.agent.cancel_autonomous_actions(stop_kind)
         self.agent.inquiry.cancel_all()
-        if it.kind:
+        if stop_kind:
             # 长期砍树任务注册为 chop（start() 里 mine+木材 归一化而来），
             # 而"别砍了"intent 解析 kind=mine → 两个 key 都要查
-            t = self.lt.get(it.kind)
-            if t is None and it.kind == "mine":
+            t = self.lt.get(stop_kind)
+            if t is None and stop_kind == "mine":
                 t = self.lt.get("chop")
             stopped = []
             cur = self.executor.current()
-            if cur and self._stop_matches(it, cur):
+            if cur and self._stop_matches(stop_kind, it, cur):
                 if await self.agent.interrupt_current("主人喊停"):
                     stopped.append(cur["name"])
             if t is not None:
@@ -309,9 +317,14 @@ class TaskCoordinator:
             return {"ok": True, "output": "好的，" + "、".join(names) + " 都停下了~"}
         return {"ok": True, "output": "我现在什么都没在做哦~"}
 
-    def _stop_matches(self, it, cur: Dict[str, Any]) -> bool:
+    def _stop_matches(self, kind_or_intent, cur_or_task=None, maybe_cur=None) -> bool:
         """前台任务名是否与停止意图的 kind 匹配，避免"别守了"误停挖矿。"""
-        kind = it.kind or ""
+        # 保持兼容旧调用签名，同时允许调用方传入已规范化的 kind。
+        if maybe_cur is None:
+            it, cur = kind_or_intent, cur_or_task
+            kind = it.kind or ""
+        else:
+            kind, it, cur = kind_or_intent, cur_or_task, maybe_cur
         goal = getattr(self.agent.tasks, "_current", None)
         if goal is not None:
             goal_kind = goal.goal_type

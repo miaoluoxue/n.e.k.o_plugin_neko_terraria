@@ -930,10 +930,10 @@ class TerrariaAgent:
         return False
 
     async def use_item_on_self(self, name: str) -> bool:
-        iid = self.resolve_item(name)
-        if iid < 0:
-            return False
-        return await self.mod.give_item(iid, 1)
+        # 这是“使用身上已有物品”，不能用 give_item 生成一件新物品。
+        # 生成物品会让喝药/使用道具的调用在背包没有该物品时也假成功，
+        # 并且可能把物品凭空留在世界中。
+        return await self.items.use_item_by_name(name)
 
     async def navigate_to(self, x: int, y: int, timeout: int = 25) -> bool:
         """自动寻路走到坐标（v3.0: 流式导航——C# BFS 寻路 + 状态流，可中断）。
