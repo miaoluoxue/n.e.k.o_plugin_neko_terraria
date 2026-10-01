@@ -623,7 +623,15 @@ class TerrariaAgent:
 
     def on_respawn(self, callback) -> None:
         """注册复活回调。复活时自动调用，用于 brain 注册自动寻路等。"""
-        self.respawn_callbacks.append(callback)
+        if callback not in self.respawn_callbacks:
+            self.respawn_callbacks.append(callback)
+
+    def off_respawn(self, callback) -> None:
+        """移除复活回调，避免插件重启后旧 Brain 继续接管移动。"""
+        try:
+            self.respawn_callbacks.remove(callback)
+        except ValueError:
+            pass
 
     async def submit_goal(self, goal: Goal) -> None:
         await self.tasks.submit(goal)
@@ -829,30 +837,37 @@ class TerrariaAgent:
         if brain:
             await brain.cancel_actions(kind)
 
-    async def send_chat(self, text: str) -> None:
+    async def send_chat(self, text: str) -> bool:
         """通过 Mod 发送聊天消息（A5：加保护，发不出去不炸线程）"""
         try:
             await self.mod.send_chat(text)
+            return True
         except Exception as e:
             self.log(f"发送聊天失败: {e}", "warn")
+            return False
 
-    async def speak(self, text: str, ai_behavior: str = "respond") -> None:
+    async def speak(self, text: str, ai_behavior: str = "respond") -> bool:
         """播报一句话：推给宿主对话 LLM（respond → 语音合成让主人听到）。
 
         - ai_behavior="respond"：猫娘语气回复（触发语音）
         - ai_behavior="read"：静默上下文（不打断主人，只给 LLM 知道）
 
         SDK 的 push_message 是同步方法（返回 PushMessageResult），不能 await。
-        失败时静默（不打游戏内聊天——语音由宿主 LLM 负责，游戏内聊天不可取）。
+        返回是否成功交给宿主；失败必须可观察，调用方才能决定是否兜底。
         """
         plugin = getattr(self, "plugin", None)
         push = getattr(plugin, "push_message", None)
         if not push:
-            return
-        try:
-            push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
-        except Exception:
-            pass
+            self.log("宿主没有 push_message，无法播报猫娘消息", "warn")
+        else:
+            try:
+                push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
+                return True
+            except Exception as exc:
+                self.log(f"猫娘消息推送失败: {exc}", "warn")
+        if ai_behavior == "respond" and self.running:
+            return await self.send_chat(text[:80])
+        return False
 
     def get_state(self) -> Dict[str, Any]:
         if not self.conn.is_mod_connected():
@@ -1087,7 +1102,21 @@ class TerrariaAgent:
         st = self._state
         players = st.get("nearby_players", [])
         if players:
-            await self.navigate_to(players[0]["tile_x"], players[0]["tile_y"])
+            me_x = int(st.get("tile_x", 0) or 0)
+            me_y = int(st.get("tile_y", 0) or 0)
+            mine = self._character_name()
+            valid = []
+            for player in players:
+                if not isinstance(player, dict) or player.get("name") == mine:
+                    continue
+                x = int(player.get("tile_x", player.get("tileX", 0)) or 0)
+                y = int(player.get("tile_y", player.get("tileY", 0)) or 0)
+                if x == 0 and y == 0:
+                    continue
+                valid.append((x, y, (x - me_x) ** 2 + (y - me_y) ** 2))
+            if valid:
+                ox, oy, _ = min(valid, key=lambda item: item[2])
+                await self.navigate_to(ox, oy)
         return True
 
     @property

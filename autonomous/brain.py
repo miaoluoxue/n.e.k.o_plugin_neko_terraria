@@ -107,6 +107,9 @@ class AutonomousBrain:
     async def stop(self) -> None:
         self.running = False
         await self.cancel_actions()
+        off_respawn = getattr(self.agent, "off_respawn", None)
+        if off_respawn:
+            off_respawn(self._on_respawn)
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -417,7 +420,9 @@ class AutonomousBrain:
         if players and drive == "social":
             if not self._autonomy_allowed("follow"):
                 return
-            ppos = (players[0]["tile_x"], players[0]["tile_y"])
+            ppos = self._nearest_owner(state)
+            if ppos is None:
+                return
             distance = abs(ppos[0] - state.get("tile_x", 0)) + abs(ppos[1] - state.get("tile_y", 0))
             if distance > 12:
                 await self.agent.mod.navigate_to(*ppos, timeout=5)
@@ -579,10 +584,18 @@ class AutonomousBrain:
             players = st.get("nearby_players", []) or []
             if not players:
                 return  # 单人模式，不需要找
-
-            owner = players[0]
-            ox, oy = owner.get("tile_x", 0), owner.get("tile_y", 0)
-            dist = owner.get("distance", 9999)
+            owner_pos = self._nearest_owner(st)
+            if owner_pos is None:
+                return
+            ox, oy = owner_pos
+            owner = min(
+                (p for p in players if isinstance(p, dict)),
+                key=lambda p: (int(p.get("tile_x", p.get("tileX", 0)) or 0) - ox) ** 2
+                + (int(p.get("tile_y", p.get("tileY", 0)) or 0) - oy) ** 2,
+                default={},
+            )
+            dist = ((ox - int(st.get("tile_x", 0) or 0)) ** 2
+                    + (oy - int(st.get("tile_y", 0) or 0)) ** 2) ** 0.5
             name = owner.get("name", "主人")
 
             print(f"[brain] ✨ 复活后检测到玩家 {name} 距离={dist}，自动寻路回去")
@@ -607,6 +620,31 @@ class AutonomousBrain:
         if self._respawn_task and not self._respawn_task.done():
             self._respawn_task.cancel()
         self._respawn_task = asyncio.create_task(_navigate_back())
+
+    def _nearest_owner(self, state: Dict[str, Any]):
+        """返回最近的有效主人坐标，过滤自身和联机状态中的空槽位。"""
+        me_x = int(state.get("tile_x", 0) or 0)
+        me_y = int(state.get("tile_y", 0) or 0)
+        try:
+            my_name = self.agent._character_name()
+        except Exception:
+            my_name = ""
+        best = None
+        best_dist = float("inf")
+        for player in state.get("nearby_players", []) or []:
+            if not isinstance(player, dict):
+                continue
+            if my_name and player.get("name") == my_name:
+                continue
+            x = int(player.get("tile_x", player.get("tileX", 0)) or 0)
+            y = int(player.get("tile_y", player.get("tileY", 0)) or 0)
+            if x == 0 and y == 0:
+                continue
+            dist = (x - me_x) ** 2 + (y - me_y) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = (x, y)
+        return best
 
     async def _on_combat_hit(self, data: Any) -> None:
         """受击即时响应：C# 推 combat_hit → 交互引擎立即惊呼。"""

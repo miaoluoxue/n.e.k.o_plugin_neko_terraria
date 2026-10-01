@@ -334,6 +334,7 @@ class InteractionEngine:
         # 运行状态
         self._running: bool = False
         self._tick_task: Optional[asyncio.Task] = None
+        self._event_bus = None
 
         # 冷却（防重叠）
         self._speech_cooldown_until: float = 0.0
@@ -342,7 +343,8 @@ class InteractionEngine:
         self._last_owner_speech_ts: float = time.time()
         try:
             from .event_bus import get_event_bus
-            get_event_bus().subscribe("owner_spoke", self._on_owner_spoke)
+            self._event_bus = get_event_bus()
+            self._event_bus.subscribe("owner_spoke", self._on_owner_spoke)
         except Exception:
             pass
 
@@ -375,15 +377,27 @@ class InteractionEngine:
         """启动交互引擎主循环。"""
         if self._running:
             return
+        if self._event_bus is None:
+            try:
+                from .event_bus import get_event_bus
+                self._event_bus = get_event_bus()
+                self._event_bus.subscribe("owner_spoke", self._on_owner_spoke)
+            except Exception:
+                self._event_bus = None
         self._running = True
         self._tick_task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
         """停止交互引擎。"""
         self._running = False
-        if self._tick_task:
-            self._tick_task.cancel()
-            self._tick_task = None
+        task = self._tick_task
+        self._tick_task = None
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._event_bus is not None:
+            self._event_bus.unsubscribe("owner_spoke", self._on_owner_spoke)
+            self._event_bus = None
 
     async def _loop(self) -> None:
         """主循环：动态间隔 tick。"""
@@ -519,16 +533,23 @@ class InteractionEngine:
         # 失败/不可用时 respond 降级为游戏内聊天（send_chat）——保证不静默。
         # 这是"情感交互有声音"的兜底关键：宿主没接 push_message 时猫娘也会开口。
         try:
-            await self.agent.speak(text, ai_behavior=behavior)
+            delivered = await self.agent.speak(text, ai_behavior=behavior)
             # #95 治理：只有真正开口（respond）才清零冲动 + 进入说话冷却。
             # read 是上下文数据（step_done/画面感知），blind 是紧急短句——
             # 二者若也刷新冷却/清零 urge，挖矿时每步 read 会持续压制主动说话，
             # 猫娘永远不开口（"闷头干活"假象）。blind 紧急短句也不设冷却，
             # 允许连续危险连续喊。
-            if behavior == "respond":
+            if behavior == "respond" and delivered:
                 self._urge = 0.0  # 说过话了，冲动值清零
                 self._speech_cooldown_until = time.time() + self.timing.reaction_delay()
-            self._last_speech_ts = time.time()
+            if delivered:
+                self._last_speech_ts = time.time()
+            elif behavior == "respond" and getattr(self.agent, "running", False):
+                # 宿主推送失败时给游戏内一条短兜底，避免任务结果/危险提示完全丢失。
+                try:
+                    await self.agent.send_chat(text[:80])
+                except Exception:
+                    pass
         except Exception:
             pass  # 推送失败不崩溃
 
