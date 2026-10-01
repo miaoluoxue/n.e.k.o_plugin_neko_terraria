@@ -951,9 +951,14 @@ namespace NekoTerrariaLink
         {
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
             if (!InReach(x, y, 8)) return false;   // 太远：人物没走过去就不许拆
+            if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) return false;
+            var before = Main.tile[x, y];
+            if (before == null || !before.HasTile) return false;
             WorldGen.KillTile(x, y, false, false, true);
-            SyncTile(x, y, 1);   // 破坏 → 服务器广播
-            return true;
+            var after = Main.tile[x, y];
+            bool changed = after == null || !after.HasTile;
+            if (changed) SyncTile(x, y, 1);   // 破坏 → 服务器广播
+            return changed;
         }
 
         private bool PlaceTile(Dict cmd)
@@ -1858,8 +1863,11 @@ namespace NekoTerrariaLink
         {
             int id = (int)cmd.GetNum("item_id"), stack = (int)cmd.GetNum("stack");
             var player = Main.LocalPlayer;
+            if (player == null || !player.active || id <= 0 || id >= ItemLoader.ItemCount || stack <= 0)
+                return false;
             var item = new Item();
             item.SetDefaults(id);
+            if (item.type <= 0 || item.IsAir) return false;
             item.stack = stack;
             player.QuickSpawnItem(Src, item, stack);
             return true;
