@@ -93,6 +93,11 @@ class SituationEngine:
         """从插件记忆取一条最近互动（主人行为模式的轻量提示）。"""
         try:
             store = getattr(self.agent, "memory", None) or getattr(self.agent, "_memory", None)
+            if store is None:
+                plugin = getattr(self.agent, "plugin", None)
+                getter = getattr(plugin, "_memory_store", None)
+                if getter:
+                    store = getter()
             if store and hasattr(store, "recall"):
                 hits = store.recall("主人", limit=1) if callable(store.recall) else None
                 if hits:

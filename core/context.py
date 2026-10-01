@@ -203,7 +203,7 @@ def build_user_context(agent: Any) -> str:
     y = state.get("tile_y", "?")
     lines.append(f"位置: ({x}, {y})")
 
-    time_label = str(state.get("time", "") or "").strip()
+    time_label = str(state.get("time_of_day", state.get("time", "")) or "").strip()
     lines.append(f"时间: {time_label or '未知'}")
 
     biome = str(state.get("biome", "") or "").strip()
@@ -237,11 +237,16 @@ def build_user_context(agent: Any) -> str:
 
     # 背包摘要
     hotbar = state.get("hotbar_slots", []) or []
+    if not hotbar:
+        try:
+            hotbar = (getattr(agent, "get_inventory_sync", lambda: {})() or {}).get("hotbar", []) or []
+        except Exception:
+            hotbar = []
     if hotbar:
         items = []
         for slot in hotbar:
             name = str(slot.get("name", "") or "")
-            count = slot.get("count", 1)
+            count = slot.get("count", slot.get("stack", 1))
             if name:
                 items.append(f"{name}" + (f"x{count}" if count > 1 else ""))
         if items:

@@ -1,5 +1,6 @@
 """并行执行器：多层动作优先级队列（移动/攻击/垫土可并行）。"""
 
+import inspect
 from typing import Any, Callable, Dict, List
 
 
@@ -15,10 +16,9 @@ class ParallelExecutor:
         for layer in sorted(self._layers):
             for action in self._layers[layer]:
                 try:
-                    if hasattr(action, "__await__"):
-                        await action()
-                    else:
-                        action()  # 普通 callable 同步调用（曾缺 else，静默丢弃）
+                    result = action()
+                    if inspect.isawaitable(result):
+                        await result
                 except Exception:
                     pass
             self._layers[layer].clear()

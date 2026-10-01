@@ -24,6 +24,7 @@ class TerrariaService:
         self.cfg = plugin._config
         self.push = push_message
         self._running = False
+        self._context_task: asyncio.Task | None = None
         self._context_seq = 0
         self._last_hp = 100
         self._joined = False
@@ -35,10 +36,12 @@ class TerrariaService:
         self._event_emitter: GameEventEmitter = GameEventEmitter(self.agent)
 
     async def start(self) -> None:
+        if self._running:
+            return
         self._running = True
         if self.interaction:
             self._event_emitter.bind_interaction(self.interaction)
-        asyncio.create_task(self._context_push_loop())
+        self._context_task = asyncio.create_task(self._context_push_loop())
         bus = get_event_bus()
         bus.subscribe("player_died", self._on_player_died)
         bus.subscribe("player_respawned", self._on_player_respawned)
@@ -46,6 +49,14 @@ class TerrariaService:
     async def stop(self) -> None:
         """停止所有后台任务并清理资源。"""
         self._running = False
+        task = self._context_task
+        self._context_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        bus = get_event_bus()
+        bus.unsubscribe("player_died", self._on_player_died)
+        bus.unsubscribe("player_respawned", self._on_player_respawned)
         if self._event_emitter:
             self._event_emitter.reset()
         self.interaction = None
@@ -264,5 +275,8 @@ class TerrariaService:
             self.push(
                 parts=[{"type": "text", "text": content}],
                 ai_behavior=behavior)
-        except Exception:
-            pass  # 推送失败不阻塞状态循环
+        except Exception as exc:
+            try:
+                self.plugin.logger.warning(f"[service] 状态推送失败: {exc}")
+            except Exception:
+                pass

@@ -112,9 +112,11 @@ class VisionPipeline:
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
+        task = self._task
+        self._task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _capture_loop(self) -> None:
         while self._running:

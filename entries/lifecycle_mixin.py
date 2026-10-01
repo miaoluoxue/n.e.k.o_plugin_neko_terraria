@@ -312,11 +312,18 @@ class LifecycleMixin:
         在这里 create_task 的后台任务能存活；且 create_task 立即返回，不阻塞
         downlink_ready 的标记（host 在钩子返回后才 set）。
         """
-        if getattr(self, "_boot_task", None) is not None:
-            return
+        task = getattr(self, "_boot_task", None)
+        if task is not None:
+            if not task.done():
+                return
+            if not getattr(self, "_boot_failed", False):
+                return
+            self._boot_task = None
+            self._boot_failed = False
         self._boot_task = asyncio.create_task(self._boot())
 
     async def _boot(self) -> None:
+        self._boot_failed = False
         try:
             self.logger.info("[boot] 开始启动 neko_terraria...")
             await self._load_config()
@@ -347,13 +354,18 @@ class LifecycleMixin:
             try:
                 await asyncio.wait_for(self._autonomous_brain.start(), timeout=20.0)
             except asyncio.TimeoutError:
-                self.logger.warning("[boot] 自治大脑启动超时，尝试强制拉起")
+                self.logger.warning("[boot] 自治大脑启动超时，清理半初始化状态后重试")
                 try:
+                    await self._autonomous_brain.stop()
                     await self._autonomous_brain.start()
                 except Exception:
                     pass
             except Exception as e:
                 self.logger.warning(f"[boot] 自治大脑启动异常: {e}")
+                try:
+                    await self._autonomous_brain.stop()
+                except Exception:
+                    pass
             self.logger.info("[boot] 自治大脑启动完成")
 
             # v2.1: 交互引擎暴露给 agent → service/coordinator 可通过 agent._neko_interaction 访问
@@ -407,6 +419,7 @@ class LifecycleMixin:
 
             self.logger.info("猫娘已进入泰拉瑞亚世界（v2.1 交互引擎 + 紧急事件已接通）")
         except Exception as e:
+            self._boot_failed = True
             import traceback
             self.logger.error(f"[boot] 启动过程中抛出未捕获异常: {e}")
             self.logger.error(f"[boot] 堆栈跟踪:\n{traceback.format_exc()}")

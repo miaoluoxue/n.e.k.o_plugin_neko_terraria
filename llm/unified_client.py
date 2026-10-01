@@ -117,7 +117,10 @@ class UnifiedLLMClient:
         if not self.base_url:
             raise ValueError("openai_compatible 需要设置 base_url")
 
-        url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+        url = self.base_url.rstrip("/")
+        if "/chat/completions" not in url:
+            url = url if url.endswith("/v1") else f"{url}/v1"
+            url = f"{url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
