@@ -1,6 +1,7 @@
 """任务执行器：任务生命周期与占用仲裁的唯一权威（谁在做、能否打断、怎么停）。"""
 
 import asyncio
+import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -234,11 +235,20 @@ class TaskExecutor:
         data["event"] = event
         for cb in list(self._callbacks[event]):
             try:
-                if asyncio.iscoroutinefunction(cb):
-                    task = asyncio.create_task(cb(data))
-                    task.add_done_callback(
-                        lambda t: None if t.cancelled() else t.exception())
-                else:
-                    cb(data)
-            except Exception:
-                pass  # 回调异常不传播，不杀 executor
+                result = cb(data)
+                if inspect.isawaitable(result):
+                    task = asyncio.create_task(result)
+                    task.add_done_callback(self._callback_done)
+            except Exception as exc:
+                self._log(f"任务回调失败：{event}: {exc}", "warn")
+
+    def _callback_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception as exc:
+            self._log(f"读取任务回调异常失败：{exc}", "warn")
+            return
+        if error is not None:
+            self._log(f"任务回调异常：{error}", "warn")
