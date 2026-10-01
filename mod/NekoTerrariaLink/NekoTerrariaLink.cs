@@ -285,7 +285,9 @@ namespace NekoTerrariaLink
                                 ["alive"] = npc.life > 0 });
                     }
                 }
-                // 附近玩家（300 格内，非自身，坐标有效）
+                // 附近玩家（1000 格内，非自身，坐标有效）。跟随任务需要
+                // 在主人暂时走远时仍拿到最后的真实目标，否则会误判“失踪”
+                // 并原地等待；玩家数量很少，扩大范围不会显著增加帧负担。
                 // 范围必须大于 Python 侧 follow_trigger_dist(60)：
                 // 否则主人走出 80 格后 nearby_players 变空，跟随直接"跟丢"（猫娘永远追不上）
                 // 已下线/未同步的槽位 active=true 但 Center 为 (0,0)，必须过滤，
@@ -300,7 +302,7 @@ namespace NekoTerrariaLink
                     if (plTx == 0 && plTy == 0) continue;  // 残留槽位无真实位置
                     int dx = plTx - (int)(p.Center.X / 16);
                     int dy = plTy - (int)(p.Center.Y / 16);
-                    if (Math.Abs(dx) < 300 && Math.Abs(dy) < 300)
+                    if (Math.Abs(dx) < 1000 && Math.Abs(dy) < 1000)
                         players.Add(new Dict { ["name"] = pl.name,
                             ["tile_x"] = plTx, ["tile_y"] = plTy });
                 }
@@ -602,6 +604,9 @@ namespace NekoTerrariaLink
 
                     // ── 握手：先发 welcome，让 Python 确认字节流是干净的 ──
                     stream = client.GetStream();
+                    // Send() 使用同步 Write；设置写超时避免客户端卡住/断开时
+                    // 持有发送锁无限等待，进而拖住状态推送和停止命令。
+                    stream.WriteTimeout = 1000;
                     SendRawUtf8(stream, "{\"welcome\":true}\n");
                     _activeStream = stream;   // 握手完成后才允许并行推送事件
                     Logger.Info("[TCP] 已发送 welcome 握手");
@@ -728,6 +733,7 @@ namespace NekoTerrariaLink
         {
             try
             {
+                s.WriteTimeout = 1000;
                 var bytes = Encoding.UTF8.GetBytes(text);
                 s.Write(bytes, 0, bytes.Length);
             }
@@ -2766,7 +2772,7 @@ namespace NekoTerrariaLink
                 if (plTx == 0 && plTy == 0) continue;  // 残留槽位无真实位置
                 int dx = plTx - (int)(p.Center.X / 16);
                 int dy = plTy - (int)(p.Center.Y / 16);
-                if (Math.Abs(dx) < 300 && Math.Abs(dy) < 300)
+                if (Math.Abs(dx) < 1000 && Math.Abs(dy) < 1000)
                     players.Add(new Dict {
                         ["name"] = pl.name, ["tileX"] = plTx, ["tileY"] = plTy,
                         ["hp"] = pl.statLife, ["max_life"] = pl.statLifeMax,

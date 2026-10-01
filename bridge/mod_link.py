@@ -196,6 +196,10 @@ class ModLink:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # 断线时无需再等待 stop_actions 的 TCP 回执；动作任务已经在
+        # Python 侧取消，连接恢复后也不应把旧的停止请求排到新会话里。
+        if not self.conn.is_mod_connected():
+            return False
         resp = await self.conn.request_mod({"cmd": "stop_actions"}, timeout=3.0)
         return bool(resp and resp.get("ok"))
 

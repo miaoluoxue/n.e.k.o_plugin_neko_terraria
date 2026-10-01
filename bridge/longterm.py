@@ -216,12 +216,16 @@ class LongTermManager:
                 task.status = LT_STOPPED
                 if self._tasks.get(task.kind) is task:
                     try:
-                        if self.agent and not self.agent.executor.busy():
+                        # stop() 会在 runner 退出后统一停止 Mod 动作；取消态
+                        # 这里再等一次 TCP 回执会把停止延迟到请求超时。
+                        if not cancelled and self.agent and not self.agent.executor.busy():
                             await self.agent.mod.stop_actions()
                     finally:
                         self._tasks.pop(task.kind, None)
                         self._runners.pop(task.kind, None)
                         self._stop_flags.pop(task.kind, None)
+                # 停止路径已经由 stop() 处理；取消态不能再等待宿主 LLM
+                # 的播报，否则主人喊停时 runner 可能长期占着槽位。
                 if not cancelled and self.agent:
                     if blocked:
                         text = (f"[任务受阻] 「{task.name}」已停止，实际进度 {task.progress}。"
