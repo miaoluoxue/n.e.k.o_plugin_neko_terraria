@@ -532,8 +532,7 @@ class InteractionEngine:
         # 此处传递的是事实和生成要求，不是 LLM 的最终台词。
         # 随机插字会破坏物品名、数量和指令，语气交给宿主人设生成。
         # 走 agent.speak：优先宿主 push_message（LLM 人设润色），
-        # 失败/不可用时 respond 降级为游戏内聊天（send_chat）——保证不静默。
-        # 这是"情感交互有声音"的兜底关键：宿主没接 push_message 时猫娘也会开口。
+        # 宿主拒收时记录失败；只有面向玩家的 blind 短句可直接游戏聊天兜底。
         try:
             delivered = await self.agent.speak(text, ai_behavior=behavior)
             # #95 治理：只有真正开口（respond）才清零冲动 + 进入说话冷却。
@@ -546,12 +545,9 @@ class InteractionEngine:
                 self._speech_cooldown_until = time.time() + self.timing.reaction_delay()
             if delivered and behavior in ("respond", "blind"):
                 self._last_speech_ts = time.time()
-            elif behavior == "respond" and getattr(self.agent, "running", False):
-                # 宿主推送失败时给游戏内一条短兜底，避免任务结果/危险提示完全丢失。
-                try:
-                    await self.agent.send_chat(text[:80])
-                except Exception:
-                    pass
+            # respond/read 内容是给宿主 LLM 的事实和提示词；宿主拒收时
+            # 不能把内部提示词原样发到游戏聊天。危险短句走 blind 分支，
+            # 由 agent.speak 负责安全的游戏内兜底。
         except Exception:
             pass  # 推送失败不崩溃
 

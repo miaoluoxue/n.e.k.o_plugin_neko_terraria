@@ -54,13 +54,13 @@ class GoalToolsMixin:
             - phase=act（已交 executor）→ task_done/step_done 回调已由 brain 推回
               （不重复）。
             - phase=think/plan（还没进执行器就被拒：not_doable / empty_plan /
-              not_understood）→ executor 不会发任何事件，必须在这里 read 回读，
+              not_understood）→ executor 不会发任何事件，必须在这里请求回应，
               否则宿主 LLM 只看到"已受理"后永远等不到结果、误以为任务还在跑
               （对齐 mc：拒绝要明确说出来，绝不能假装在做）。busy 由 executor
               发 interrupted(busy)，brain 会 respond「没接上」，这里不重复。
             chat 由 _do_chat 直接 respond（不重复）。只有 stop / unknown(反问) /
-            longterm(启动确认) 这些即时结果没有异步通道，这里用 read 模式回传
-            给宿主 LLM，避免 fire-and-forget 后 LLM 失明。
+            longterm(启动确认) 这些即时结果没有异步通道，这里请求宿主回应；
+            已在运行的重复指令仅作为静默上下文。
             """
             try:
                 res = await self._agent.command(text, source="owner")
@@ -68,11 +68,15 @@ class GoalToolsMixin:
                 self._agent.logger.warning(f"[llm_command] 执行异常: {e}")
                 await self._agent.speak(
                     f"[指令受阻] 「{text}」未能执行：{e}。请如实向主人说明，不要自动重派。",
-                    ai_behavior="respond")
+                    ai_behavior="respond", fallback_text=f"指令未能执行：{e}")
                 return
             mode = str(res.get("mode", "") or "")
             if mode == "chat":
                 return  # _do_chat 已覆盖
+            if res.get("reported") is True:
+                # 询问/闲聊已经通过游戏聊天或宿主推送送达；不要把同一
+                # 结果再次包装成“指令结果”交给 LLM，避免猫娘重复开口。
+                return
             if mode == "finite":
                 phase = str(res.get("phase", "") or "")
                 status = str(res.get("status", "") or "")
@@ -85,11 +89,11 @@ class GoalToolsMixin:
                 if not out:
                     return
                 # think/plan 阶段拒绝（not_doable/empty_plan/not_understood）：
-                # 无 executor 事件 → read 回读，让宿主 LLM 如实知道"没做/做不了"
+                # 无 executor 事件 → 请求宿主向主人说明"没做/做不了"
                 try:
                     await self._agent.speak(
                         f"[指令受阻] {out}。请根据事实向主人说明原因，不要自动重派旧任务。",
-                        ai_behavior="respond")
+                        ai_behavior="respond", fallback_text=out)
                 except Exception:
                     pass
                 return
@@ -98,7 +102,9 @@ class GoalToolsMixin:
                 return
             try:
                 await self._agent.speak(
-                    f"[指令结果] {out}", ai_behavior="read")
+                    f"[指令结果] {out}。请只根据此结果回应，不要自动重派指令。",
+                    ai_behavior="read" if res.get("status") == "running" else "respond",
+                    fallback_text=out)
             except Exception:
                 pass
 

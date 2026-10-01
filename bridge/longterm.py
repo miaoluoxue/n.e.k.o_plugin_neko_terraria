@@ -233,7 +233,9 @@ class LongTermManager:
                     else:
                         text = (f"[任务结束] 「{task.name}」已结束，实际进度 {task.progress}。"
                                 f"{task.note}。请根据事实自然告知主人，不要自动重派旧任务。")
-                    await self.agent.speak(text, ai_behavior="respond")
+                    await self.agent.speak(
+                        text, ai_behavior="respond",
+                        fallback_text=f"「{task.name}」已结束，实际进度 {task.progress}。{task.note}")
 
         self._runners[task.kind] = asyncio.ensure_future(_wrap())
         self._log(f"开始长期任务：{task.name}", "task")

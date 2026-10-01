@@ -847,8 +847,10 @@ class TerrariaAgent:
         names = await self.longterm.stop_all(why)
         fg = await self.executor.cancel_current(why)
         self.inquiry.cancel_all()
-        await self.mod.stop_actions()
-        return {"ok": True, "foreground_cancelled": fg, "longterm_stopped": names}
+        actions_stopped = await self.mod.stop_actions()
+        stopped = bool(actions_stopped) and not self.executor.busy() and not self.longterm.busy_kinds()
+        return {"ok": stopped, "actions_stopped": bool(actions_stopped),
+                "foreground_cancelled": fg, "longterm_stopped": names}
 
     @staticmethod
     def _action_kind(kind: str) -> str:
@@ -904,20 +906,21 @@ class TerrariaAgent:
     async def send_chat(self, text: str) -> bool:
         """通过 Mod 发送聊天消息（A5：加保护，发不出去不炸线程）"""
         try:
-            await self.mod.send_chat(text)
-            return True
+            return bool(await self.mod.send_chat(text))
         except Exception as e:
             self.log(f"发送聊天失败: {e}", "warn")
             return False
 
-    async def speak(self, text: str, ai_behavior: str = "respond") -> bool:
+    async def speak(self, text: str, ai_behavior: str = "respond", *,
+                    fallback_text: str = "") -> bool:
         """播报一句话：推给宿主对话 LLM（respond → 语音合成让主人听到）。
 
         - ai_behavior="respond"：猫娘语气回复（触发语音）
         - ai_behavior="read"：静默上下文（不打断主人，只给 LLM 知道）
 
         SDK 的 push_message 是同步方法（返回 PushMessageResult），不能 await。
-        返回是否成功交给宿主；失败必须可观察，调用方才能决定是否兜底。
+        返回是否受理或已发送游戏聊天，不代表语音已播放。
+        fallback_text 只能传给玩家看的事实短句，不能包含 LLM 提示词。
         """
         plugin = getattr(self, "plugin", None)
         push = getattr(plugin, "push_message", None)
@@ -925,12 +928,20 @@ class TerrariaAgent:
             self.log("宿主没有 push_message，无法播报猫娘消息", "warn")
         else:
             try:
-                push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
-                return True
+                result = push(parts=[{"type": "text", "text": text}], ai_behavior=ai_behavior)
+                if isinstance(result, dict) and (
+                        result.get("submitted") is False or result.get("ok") is False):
+                    self.log(f"宿主未受理猫娘消息：{result.get('reason', 'unknown')}", "warn")
+                else:
+                    # SDK acknowledgement confirms submission, not playback.
+                    return True
             except Exception as exc:
                 self.log(f"猫娘消息推送失败: {exc}", "warn")
-        if ai_behavior == "respond" and self.running:
-            return await self.send_chat(text[:80])
+        # respond/read 内容通常是给宿主 LLM 的事实和提示词，不能把内部
+        # 指令原文直接显示在游戏聊天里。blind 才是已经写给玩家看的紧急短句。
+        fallback = text if ai_behavior == "blind" else fallback_text
+        if ai_behavior in ("blind", "respond") and fallback and self.running:
+            return await self.send_chat(fallback[:200])
         return False
 
     def get_state(self) -> Dict[str, Any]:

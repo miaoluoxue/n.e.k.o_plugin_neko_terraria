@@ -758,7 +758,8 @@ class AutonomousBrain:
                 head += f"实际情况：{out}。"
             followup = "根据事实说明已做的部分与尚未确认的部分（1-2句）；不得说完成、收到、钓到，也不要自动重派。"
         try:
-            await self.agent.speak(head + followup, ai_behavior="respond")
+            await self.agent.speak(head + followup, ai_behavior="respond",
+                                   fallback_text=head)
         except Exception:
             pass
 

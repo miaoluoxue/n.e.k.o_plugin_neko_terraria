@@ -123,7 +123,7 @@ class TaskCoordinator:
                 await self._announce_inquiry_answered(answered)
                 return {"ok": True, "status": "inquiry_answered",
                         "question": answered.question, "answer": answered.answer,
-                        "output": answered.answer}
+                        "output": f"已记录主人对『{answered.question}』的回答：{text}。尚未确认后续动作结果。"}
 
         # v0.7: 指令情感反馈（夸/凶）——主人语气影响依恋值与情绪
         try:
@@ -141,17 +141,11 @@ class TaskCoordinator:
                         heart.on_praise(text)
                     if interaction:
                         interaction.mood.trigger("excitement", 0.5)
-                        await interaction.push_speech(
-                            f"[被夸] 主人夸我了：{text}\n开心地回应（1句话，15字内）",
-                            behavior="respond")
                 elif aff == "scold":
                     if heart:
                         heart.on_scold(text)
                     if interaction:
                         interaction.mood.trigger("tired", 0.45)
-                        await interaction.push_speech(
-                            f"[被凶] 主人凶我了：{text}\n委屈地回应（1句话，15字内）",
-                            behavior="respond")
         except Exception:
             pass
 
@@ -168,12 +162,8 @@ class TaskCoordinator:
         if result.source == "semantic":
             return await self._handle_unknown(text, result)
 
-        # 先回话（LLM 解析出的 pre_reply，如"好的主人~"）
-        if result.pre_reply:
-            try:
-                await self.agent.send_chat(result.pre_reply)
-            except Exception:
-                pass
+        # 意图解析器只提供理解结果。闲聊由宿主人设统一回复，任务受理
+        # 与终态由工具/执行器回报，避免 pre_reply 与实际回复重复开口。
 
         # 处理打断级别
         if result.interrupt_level > 0 and result.mode not in ("chat", "stop"):
@@ -232,13 +222,10 @@ class TaskCoordinator:
 
     # ---------------- 闲聊处理 ----------------
 
-    async def _do_chat(self, text: str, it: IntentResult) -> None:
+    async def _do_chat(self, text: str, it: IntentResult) -> bool:
         """陪伴式闲聊：把主人的话题交给主程序 LLM，以角色人设完整回应。"""
         try:
             plugin = getattr(self.agent, "plugin", None)
-            push = getattr(plugin, "push_message", None)
-            if not push:
-                return
             # 当前游戏状态一句话（防 LLM 编造）
             try:
                 anchor = build_anchor_msg(self.agent)
@@ -251,24 +238,19 @@ class TaskCoordinator:
                 style = inter.mood.primary_style()
                 if style:
                     mood_note = f"\n你此刻的心情：{json.dumps(style, ensure_ascii=False)}"
-            push(
-                parts=[{"type": "text", "text": (
-                    f"[主人找你聊天] 主人说：『{text}』{mood_note}"
-                    f"\n{anchor}\n"
-                    f"用猫娘语气自然回应主人的话（闲聊，1-2句，20字内，"
-                    f"不要做任务、不要提'执行/完成'）")}],
+            return await self.agent.speak(
+                f"[主人找你聊天] 主人说：『{text}』{mood_note}"
+                f"\n{anchor}\n"
+                f"用猫娘语气自然回应主人的话（闲聊，1-2句，20字内，"
+                f"不要做任务、不要提'执行/完成'）",
                 ai_behavior="respond")
         except Exception:
-            pass  # 闲聊推送失败不阻塞
+            return False  # 闲聊推送失败不阻塞
 
     # ---------------- 询问回答处理 ----------------
 
     async def _announce_inquiry_answered(self, answered) -> None:
-        """主人回答了询问 → 猫娘回应一句 + 通知交互引擎。"""
-        try:
-            await self.agent.send_chat("好的主人~")
-        except Exception:
-            pass
+        """发布回答事件；回应统一走指令结果，避免额外抢答。"""
         try:
             from ..autonomous.event_bus import get_event_bus
             await get_event_bus().publish("inquiry_answered", {
@@ -339,9 +321,9 @@ class TaskCoordinator:
                     "output": "已停止：" + "、".join(stopped) if stopped else "当前没有对应的运行任务。"}
         # 没指明停什么：全停
         result = await self.agent.stop_everything("主人喊停")
-        if self.executor.busy() or self.lt.busy_kinds():
+        if self.executor.busy() or self.lt.busy_kinds() or not result.get("actions_stopped"):
             return {"ok": False, "status": "unconfirmed",
-                    "output": "已发送停止请求，但仍有任务在退出，尚不能确认完全停下。"}
+                    "output": "已发送停止请求，但任务退出或游戏动作停止尚未全部确认。"}
         names = result["longterm_stopped"]
         if result["foreground_cancelled"]:
             names.append("当前任务")
@@ -440,7 +422,7 @@ class TaskCoordinator:
         # 统一规范化：LLM 兜底可能产出字符串步骤，task_brain 需要 dict
         from ..llm.intent_parser import LLMIntentParser
         it.steps = LLMIntentParser._normalize_steps(steps)
-        # 人类化延迟：pre_reply 已发，"好的喵~"说了 → 停顿一下再动手
+        # 短暂反应时间；动作和结果仍由执行器确认。
         await asyncio.sleep(self.timing.command_delay())
         return await self.run_foreground(it.steps, it.raw or it.reason, source)
 
@@ -555,11 +537,13 @@ class TaskCoordinator:
                 )
                 if inq:
                     try:
-                        await self.agent.send_chat(inq.question)
+                        reported = await self.agent.speak(
+                            f"[指令确认] {inq.question} 请向主人确认，不要自行执行建议。",
+                            fallback_text=inq.question)
                         # 等待回答（非阻塞，由主循环处理）
                         return {"ok": False, "status": "confirming",
                                 "mode": "unknown", "output": inq.question,
-                                "intent": result.to_dict()}
+                                "intent": result.to_dict(), "reported": reported}
                     except Exception:
                         pass
 
@@ -574,15 +558,17 @@ class TaskCoordinator:
                 )
                 if inq:
                     try:
-                        await self.agent.send_chat(inq.question)
+                        reported = await self.agent.speak(
+                            f"[指令询问] {inq.question} 请向主人澄清，不要猜测任务。",
+                            fallback_text=inq.question)
                         return {"ok": False, "status": "need_clarification",
                                 "mode": "unknown", "output": inq.question,
-                                "intent": result.to_dict()}
+                                "intent": result.to_dict(), "reported": reported}
                     except Exception:
                         pass
 
         # 默认：陪伴式回应（不是客服提示）
-        await self._do_chat(text, result)
+        reported = await self._do_chat(text, result)
         return {"ok": False, "status": "not_understood", "mode": "unknown",
                 "output": "喵？主人说的我有点懵，换个说法跟我说嘛~",
-                "intent": result.to_dict()}
+                "intent": result.to_dict(), "reported": reported}

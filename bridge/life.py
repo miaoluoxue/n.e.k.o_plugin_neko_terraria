@@ -133,27 +133,26 @@ class LifeEngine:
             self.agent.log(f"自动制作工具失败：{exc}", "warn")
         return False
 
-    async def _prepare_tool_materials(self, recipe, inventory, seen: set[int]) -> bool:
+    async def _prepare_tool_materials(self, recipe, inventory, seen: set[int],
+                                      output_amount: int = 1) -> bool:
         """Obtain missing recipe materials without manufacturing the tool itself."""
         from .reasoner import Reasoner
         from .world_model import WorldModel
 
-        if self._tool_prepare_depth >= 2 or recipe.item_id in seen:
+        if recipe.item_id in seen:
             return False
         seen = seen | {recipe.item_id}
-        _takes, missing = recipe.requirements(1, inventory)
+        output_amount = max(1, int(output_amount or 1))
+        _takes, missing = recipe.requirements(output_amount, inventory)
         if not missing:
             return True
+        if self._tool_prepare_depth >= 2:
+            return False
         self._tool_prepare_depth += 1
         try:
             for name, amount in missing:
                 iid = self.agent.resolve_item(name)
                 if iid <= 0 or iid in seen:
-                    return False
-                # Wood is the classic axe->wood->axe cycle.  Punching trees is
-                # intentionally not treated as a confirmed wood source here.
-                if iid == 9:
-                    self.last_failure = f"制作工具还缺木材×{amount}（不能用待制作的斧头递归砍树）"
                     return False
                 try:
                     chest = await self.agent.nearest_chest_with(name)
@@ -166,6 +165,10 @@ class LifeEngine:
                     raise
                 except Exception:
                     pass
+                # 先检查真实箱子，再阻断“缺斧头→砍木材→做斧头”的循环。
+                if iid == 9:
+                    self.last_failure = f"制作工具还缺木材×{amount}（未能从箱子取足，不能用待制作的斧头递归砍树）"
+                    return False
                 # Prefer an actual mining result for recognized ore materials.
                 try:
                     if Reasoner(self.agent, None)._is_mineable(name):
@@ -184,7 +187,8 @@ class LifeEngine:
                 child = book.find(name, inventory=inventory, amount=amount)
                 if child is None or not child.environment_ready:
                     return False
-                if not await self._prepare_tool_materials(child, inventory, seen):
+                if not await self._prepare_tool_materials(
+                        child, inventory, seen, output_amount=amount):
                     return False
                 before = await self.agent.mod.get_inventory()
                 crafted = await self.agent.mod.craft(
@@ -196,7 +200,10 @@ class LifeEngine:
                 if crafted <= 0 or gained < amount:
                     return False
                 inventory = await WorldModel(self.agent, book).snapshot()
-            return True
+            # 子配方可能消耗父配方也需要的材料，重新核对整份实际库存。
+            inventory = await WorldModel(self.agent, getattr(
+                self.agent, "recipe_book", None)).snapshot()
+            return not recipe.requirements(output_amount, inventory)[1]
         finally:
             self._tool_prepare_depth -= 1
 

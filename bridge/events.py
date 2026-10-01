@@ -30,7 +30,7 @@ class EventResponder:
 
     async def _push(self, text: str, behavior: str = "respond") -> None:
         """A5：异步播报，不可用时游戏内聊天兜底，保证不静默。"""
-        await self.agent.speak(text, ai_behavior=behavior)
+        await self.agent.speak(text, ai_behavior=behavior, fallback_text=text)
 
     async def _on_boss_spawned(self, data: Any) -> None:
         name = data.get("name", "未知Boss") if isinstance(data, dict) else "未知Boss"
