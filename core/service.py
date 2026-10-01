@@ -117,48 +117,74 @@ class TerrariaService:
         # joined 推送延迟到 agent 真正连接后（boot 不再自动启动 AI 客户端，
         # 未连接时推"进入世界"是假消息）
         while self._running:
-            await asyncio.sleep(interval)
-
-            if not getattr(self.agent, "running", False):
-                # AI 客户端未连接：状态为空，不发 delta/deep（避免空上下文噪音）
-                continue
-
-            if not self._joined:
-                self._joined = True
-                await self._push(
-                    "[系统] 我正在进入泰拉瑞亚世界，马上就好...",
-                    "system")
-                await self._push_joined_game()
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log_loop_error(exc)
                 continue
 
             try:
+                if not getattr(self.agent, "running", False):
+                    # AI 客户端未连接：状态为空，不发 delta/deep（避免空上下文噪音）
+                    continue
+
+                if not self._joined:
+                    self._joined = True
+                    await self._push(
+                        "[系统] 我正在进入泰拉瑞亚世界，马上就好...",
+                        "system")
+                    await self._push_joined_game()
+                    continue
+
                 state = self.agent.get_state()
-            except Exception:
-                continue
+                if not state:
+                    continue
 
-            # 统一由 emitter 检测所有事件（含 HP/Boss 紧急事件，不再独立检测）
-            # tick 异常不得杀死上下文推送循环
-            try:
+                # 统一由 emitter 检测所有事件（含 HP/Boss 紧急事件，不再独立检测）
                 self._event_emitter.tick(state)
-            except Exception:
-                pass
 
-            now = time.monotonic()
-            if now - last_deep >= deep_interval:
-                last_deep = now
-                await self._push_deep_context()
-                self._prev_snap = state
-                continue
+                now = time.monotonic()
+                if now - last_deep >= deep_interval:
+                    last_deep = now
+                    await self._push_deep_context()
+                    self._prev_snap = self._snapshot_for_delta(state)
+                    continue
 
-            delta = self._build_delta(state)
-            if delta:
-                anchor = build_anchor_msg(self.agent)
-                if anchor:
-                    msg = f"{anchor}\n最近变化：\n{delta}"
-                else:
-                    msg = f"最近变化：\n{delta}"
-                await self._push(msg, "read")
-            self._prev_snap = state
+                delta = self._build_delta(state)
+                if delta:
+                    anchor = build_anchor_msg(self.agent)
+                    if anchor:
+                        msg = f"{anchor}\n最近变化：\n{delta}"
+                    else:
+                        msg = f"最近变化：\n{delta}"
+                    await self._push(msg, "read")
+                self._prev_snap = self._snapshot_for_delta(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # 单次状态/LLM 推送失败不能杀死整个服务；记录后等待下一轮。
+                self._log_loop_error(exc)
+
+    def _log_loop_error(self, exc: Exception) -> None:
+        try:
+            self.plugin.logger.warning(f"[service] 上下文循环异常: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+
+    def _snapshot_for_delta(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """保存状态增量所需的轻量副本，补上事件中通常缺失的背包栏位。"""
+        snap = dict(state or {})
+        try:
+            inv = self.agent.get_inventory_sync() or {}
+            snap["_inventory_snapshot"] = {
+                "hotbar": list(inv.get("hotbar", []) or []),
+                "selected_slot": int(inv.get("selected_slot", 0) or 0),
+            }
+        except Exception:
+            snap["_inventory_snapshot"] = {}
+        return snap
 
     async def _push_deep_context(self) -> None:
         try:
@@ -219,6 +245,21 @@ class TerrariaService:
 
         held = state.get("held_item", "")
         prev_held = prev.get("held_item", "")
+        # game_state 事件通常不含 held_item；从缓存背包取选中快捷栏，
+        # 否则切换斧头/镐子时上下文永远看不到变化。
+        try:
+            inv = self.agent.get_inventory_sync() or {}
+            slots = inv.get("hotbar", []) or []
+            selected = int(inv.get("selected_slot", 0) or 0)
+            if not held and 0 <= selected < len(slots):
+                held = slots[selected]
+            prev_inv = prev.get("_inventory_snapshot", {}) or {}
+            prev_slots = prev_inv.get("hotbar", []) or []
+            prev_selected = int(prev_inv.get("selected_slot", 0) or 0)
+            if not prev_held and 0 <= prev_selected < len(prev_slots):
+                prev_held = prev_slots[prev_selected]
+        except Exception:
+            pass
         cur_name = held.get("name", held) if isinstance(held, dict) else str(held)
         prev_name = prev_held.get("name", prev_held) if isinstance(prev_held, dict) else str(prev_held)
         if cur_name and cur_name != prev_name and prev_name:

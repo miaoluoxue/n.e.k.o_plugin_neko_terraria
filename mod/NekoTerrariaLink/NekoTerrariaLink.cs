@@ -2229,35 +2229,65 @@ namespace NekoTerrariaLink
                 }
                 if (capacity < stack) return false;
 
+                var beforeInventory = new Item[player.inventory.Length];
+                for (int i = 0; i < player.inventory.Length; i++)
+                    beforeInventory[i] = player.inventory[i]?.Clone() ?? new Item();
+                var beforeChest = new Item[chest.item.Length];
+                for (int i = 0; i < chest.item.Length; i++)
+                    beforeChest[i] = chest.item[i]?.Clone() ?? new Item();
+
                 int remaining = stack;
-                for (int k = 0; k < chest.item.Length; k++)
+                try
                 {
-                    var ci = chest.item[k];
-                    if (ci == null || ci.type == 0)
+                    for (int k = 0; k < chest.item.Length; k++)
                     {
-                        var nw = src.Clone();
-                        nw.stack = Math.Min(remaining, Math.Min(src.stack, nw.maxStack));
-                        if (nw.stack <= 0) continue;
-                        chest.item[k] = nw;
-                        src.stack -= nw.stack;
-                        remaining -= nw.stack;
-                        SyncChest(idx, k);
-                        if (remaining <= 0) break;
-                        continue;
+                        var ci = chest.item[k];
+                        if (ci == null || ci.type == 0)
+                        {
+                            var nw = src.Clone();
+                            nw.stack = Math.Min(remaining, Math.Min(src.stack, nw.maxStack));
+                            if (nw.stack <= 0) continue;
+                            chest.item[k] = nw;
+                            src.stack -= nw.stack;
+                            remaining -= nw.stack;
+                            SyncChest(idx, k);
+                            if (remaining <= 0) break;
+                            continue;
+                        }
+                        if (ci.type == src.type && ci.stack < ci.maxStack)
+                        {
+                            int add = Math.Min(remaining, Math.Min(src.stack, ci.maxStack - ci.stack));
+                            if (add <= 0) continue;
+                            ci.stack += add;
+                            src.stack -= add;
+                            remaining -= add;
+                            SyncChest(idx, k);
+                            if (remaining <= 0) break;
+                        }
                     }
-                    if (ci.type == src.type && ci.stack < ci.maxStack)
+                    if (remaining == 0)
                     {
-                        int add = Math.Min(remaining, Math.Min(src.stack, ci.maxStack - ci.stack));
-                        if (add <= 0) continue;
-                        ci.stack += add;
-                        src.stack -= add;
-                        remaining -= add;
-                        SyncChest(idx, k);
-                        if (remaining <= 0) break;
+                        if (src.stack <= 0) src.SetDefaults(0);
+                        if (Main.netMode == NetmodeID.MultiplayerClient)
+                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                        return true;
                     }
                 }
-                if (src.stack <= 0) src.SetDefaults(0);
-                return remaining == 0;
+                catch
+                {
+                    remaining = stack;
+                }
+                // 任何中途异常或容量估算偏差都完整回滚，避免玩家物品丢失。
+                for (int i = 0; i < player.inventory.Length; i++)
+                    player.inventory[i] = beforeInventory[i];
+                for (int i = 0; i < chest.item.Length; i++)
+                    chest.item[i] = beforeChest[i];
+                if (Main.netMode == NetmodeID.MultiplayerClient)
+                {
+                    NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                    for (int i = 0; i < chest.item.Length; i++) SyncChest(idx, i);
+                }
+                return false;
             }
             finally { player.chest = -1; }
         }
@@ -2296,6 +2326,22 @@ namespace NekoTerrariaLink
                 var before = new Item[player.inventory.Length];
                 for (int i = 0; i < player.inventory.Length; i++)
                     before[i] = player.inventory[i]?.Clone() ?? new Item();
+                var beforeChest = new Item[chest.item.Length];
+                for (int i = 0; i < chest.item.Length; i++)
+                    beforeChest[i] = chest.item[i]?.Clone() ?? new Item();
+
+                void RestoreSnapshots()
+                {
+                    for (int i = 0; i < player.inventory.Length; i++)
+                        player.inventory[i] = before[i];
+                    for (int i = 0; i < chest.item.Length; i++)
+                        chest.item[i] = beforeChest[i];
+                    if (Main.netMode == NetmodeID.MultiplayerClient)
+                    {
+                        NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                        for (int i = 0; i < chest.item.Length; i++) SyncChest(idx, i);
+                    }
+                }
                 int remaining = stack;
                 for (int k = 0; k < chest.item.Length; k++)
                 {
@@ -2308,10 +2354,7 @@ namespace NekoTerrariaLink
                         GetItemSettings.InventoryEntityToPlayerInventorySettings);
                     if (remainder != null && !remainder.IsAir && remainder.stack > 0)
                     {
-                        for (int i = 0; i < player.inventory.Length; i++)
-                            player.inventory[i] = before[i];
-                        if (Main.netMode == NetmodeID.MultiplayerClient)
-                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                        RestoreSnapshots();
                         return false;
                     }
                     it.stack -= take;
@@ -2325,8 +2368,7 @@ namespace NekoTerrariaLink
                         return true;
                     }
                 }
-                for (int i = 0; i < player.inventory.Length; i++)
-                    player.inventory[i] = before[i];
+                RestoreSnapshots();
                 return false;
             }
             finally { player.chest = -1; }

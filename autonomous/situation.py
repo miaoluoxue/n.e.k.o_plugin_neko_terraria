@@ -101,7 +101,10 @@ class SituationEngine:
             if store and hasattr(store, "recall"):
                 hits = store.recall("主人", limit=1) if callable(store.recall) else None
                 if hits:
-                    return str(hits[0])[:60]
+                    hit = hits[0]
+                    if isinstance(hit, dict):
+                        return f"{hit.get('key', '')}: {hit.get('value', '')}"[:60]
+                    return str(hit)[:60]
         except Exception:
             pass
         return ""

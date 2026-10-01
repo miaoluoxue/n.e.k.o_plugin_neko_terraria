@@ -150,6 +150,10 @@ class TaskChain:
                 raise
             except Exception as e:
                 ok = False
+                if goal.outcome == "pending":
+                    goal.outcome = "failed"
+                if not goal.report_fail:
+                    goal.report_fail = f"任务执行异常，未确认完成：{e}"
                 if self.agent:
                     self.agent.log(f"任务异常：{e}", "warn")
             finally:
@@ -281,7 +285,8 @@ class TaskChain:
                             return False
                     return True
                 return False
-            except Exception:
+            except Exception as exc:
+                goal.report_fail = f"砍树执行异常，未确认获得目标物：{exc}"
                 return False
 
         # fish：真钓鱼（工具 → 钓竿）
@@ -297,7 +302,8 @@ class TaskChain:
                                             life.last_failure or "未能完成钓鱼动作")
                     return False
                 return False
-            except Exception:
+            except Exception as exc:
+                goal.report_fail = f"钓鱼执行异常，未确认鱼获：{exc}"
                 return False
 
         # 没有实际执行器的行为不能凭空成功。

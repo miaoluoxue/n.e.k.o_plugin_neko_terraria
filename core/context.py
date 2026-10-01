@@ -185,10 +185,26 @@ def build_user_context(agent: Any) -> str:
     max_hp = state.get("max_life", 100) or 100
     lines.append(f"血量: {hp}/{max_hp}")
     defense = state.get("defense", 0)
+    # get_state 不一定携带装备属性；从 Mod 的真实装备快照补齐，避免
+    # LLM 误以为角色没有防御装备。
+    inv_snapshot: Dict[str, Any] = {}
+    try:
+        inv_snapshot = getattr(agent, "get_inventory_sync", lambda: {})() or {}
+    except Exception:
+        pass
+    if not defense:
+        defense = sum(int(slot.get("defense", 0) or 0)
+                      for slot in (inv_snapshot.get("equipped", []) or [])
+                      if isinstance(slot, dict))
     if defense:
         lines.append(f"防御力: {defense}")
 
     held = state.get("held_item", "")
+    if not held:
+        hotbar_snapshot = inv_snapshot.get("hotbar", []) or []
+        selected = int(inv_snapshot.get("selected_slot", 0) or 0)
+        if 0 <= selected < len(hotbar_snapshot):
+            held = hotbar_snapshot[selected]
     if isinstance(held, dict):
         held_name = held.get("name", "")
         if held_name:
@@ -239,7 +255,7 @@ def build_user_context(agent: Any) -> str:
     hotbar = state.get("hotbar_slots", []) or []
     if not hotbar:
         try:
-            hotbar = (getattr(agent, "get_inventory_sync", lambda: {})() or {}).get("hotbar", []) or []
+            hotbar = inv_snapshot.get("hotbar", []) or []
         except Exception:
             hotbar = []
     if hotbar:
@@ -251,6 +267,20 @@ def build_user_context(agent: Any) -> str:
                 items.append(f"{name}" + (f"x{count}" if count > 1 else ""))
         if items:
             lines.append(f"快捷栏: {', '.join(items[:10])}")
+
+    # 给 LLM 一个受限的完整背包摘要，避免只看到快捷栏而误报“没有斧头/镐子”。
+    inventory = inv_snapshot.get("inventory", []) or []
+    if inventory:
+        items = []
+        for slot in inventory:
+            if not isinstance(slot, dict):
+                continue
+            name = str(slot.get("name", "") or "")
+            count = int(slot.get("stack", slot.get("count", 1)) or 1)
+            if name:
+                items.append(f"{name}" + (f"x{count}" if count > 1 else ""))
+        if items:
+            lines.append(f"背包: {', '.join(items[:30])}")
 
     # 当前目标
     goal_info = state.get("current_goal")

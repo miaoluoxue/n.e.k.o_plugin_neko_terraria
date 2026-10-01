@@ -128,6 +128,8 @@ class VisionPipeline:
                         await self.perception.feed(b64, mime)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                logger = getattr(self.agent, "logger", None)
+                if logger:
+                    logger.warning("视觉采集循环异常: %s", exc)
             await asyncio.sleep(self._interval)

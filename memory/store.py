@@ -57,8 +57,21 @@ class MemoryStore:
         now = time.time()
         words: List[str] = []
         if query:
-            words = [w for w in re.split(r"[\s,，。！？!?、；;：:]+", query.lower())
-                     if w]
+            # 中文连续文本没有空格，直接按标点切分会把整句当成一个词，
+            # 导致“你还记得我喜欢什么吗”无法命中“喜欢挖矿”。
+            # 保留完整片段，同时加入 2～4 字短语；英文/数字仍按词匹配。
+            for part in re.split(r"[\s,，。！？!?、；;：:]+", query.casefold()):
+                if not part:
+                    continue
+                words.append(part)
+                for chunk in re.findall(r"[\u4e00-\u9fff]+|[a-z0-9_]+", part):
+                    if re.fullmatch(r"[\u4e00-\u9fff]+", chunk):
+                        for size in (4, 3, 2):
+                            words.extend(chunk[i:i + size]
+                                         for i in range(max(0, len(chunk) - size + 1)))
+                    elif chunk != part:
+                        words.append(chunk)
+            words = list(dict.fromkeys(w for w in words if w))
         scored: List[tuple] = []
         for key, value, category, importance, _created, updated, _ac in rows:
             age = max(0.0, now - updated)

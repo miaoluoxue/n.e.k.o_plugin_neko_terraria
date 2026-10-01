@@ -140,10 +140,35 @@ class TerrariaAgent:
             async with self._start_lock:
                 if self._running:
                     return True
-                return await self._start_impl()
+                try:
+                    result = await self._start_impl()
+                except asyncio.CancelledError:
+                    self._cleanup_start_failure()
+                    raise
+                except Exception as exc:
+                    self.log(f"启动 AI 客户端异常: {type(exc).__name__}: {exc}", "error")
+                    self._cleanup_start_failure()
+                    return False
+                if not result:
+                    # 启动流程的任一阶段失败时释放半初始化的 TCP/进程，
+                    # 否则下一次“重新连接”会复用坏状态或拉起重复客户端。
+                    self._cleanup_start_failure()
+                return result
 
         self._start_task = asyncio.create_task(_run())
         return await self._start_task
+
+    def _cleanup_start_failure(self) -> None:
+        """清理未完成启动留下的连接、回调和客户端进程。"""
+        self._running = False
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            self.launcher.close()
+        except Exception:
+            pass
 
     async def _start_impl(self) -> bool:
         """start() 实际执行体（防重入锁保护）。"""
