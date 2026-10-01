@@ -347,6 +347,12 @@ class TaskCoordinator:
     # ---------------- 长期任务 ----------------
     async def _do_longterm(self, it) -> Dict[str, Any]:
         import re
+        # 解析器和旧规则可能把砍树识别成 mine；在去重、停止和实际启动前
+        # 统一成 StandingJobs 使用的 canonical kind，避免同一任务多开。
+        if it.kind == "mine" and str(it.target or "").casefold() in {
+                "木材", "木", "木头", "树", "wood", "wooden"}:
+            it.kind = "chop"
+            it.target = "木材"
         if re.search(r"(?:\d+|[一二两三四五六七八九十百]+)\s*棵", it.raw or "") and it.kind in ("chop", "mine"):
             return {"ok": False, "status": "unconfirmed", "mode": "longterm",
                     "output": "当前只能核验木材数量，不能核验树的棵数；没有把棵数改成木材数量执行。"}
@@ -371,13 +377,16 @@ class TaskCoordinator:
                     "output": "旧任务仍在退出，长期任务尚未启动。"}
         res = await self.jobs.start(it.kind, target=it.target,
                                     amount=it.amount, reason=it.reason)
-        try:
-            self.agent.remember(
-                "主人偏好-长期任务",
-                f"主人让我长期{it.kind}({it.target or '无目标'})",
-                category="preference")
-        except Exception:
-            pass
+        # 只有 runner 确实创建成功才写入偏好记忆；busy/unsupported/error
+        # 不能污染后续语义匹配，否则失败指令会被当成成功历史重放。
+        if res.get("ok") and res.get("status") == "started":
+            try:
+                self.agent.remember(
+                    "主人偏好-长期任务",
+                    f"主人让我长期{it.kind}({it.target or '无目标'})",
+                    category="preference")
+            except Exception:
+                pass
         self.agent.log(f"[coordinator] 🟢 _do_longterm() 完成: {res}", "info")
         res["mode"] = "longterm"
         res["intent"] = it.snapshot()

@@ -24,6 +24,38 @@ from ..core.context import build_user_context as _build_ctx
 
 log = logging.getLogger(__name__)
 
+
+def _safe_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> int:
+    """将 LLM 的 null/空串/中文数字安全转换为整数。"""
+    if value is None or value == "":
+        result = default
+    else:
+        try:
+            result = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2,
+                      "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+                      "八": 8, "九": 9, "十": 10}
+            text = str(value).strip()
+            if text in digits:
+                result = digits[text]
+            elif text.startswith("十") and text[1:] in digits:
+                result = 10 + digits[text[1:]]
+            elif text.endswith("十") and text[:-1] in digits:
+                result = digits[text[:-1]] * 10
+            else:
+                result = default
+    return max(minimum, result) if minimum is not None else result
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """将 LLM 的 null/空串安全转换为有限浮点数。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result == result and abs(result) != float("inf") else default
+
 # ── LLM 意图解析的 prompt 模板（v2：思维链 + few-shot + 上下文）──
 
 INTENT_PARSE_PROMPT = """你是{name}，在泰拉瑞亚世界里帮主人做事的猫娘冒险者。
@@ -279,20 +311,22 @@ class LLMIntentParser:
         stop_kws = ("别跟了", "不跟了", "别跟着", "别跟", "不用跟", "别追了",
                     "停下", "停止", "停一下", "别动", "住手",
                     "别做了", "别弄了", "别挖了", "别采了", "别打了", "别守了", "不用守",
-                    "别砍了", "别砍", "不用砍")
+                    "别砍了", "别砍", "不用砍", "stop", "cancel", "abort",
+                    "don't follow", "do not follow", "stop following",
+                    "stop mining", "stop chopping", "stop fighting", "stop guarding")
         for kw in stop_kws:
             if kw not in t:
                 continue
             kind = ""
-            if "跟" in t or "追" in t:
+            if any(word in t for word in ("跟", "追", "follow")):
                 kind = "follow"
-            elif "砍" in t:
+            elif any(word in t for word in ("砍", "chop", "wood")):
                 kind = "chop"  # 长期砍树任务注册为 chop（mine+木材归一化）
-            elif "挖" in t or "采" in t:
+            elif any(word in t for word in ("挖", "采", "mine")):
                 kind = "mine"
-            elif "守" in t:
+            elif any(word in t for word in ("守", "guard")):
                 kind = "guard"
-            elif "打" in t or "战斗" in t:
+            elif any(word in t for word in ("打", "战斗", "fight", "combat")):
                 kind = "combat"
             return IntentResult(
                 mode="stop", kind=kind, target="",
@@ -354,17 +388,17 @@ class LLMIntentParser:
         steps = self._normalize_steps(steps_raw)
 
         # 提取置信度（如果 LLM 返回了）
-        confidence = float(data.get("confidence", 1.0))
+        confidence = _safe_float(data.get("confidence", 1.0), 1.0)
         confidence = max(0.0, min(1.0, confidence))
 
         result = IntentResult(
             mode=mode,
-            kind=str(data.get("kind", "")),
-            target=str(data.get("target", "")),
-            amount=int(data.get("amount", 0)),
-            pre_reply=str(data.get("pre_reply", "")),
-            interrupt_level=max(0, min(3, int(data.get("interrupt_level", 0)))),
-            reason=str(data.get("reason", "")),
+            kind=str(data.get("kind", "") or "").strip(),
+            target=str(data.get("target", "") or "").strip(),
+            amount=_safe_int(data.get("amount", 0), 0, minimum=0),
+            pre_reply=str(data.get("pre_reply", "") or "").strip(),
+            interrupt_level=max(0, min(3, _safe_int(data.get("interrupt_level", 0)))),
+            reason=str(data.get("reason", "") or "").strip(),
             raw=original_text,
             steps=steps,
             source="llm",
@@ -384,7 +418,11 @@ class LLMIntentParser:
         out = []
         for s in steps_raw:
             if isinstance(s, dict):
-                out.append({k: v for k, v in s.items()})
+                step = {k: v for k, v in s.items()}
+                step["action"] = str(step.get("action", "") or "goto").strip()
+                step["item"] = str(step.get("item", "") or "目标").strip()
+                step["amount"] = _safe_int(step.get("amount", 1), 1, minimum=0)
+                out.append(step)
             elif isinstance(s, str):
                 t = s.strip()
                 action, item, amount = "goto", "", 1
@@ -397,9 +435,11 @@ class LLMIntentParser:
                     if rest.startswith("成"):
                         rest = rest[1:]  # "合成镐子" → "镐子"
                     item, amount = _parse_item_amount(rest)
-                elif "打" in t or "杀" in t:
-                    item, amount = _parse_item_amount(
-                        t.split("打")[-1].split("杀")[-1])
+                elif "打" in t or "杀" in t or "fight" in t.lower() or "kill" in t.lower() or "combat" in t.lower():
+                    action = "combat"
+                    rest = re.sub(r"(?i)^.*?\b(?:fight|kill|combat)\b", "", t)
+                    rest = rest.split("打")[-1].split("杀")[-1]
+                    item, amount = _parse_item_amount(rest)
                 elif "捡" in t or "收" in t or "采" in t:
                     action = "gather"
                     item, amount = _parse_item_amount(
