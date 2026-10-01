@@ -28,7 +28,8 @@ namespace NekoTerrariaLink
             if (npc.Distance(player.Center) > 1200f) return;
             var inst = NekoTerrariaLink.Instance;
             if (inst != null) inst.PushEvent("npc_killed",
-                $"干掉了{npc.FullName}", npc.boss ? npc.FullName : null);
+                $"干掉了{npc.FullName}", npc.boss ? npc.FullName : null,
+                npc.whoAmI, npc.type);
         }
     }
 }

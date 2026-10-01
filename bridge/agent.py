@@ -525,6 +525,12 @@ class TerrariaAgent:
         elif event == "invasion_end":
             bus.fire("invasion_end", {"message": msg.get("message", "")})
 
+        elif event == "npc_killed":
+            # CombatEngine uses the Mod's slot/type identity to distinguish an
+            # actual kill from an NPC merely leaving the 50-tile state radius.
+            self.combat.confirm_npc_kill(msg)
+            bus.fire("npc_killed", msg)
+
         # v3.0: 导航状态流事件（nav_moving/nav_arrived/nav_stuck/nav_timeout）
         # → 转发给 mod_link 的导航监听（navigate_async）
         elif event.startswith("nav_"):

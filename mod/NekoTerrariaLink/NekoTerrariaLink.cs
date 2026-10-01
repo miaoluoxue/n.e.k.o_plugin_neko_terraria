@@ -356,7 +356,8 @@ namespace NekoTerrariaLink
         }
 
         /// <summary>向 Python 桥推送事件（仅主线程调用，Send 自带锁）。</summary>
-        internal void PushEvent(string eventName, string message, string bossName = null)
+        internal void PushEvent(string eventName, string message, string bossName = null,
+            int npcSlot = -1, int npcType = -1)
         {
             var s = _activeStream;
             if (s == null) return;
@@ -368,6 +369,8 @@ namespace NekoTerrariaLink
                     ["message"] = message,
                 };
                 if (!string.IsNullOrEmpty(bossName)) d["boss_name"] = bossName;
+                if (npcSlot >= 0) d["npc_slot"] = npcSlot;
+                if (npcType >= 0) d["npc_type"] = npcType;
                 Send(s, d);
             }
             catch (Exception ex)

@@ -19,6 +19,7 @@ class CombatEngine:
         self.mod = mod
         self.agent = agent
         self._blacklist: Dict[tuple, float] = {}
+        self._kill_confirmations: Dict[tuple, float] = {}
         self.blacklist_secs = 30
         self.no_dmg_timeout = 4
         # ── 风筝参数（按生存循环惯例 KITE_IDEAL_DIST/KITE_TOO_CLOSE） ──
@@ -50,6 +51,30 @@ class CombatEngine:
         if key in self._blacklist:
             del self._blacklist[key]
         return False
+
+    def confirm_npc_kill(self, event: Dict[str, Any]) -> None:
+        """Record an authoritative Mod kill event keyed to the NPC instance."""
+        try:
+            slot = int(event.get("npc_slot", -1))
+            npc_type = int(event.get("npc_type", -1))
+        except (TypeError, ValueError):
+            return
+        if slot < 0 or npc_type < 0:
+            return
+        now = time.monotonic()
+        self._kill_confirmations[(slot, npc_type)] = now
+        self._kill_confirmations = {
+            key: ts for key, ts in self._kill_confirmations.items()
+            if now - ts <= 10.0
+        }
+
+    def _consume_kill_confirmation(self, enemy: Dict[str, Any]) -> bool:
+        try:
+            key = (int(enemy.get("slot", -1)), int(enemy.get("type", -1)))
+        except (TypeError, ValueError):
+            return False
+        killed_at = self._kill_confirmations.pop(key, None)
+        return killed_at is not None and time.monotonic() - killed_at <= 10.0
 
     async def fight_nearest(
         self, state: Dict[str, Any], timeout: int = 10, check_task: Optional[Callable[[], bool]] = None
@@ -127,11 +152,16 @@ class CombatEngine:
                     cur = e
                     break
             if cur is None:
-                # The mod exports living NPCs only, so a killed NPC normally
-                # disappears instead of producing a life==0 frame.  Treat
-                # disappearance as a kill only after we observed real damage;
-                # an unhurt target leaving the radius is still inconclusive.
-                return saw_damage
+                # The Mod exports living NPCs only. Damage followed by
+                # disappearance is ambiguous because the NPC may have walked
+                # beyond the state radius; require its authoritative kill event.
+                confirmed = self._consume_kill_confirmation(target)
+                if confirmed:
+                    try:
+                        await self.mod.collect_items(radius=400)
+                    except Exception:
+                        pass
+                return confirmed
             if int(cur.get("life", 0) or 0) <= 0:
                 # 战斗胜利，收集掉落物（打完不抢任务，掉落让主线收）
                 try:
