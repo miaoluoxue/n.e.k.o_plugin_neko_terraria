@@ -30,6 +30,9 @@ namespace NekoTerrariaLink
             if (inst != null) inst.PushEvent("npc_killed",
                 $"干掉了{npc.FullName}", npc.boss ? npc.FullName : null,
                 npc.whoAmI, npc.type);
+            if (inst != null && npc.boss)
+                inst.PushEvent("boss_killed", $"击败了{npc.FullName}", npc.FullName,
+                    npc.whoAmI, npc.type);
         }
     }
 }

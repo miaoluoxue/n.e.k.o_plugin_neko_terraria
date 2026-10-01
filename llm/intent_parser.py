@@ -419,13 +419,16 @@ class LLMIntentParser:
         for s in steps_raw:
             if isinstance(s, dict):
                 step = {k: v for k, v in s.items()}
-                step["action"] = str(step.get("action", "") or "goto").strip()
+                # Missing/invalid actions must stay visible to TaskBrain so it
+                # can stop the chain honestly.  Defaulting to ``goto`` turned
+                # malformed LLM JSON into an unintended navigation command.
+                step["action"] = str(step.get("action", "") or "").strip()
                 step["item"] = str(step.get("item", "") or "目标").strip()
                 step["amount"] = _safe_int(step.get("amount", 1), 1, minimum=0)
                 out.append(step)
             elif isinstance(s, str):
                 t = s.strip()
-                action, item, amount = "goto", "", 1
+                action, item, amount = "", "", 1
                 if "挖" in t:
                     action = "mine"
                     item, amount = _parse_item_amount(t.split("挖")[-1])
@@ -445,9 +448,14 @@ class LLMIntentParser:
                     item, amount = _parse_item_amount(
                         t.split("捡")[-1].split("收")[-1].split("采")[-1])
                 elif "去" in t or "走到" in t:
+                    action = "goto"
                     item, amount = _parse_item_amount(t.split("去")[-1].split("走到")[-1])
                 out.append({"action": action,
                             "item": item or "目标", "amount": amount})
+            else:
+                # Preserve malformed entries as blockers; dropping one step
+                # would let a partial chain be reported as the whole task.
+                out.append({"action": "", "item": "目标", "amount": 1})
         return out
 
     def _fallback_parse(self, text: str) -> IntentResult:

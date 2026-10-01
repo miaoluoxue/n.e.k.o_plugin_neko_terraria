@@ -165,7 +165,11 @@ class StandingJobs:
                 if lost == 5:
                     task.beat("找不到主人了，先待在原地")
                     logger.warning("⚠️ 连续 5 次找不到主人")
-                self._following = False  # 失去目标时重置
+                if self._following:
+                    self._following = False
+                    # The existing navigation runs in the background until its
+                    # deadline; losing sight of the owner must release it now.
+                    await self.agent.mod.stop_actions()
                 await asyncio.sleep(self.timing.action_duration(FOLLOW_TICK))
                 continue
             lost = 0

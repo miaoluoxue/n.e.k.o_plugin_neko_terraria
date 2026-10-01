@@ -47,6 +47,7 @@ class TaskInquiry:
         - 返回 Inquiry → 发起询问并暂停任务
         - 返回 None → 队列满了，executor 自己做决策
         """
+        self.check_timeouts()
         if len(self._pending) >= self.max_pending:
             return None
         self._counter += 1
@@ -74,6 +75,8 @@ class TaskInquiry:
         曾默认吞掉任意文本当答案：主人询问等待期说"帮我挖矿"会被当回答
         消费，新指令永不进入 parse/派发（"说了不执行"）。
         """
+        # An expired semantic confirmation must never authorize an old task.
+        self.check_timeouts()
         if not self._pending:
             return None
 
@@ -96,6 +99,16 @@ class TaskInquiry:
         for inquiry in list(self._pending):
             if inquiry.resolved:
                 continue
+            # Negative/hold answers keep their control meaning even when the
+            # same words are offered as explicit options.  In particular,
+            # the semantic-confirmation prompt offers "不是"; returning that
+            # raw option made the coordinator treat it as approval.
+            if text in deny_words or text in hold_words:
+                inquiry.answer = ("deny（主人否定了）" if text in deny_words
+                                  else "hold（主人让等一下）")
+                inquiry.resolved = True
+                self._pending.remove(inquiry)
+                return inquiry
             # 先试询问自带 options（"换个地方"/"继续挖"这类精确回答）
             if inquiry.options:
                 opt = next((o for o in inquiry.options
@@ -110,17 +123,6 @@ class TaskInquiry:
                 inquiry.resolved = True
                 self._pending.remove(inquiry)
                 return inquiry
-            if text in hold_words:
-                inquiry.answer = "hold（主人让等一下）"
-                inquiry.resolved = True
-                self._pending.remove(inquiry)
-                return inquiry
-            if text in deny_words:
-                inquiry.answer = "deny（主人否定了）"
-                inquiry.resolved = True
-                self._pending.remove(inquiry)
-                return inquiry
-
         return None  # 都不像回答 → 放行，按新指令解析
 
     def cancel_all(self) -> None:
@@ -168,4 +170,5 @@ class TaskInquiry:
 
     @property
     def has_pending(self) -> bool:
+        self.check_timeouts()
         return len(self._pending) > 0

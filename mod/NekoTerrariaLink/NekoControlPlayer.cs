@@ -60,6 +60,7 @@ namespace NekoTerrariaLink
             navPath = path;
             navIdx = 0;
             _jumpFrames = 0;
+            _jumpTable = null;
         }
 
         private bool IsControlled => Player.whoAmI == Main.myPlayer
@@ -128,27 +129,30 @@ namespace NekoTerrariaLink
             }
             if (!LiquidEscapeActive && navPath != null && navIdx < navPath.Count)
             {
-                int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
+                int px = (int)(p.Center.X / 16), py = NekoTerrariaLink.FeetTileY(p);
                 var g = navPath[navIdx];
-                if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2
-                    && (g.Jump == 0 || py <= g.Y))
+                if (Math.Abs(p.Center.X - (g.X * 16f + 8f)) <= 6f && py == g.Y
+                    && (g.Jump == 0 || (p.velocity.Y >= 0f && NekoTerrariaLink.IsStandable(px, py))))
                 {
                     navIdx++;
                     if (navIdx >= navPath.Count)
                     {
                         navPath = null;
+                        _jumpFrames = 0;
+                        p.controlLeft = p.controlRight = p.controlJump = p.controlDown = false;
                         return;
                     }
                     g = navPath[navIdx];
                 }
-                int dx = g.X - px;
+                float dx = g.X * 16f + 8f - p.Center.X;
                 int dy = g.Y - py;
 
-                if (dx < 0) p.controlLeft = true;
-                else if (dx > 0) p.controlRight = true;
+                if (dx < -4f) p.controlLeft = true;
+                else if (dx > 4f) p.controlRight = true;
 
                 // 跳跃：路径点编码 Jump 高度 → 帧表精确按帧（mod 原生能力）
-                if (dy < 0 && _jumpFrames <= 0 && g.Jump > 0 && p.velocity.Y == 0f)
+                if (_jumpFrames <= 0 && g.Jump > 0 && p.velocity.Y == 0f
+                    && NekoTerrariaLink.IsStandable(px, py))
                 {
                     var tbl = JumpFrameTable();
                     int h = Math.Min(g.Jump + (NekoTerrariaLink.IsPlatform(g.X, g.Y + 1) ? 2 : 0), tbl.Length - 1);
@@ -179,12 +183,12 @@ namespace NekoTerrariaLink
             {
                 if (_diagFrame++ % 60 == 0)
                 {
-                    int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
+                    int px = (int)(p.Center.X / 16), py = NekoTerrariaLink.FeetTileY(p);
                     var g = navPath[navIdx];
                     try { ModContent.GetInstance<NekoTerrariaLink>().Logger.Info($"[NavStep] 帧={_diagFrame} 我=({px},{py}) 目标=({g.X},{g.Y}) act={g.Action} navIdx={navIdx}/{navPath.Count} vel=({p.velocity.X:F1},{p.velocity.Y:F1}) frozen={p.frozen} webbed={p.webbed} mount={p.mount.Active}"); }
                     catch { }
                 }
-                NavStepVelocity(p);   // 后备 velocity 直驱（control 注入为主）
+                SyncNavigationControls(p);
             }
             // 面向目标：近战挥动/挖掘方向对准目标（战斗时人物不动也朝怪方向砍）
             if (digTargetX >= 0 && digTargetY >= 0)
@@ -195,23 +199,12 @@ namespace NekoTerrariaLink
         }
         private int _diagFrame = 0;
 
-        /// <summary>后备 velocity 直驱：PostUpdateRunSpeeds 注入 control 为主（原生物理），
-        /// 此处仅当 control 未生效（velocity 归零）时直驱兜底 + 发包。</summary>
-        private void NavStepVelocity(Player p)
+        // A zero horizontal velocity may mean a wall, web or immobilizing
+        // debuff. Do not bypass native physics by interpreting it as input loss.
+        private void SyncNavigationControls(Player p)
         {
-            if (navPath == null || navIdx >= navPath.Count) return;
-            int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
-            var g = navPath[navIdx];
-            // Waypoint advancement is owned by PostUpdateRunSpeeds. Advancing
-            // here as well can skip a jump/drop waypoint in one frame.
-            int dx = g.X - px;
-            // 后备：control 已注入但 velocity 仍归零（钩子未生效）→ 直驱兜底
-            if (dx != 0 && Math.Abs(p.velocity.X) < 0.1f)
-            {
-                p.velocity.X = Math.Sign(dx) * p.maxRunSpeed;
-                p.direction = Math.Sign(dx);
-            }
-            NetMessage.SendData(MessageID.PlayerControls, -1, -1, null, p.whoAmI);
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                NetMessage.SendData(MessageID.PlayerControls, -1, -1, null, p.whoAmI);
         }
 
         /// <summary>跳跃帧表：跳 h 格需要按住 jump 几帧（按帧表）。

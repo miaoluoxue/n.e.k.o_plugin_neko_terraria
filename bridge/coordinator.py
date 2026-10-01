@@ -161,6 +161,13 @@ class TaskCoordinator:
                     "output": "这条指令已被后来的停止指令取消。"}
         self.agent.log(f"[coordinator.handle] 📋 解析结果: mode={result.mode}, kind={result.kind}, target={result.target}", "info")
 
+        # Similarity matches are only suggestions.  They may carry a real
+        # mode/kind copied from an earlier command, so dispatching them here
+        # would silently replay an old task.  Route them through the existing
+        # confirmation flow before any interrupt or pre-reply is emitted.
+        if result.source == "semantic":
+            return await self._handle_unknown(text, result)
+
         # 先回话（LLM 解析出的 pre_reply，如"好的主人~"）
         if result.pre_reply:
             try:
@@ -309,18 +316,32 @@ class TaskCoordinator:
             if t is None and stop_kind == "mine":
                 t = self.lt.get("chop")
             stopped = []
+            pending = []
             cur = self.executor.current()
             if t is not None:
                 if await self.lt.stop(t.kind, "主人喊停"):
                     stopped.append(t.name)
+                else:
+                    pending.append(t.name)
             if cur and self._stop_matches(stop_kind, it, cur):
                 if await self.agent.interrupt_current("主人喊停"):
                     stopped.append(cur["name"])
-            await self.agent.mod.stop_actions()
+                else:
+                    pending.append(cur["name"])
+            actions_stopped = await self.agent.mod.stop_actions()
+            if pending or not actions_stopped:
+                return {"ok": False, "status": "unconfirmed",
+                        "output": ("已发送停止请求；"
+                                   + ("仍在退出：" + "、".join(pending) + "。" if pending else "")
+                                   + ("未收到游戏动作停止确认。" if not actions_stopped else "")
+                                   + "尚不能确认完全停下。")}
             return {"ok": True, "status": "stopped",
                     "output": "已停止：" + "、".join(stopped) if stopped else "当前没有对应的运行任务。"}
         # 没指明停什么：全停
         result = await self.agent.stop_everything("主人喊停")
+        if self.executor.busy() or self.lt.busy_kinds():
+            return {"ok": False, "status": "unconfirmed",
+                    "output": "已发送停止请求，但仍有任务在退出，尚不能确认完全停下。"}
         names = result["longterm_stopped"]
         if result["foreground_cancelled"]:
             names.append("当前任务")
@@ -405,7 +426,7 @@ class TaskCoordinator:
         # explore 特殊处理：直接执行探索，不走 think/plan"能不能做"评估链
         # （那是给挖矿/合成判断材料用的，explore 没有材料概念，评估会卡在
         # "有镐子"这种无关检查导致任务不执行）。
-        if it.kind == "explore":
+        if it.kind == "explore" and not it.steps:
             return await self._run_explore(it, source)
 
         steps = list(it.steps or [])

@@ -106,7 +106,7 @@ class SceneClassifier:
 
         if longterm_kinds:
             kinds = set(longterm_kinds)
-            if "mine" in kinds:
+            if "mine" in kinds or "chop" in kinds:
                 return "mining"
             if "follow" in kinds:
                 return "follow"
@@ -232,6 +232,8 @@ class OwnerTracker:
                 ts=now))
             if len(self.positions) > self.max_history:
                 self.positions = self.positions[-self.max_history:]
+        elif not state:
+            self.positions.clear()
 
     def update_inventory(self, inv: Dict[str, Any]) -> None:
         """对比背包快照，记录主人新获得的物品（好奇素材）。
@@ -490,7 +492,8 @@ class InteractionEngine:
 
     # ── 消息推送 ──────────────────────────────────────
 
-    async def push_speech(self, text: str, behavior: str = "respond") -> None:
+    async def push_speech(self, text: str, behavior: str = "respond",
+                          urgent: bool = False) -> None:
         """推送一条猫娘话语给 LLM 管道。
 
         v0.7 治理：
@@ -506,7 +509,7 @@ class InteractionEngine:
             return
 
         # v0.7 静默窗：主人刚说话，非紧急不打扰（blind 危险短句例外）
-        if behavior != "blind" and behavior != "read":
+        if not urgent and behavior != "blind" and behavior != "read":
             if time.time() - self._last_owner_speech_ts < OWNER_SPEECH_QUIET_WINDOW:
                 behavior = "read"
 
@@ -861,7 +864,7 @@ class InteractionEngine:
 
             await self.push_speech(
                 f"[紧急事件] {merged}\n立刻用猫娘语气紧急警告（1句话，10字以内）",
-                behavior="respond")
+                behavior="respond", urgent=True)
 
         elif etype in task_respond:
             mood_type = "proud" if "complete" in etype or "done" in etype else "tired"

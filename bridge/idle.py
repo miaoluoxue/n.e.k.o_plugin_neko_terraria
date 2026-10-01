@@ -157,6 +157,13 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
         if was_following:
             await agent.mod.stop_actions()
     elif not ctx.get("_following"):
+        blocked = ctx.get("_follow_blocked_position")
+        if blocked is not None:
+            bx, by, bmx, bmy = blocked
+            changed = abs(ox - bx) + abs(oy - by) + abs(mx - bmx) + abs(my - bmy)
+            if changed < 5:
+                return
+            ctx.pop("_follow_blocked_position", None)
         if dist >= FOLLOW_TRIGGER_DIST:
             ctx["_following"] = True
             if _should_talk(ctx, "follow", "追"):
@@ -175,6 +182,7 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
                 if failures >= 5:
                     ctx["_following"] = False
                     ctx["_follow_nav_failures"] = 0
+                    ctx["_follow_blocked_position"] = (ox, oy, mx, my)
                     await agent.mod.stop_actions()
                     agent.log("自主跟随连续导航失败，暂停追赶等待位置变化", "warn")
                     return

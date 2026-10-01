@@ -42,7 +42,8 @@ class GameEventEmitter:
 
         # 挖矿追踪
         self._last_mine_time: float = 0.0
-        self._mining_ore_seen: Set[str] = set()
+        self._mining_ore_counts: Dict[str, int] = {}
+        self._mining_baselined: bool = False
         self._mining_cooldown: float = 10.0
 
         # 探索追踪
@@ -220,19 +221,34 @@ class GameEventEmitter:
             hotbar = (inv or {}).get("hotbar", []) or []
         except Exception:
             pass
+        current: Dict[str, int] = {}
         for slot in hotbar:
+            if not isinstance(slot, dict):
+                continue
             name = str(slot.get("name", "") or "")
             if not name:
                 continue
+            try:
+                stack = max(0, int(slot.get("stack", slot.get("count", 1)) or 0))
+            except (TypeError, ValueError):
+                stack = 0
             for ore in MINING_ORE_NAMES:
-                if ore in name and ore not in self._mining_ore_seen:
-                    self._mining_ore_seen.add(ore)
-                    self._last_mine_time = now
-                    if self.interaction:
-                        self._inject(
-                            EventType.ORE_FOUND, intensity=0.25,
-                            description=f"咦，发现了 {ore}！挖一下～")
-                    return
+                if ore in name:
+                    current[ore] = current.get(ore, 0) + stack
+        if not self._mining_baselined:
+            self._mining_ore_counts = current
+            self._mining_baselined = True
+            return
+        for ore, count in current.items():
+            if count > self._mining_ore_counts.get(ore, 0):
+                self._mining_ore_counts = current
+                self._last_mine_time = now
+                if self.interaction:
+                    self._inject(
+                        EventType.ORE_FOUND, intensity=0.25,
+                        description=f"咦，发现了 {ore}！挖一下～")
+                return
+        self._mining_ore_counts = current
 
     def _check_exploration_events(self, cur: Dict, prev: Dict, now: float) -> None:
         if now - self._last_explore_time < self._explore_cooldown:
@@ -411,7 +427,8 @@ class GameEventEmitter:
         self._combat_damage_sum = 0
         self._combat_kill_count = 0
         self._combat_enemy_name = ""
-        self._mining_ore_seen.clear()
+        self._mining_ore_counts.clear()
+        self._mining_baselined = False
         self._chests_seen.clear()
         self._nearby_player_names.clear()
         self._current_goal = None
