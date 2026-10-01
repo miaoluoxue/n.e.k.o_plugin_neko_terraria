@@ -153,9 +153,6 @@ class TaskCoordinator:
                     "output": "这条指令已被后来的停止指令取消。"}
         self.agent.log(f"[coordinator.handle] 📋 解析结果: mode={result.mode}, kind={result.kind}, target={result.target}", "info")
 
-        # 记录到上下文（用于"继续"/"再来点"等指代理解）
-        self._intent_parser.record_success(text, result)
-
         # 先回话（LLM 解析出的 pre_reply，如"好的主人~"）
         if result.pre_reply:
             try:
@@ -170,6 +167,7 @@ class TaskCoordinator:
         # 推给主程序 LLM，以完整角色人设自然回应
         if result.mode == "chat":
             await self._do_chat(text, result)
+            self._intent_parser.record_success(text, result)
             return {"ok": True, "status": "chat", "mode": "chat",
                     "output": result.pre_reply,
                     "intent": result.to_dict()}
@@ -196,11 +194,16 @@ class TaskCoordinator:
             return r
         if result.mode == "longterm":
             self.agent.log("[coordinator] ⏳ 执行 longterm", "info")
-            return await self._do_longterm(result)
+            outcome = await self._do_longterm(result)
+            if outcome.get("ok") and outcome.get("status") not in ("failed", "error", "cancelled"):
+                self._intent_parser.record_success(result.raw or result.reason, result)
+            return outcome
         if result.mode == "finite":
             self.agent.log("[coordinator] 📝 执行 finite", "info")
             r = await self._do_finite(result, source)
             r.setdefault("mode", "finite")
+            if r.get("ok") and r.get("status") not in ("failed", "error", "cancelled"):
+                self._intent_parser.record_success(result.raw or result.reason, result)
             return r
         if result.mode == "chat":
             await self._do_chat(raw_text or result.raw, result)
