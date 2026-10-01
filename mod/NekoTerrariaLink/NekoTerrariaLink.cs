@@ -2230,14 +2230,15 @@ namespace NekoTerrariaLink
                         {
                             var ing = r.requiredItem[ingredientIndex];
                             if (ing == null || ing.type <= 0 || ing.stack <= 0) continue;
-                            // acceptedGroups has one entry per required ingredient (-1 means no group).
+                            // acceptedGroups is a recipe-level list.  It is not
+                            // aligned with requiredItem after tModLoader removes
+                            // unused -1 entries, so resolve groups by membership.
                             var alternatives = new List<Dict>();
                             var seen = new HashSet<int> { ing.type };
-                            int groupId = ingredientIndex < r.acceptedGroups.Count
-                                ? r.acceptedGroups[ingredientIndex] : -1;
-                            if (groupId >= 0 && RecipeGroup.recipeGroups.TryGetValue(groupId, out var group)
-                                && group.ValidItems.Contains(ing.type))
+                            foreach (int groupId in r.acceptedGroups)
                             {
+                                if (groupId < 0 || !RecipeGroup.recipeGroups.TryGetValue(groupId, out var group)
+                                    || !group.ValidItems.Contains(ing.type)) continue;
                                 foreach (int altId in group.ValidItems)
                                 {
                                     if (!seen.Add(altId) || !ContentSamples.ItemsByType.TryGetValue(altId, out var alt)) continue;

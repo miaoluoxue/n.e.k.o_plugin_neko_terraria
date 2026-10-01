@@ -43,10 +43,26 @@ class VirtualInventory:
     def key(self, item) -> str:
         from .item_npc_dict import item_id
         from .recipe_book import CN_EN, _norm
-        if str(item).isdecimal() and int(item) > 0:
-            return f"id:{int(item)}"
+        raw = str(item or "").strip()
+        if raw.casefold().startswith("id:"):
+            try:
+                iid = int(raw.split(":", 1)[1])
+            except (TypeError, ValueError):
+                iid = -1
+            if iid > 0:
+                return f"id:{iid}"
+        if raw.isdecimal() and int(raw) > 0:
+            return f"id:{int(raw)}"
         iid = item_id(item, self.registry)
         return f"id:{iid}" if iid > 0 else _norm(CN_EN.get(str(item), str(item)))
+
+    def count_id(self, item_id: int) -> int:
+        """Count an inventory entry by wire ID, independent of display names."""
+        try:
+            iid = int(item_id)
+        except (TypeError, ValueError):
+            return 0
+        return int(self.counts.get(f"id:{iid}", 0)) if iid > 0 else 0
 
     def count(self, item: str) -> int:
         return int(self.counts.get(self.key(item), 0))

@@ -83,7 +83,11 @@ class LifeEngine:
                 name = str(it.get("name", "") or "").lower()
                 full_name = str(it.get("full_name", "") or "").lower()
                 attr = {"pick": "pick", "axe": "axe", "rod": "fishing_pole"}.get(kind)
-                has_attr = attr and int(it.get(attr, 0) or 0) > 0
+                # A present capability field is authoritative.  Falling back
+                # to the display name when it is zero makes CopperPickaxe look
+                # like an axe because its name contains the substring "axe".
+                attr_present = bool(attr and attr in it and it.get(attr) is not None)
+                has_attr = bool(attr and int(it.get(attr, 0) or 0) > 0)
                 # 某些 Mod 工具不会把原版 axe/pick 字段填回背包快照，
                 # 但注册表已经按 Item 属性标记了标签。完整内部名也比
                 # 本地化显示名稳定，三者任一命中即可尝试切换。
@@ -95,7 +99,10 @@ class LifeEngine:
                 except Exception:
                     pass
                 tag_match = {"pick": "pickaxe", "axe": "axe", "rod": "fishing"}.get(kind) in tags
-                if has_attr or tag_match or any(k.lower() in name or k.lower() in full_name for k in kws):
+                name_match = any(k.lower() in name or k.lower() in full_name for k in kws)
+                if kind == "axe" and ("pickaxe" in name or "pickaxe" in full_name):
+                    name_match = False
+                if has_attr or tag_match or (not attr_present and name_match):
                     if await self.agent.mod.select_item(slot):
                         self.last_failure = ""
                         self._last_tool_warning = ""

@@ -98,11 +98,13 @@ class Recipe:
                 if iid in seen:
                     continue
                 seen.add(iid)
-                name = option.get("full_name") or option.get("name", "")
-                take = min(need, trial.count(name))
+                # Inventory snapshots are keyed by the wire item ID.  Names
+                # can be localized or collide across mods, so never use them
+                # to decide whether a grouped ingredient is available.
+                take = min(need, trial.count_id(iid))
                 if take:
-                    trial.take(name, take)
-                    takes.append((name, take))
+                    trial.take(f"id:{iid}", take)
+                    takes.append((f"id:{iid}", take))
                     need -= take
                 if not need:
                     break
