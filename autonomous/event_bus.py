@@ -1,7 +1,11 @@
 """事件总线：模块间解耦通信，指令打断走这里。"""
 
 import asyncio
+import inspect
+import logging
 from typing import Any, Callable, Dict, List
+
+log = logging.getLogger(__name__)
 
 _event_bus: "EventBus | None" = None
 
@@ -55,6 +59,7 @@ def get_event_bus() -> "EventBus":
 class EventBus:
     def __init__(self) -> None:
         self._subs: Dict[str, List[Callable[[Any], Any]]] = {}
+        self._tasks: set[asyncio.Task] = set()
 
     def subscribe(self, event: str, cb: Callable[[Any], Any]) -> None:
         # 去重：面板断开→重连会多次 start()，各模块重复 bind/subscribe，
@@ -69,24 +74,37 @@ class EventBus:
             subs.remove(cb)
 
     async def publish(self, event: str, data: Any) -> None:
-        for cb in self._subs.get(event, []):
+        for cb in list(self._subs.get(event, [])):
             try:
-                if asyncio.iscoroutinefunction(cb):
-                    await cb(data)
-                else:
-                    cb(data)
-            except Exception:
-                pass
+                result = cb(data)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                log.warning("事件回调失败 event=%s callback=%r: %s", event, cb, exc)
 
     def fire(self, event: str, data: Any) -> None:
-        for cb in self._subs.get(event, []):
+        for cb in list(self._subs.get(event, [])):
             try:
-                if asyncio.iscoroutinefunction(cb):
-                    asyncio.ensure_future(cb(data))
-                else:
-                    cb(data)
-            except Exception:
-                pass
+                result = cb(data)
+                if not inspect.isawaitable(result):
+                    continue
+                task = asyncio.create_task(result)
+                self._tasks.add(task)
+                task.add_done_callback(self._task_done)
+            except Exception as exc:
+                log.warning("事件派发失败 event=%s callback=%r: %s", event, cb, exc)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception as exc:
+            log.warning("读取事件任务异常失败: %s", exc)
+            return
+        if error is not None:
+            log.warning("异步事件回调失败: %s", error, exc_info=error)
 
     def fire_player_event(self, event: str, data: Dict[str, Any]) -> None:
         self.fire(event, data)
