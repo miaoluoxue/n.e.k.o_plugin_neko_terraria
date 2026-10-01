@@ -2216,6 +2216,7 @@ namespace NekoTerrariaLink
             {
                 try
                 {
+                    if (!ReferenceEquals(_activeStream, s)) return;
                     Recipe.FindRecipes();
                     // Guide mode displays suggestions, not craftable recipes.
                     var available = new HashSet<int>(Main.availableRecipe.Take(Main.numAvailableRecipes));
@@ -2231,6 +2232,9 @@ namespace NekoTerrariaLink
                     var list = new List<Dict>();
                     for (int i = 0; i < Recipe.numRecipes; i++)
                     {
+                        // 大配方表生成期间客户端可能已经断线；及时放弃，
+                        // 不把无用的枚举工作继续占在游戏主线程上。
+                        if ((i & 63) == 0 && !ReferenceEquals(_activeStream, s)) return;
                         Recipe r = Main.recipe[i];
                         if (r == null || r.Disabled || r.createItem == null || r.createItem.type <= 0) continue;
                         if (cat == "available" && !available.Contains(i)) continue;
@@ -2276,7 +2280,8 @@ namespace NekoTerrariaLink
                             ["axe"] = created.axe, ["defense"] = created.defense,
                         });
                     }
-                    Send(s, new Dict { ["req_id"] = reqId, ["type"] = "recipes", ["recipes"] = list });
+                    if (ReferenceEquals(_activeStream, s))
+                        Send(s, new Dict { ["req_id"] = reqId, ["type"] = "recipes", ["recipes"] = list });
                 }
                 catch (Exception ex)
                 {
