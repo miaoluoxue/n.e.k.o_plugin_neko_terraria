@@ -44,4 +44,5 @@ exclude_files = [
     "mod/tModLoader/servers.dat",
     "mod/tModLoader/LastLaunchedMods.txt",
     "mod/tModLoader/input profiles.json",
+    "*.lnk",
 ]
