@@ -612,6 +612,15 @@ namespace NekoTerrariaLink
                     stream.WriteTimeout = 1000;
                     SendRawUtf8(stream, "{\"welcome\":true}\n");
                     _activeStream = stream;   // 握手完成后才允许并行推送事件
+                    // 新会话不能继承上一名角色的死亡/Boss/伤害边沿，
+                    // 否则重连后自主层可能收不到复活或状态变化。
+                    var sessionPlayer = Main.LocalPlayer;
+                    _prevAlive = sessionPlayer != null && sessionPlayer.active && sessionPlayer.statLife > 0;
+                    _prevBossActive = false;
+                    _prevBossName = "";
+                    _prevInvasionType = 0;
+                    _prevHp = sessionPlayer != null ? sessionPlayer.statLife : 0;
+                    _dmgAccum = 0;
                     Logger.Info("[TCP] 已发送 welcome 握手");
 
                     // StreamReader 保留跨 TCP 包的 UTF-8 解码状态，中文不会被截断。

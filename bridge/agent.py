@@ -495,6 +495,24 @@ class TerrariaAgent:
                     },
                 )
 
+        elif event == "player_respawned":
+            # Mod 已确认复活时立即解除死亡闸门；否则只靠低频
+            # get_state 轮询，可能让自主行为停在死亡状态数秒甚至更久。
+            self._is_dead = False
+            self._state["alive"] = True
+            if msg.get("hp") is not None:
+                self._state["hp"] = int(msg.get("hp", self._state.get("hp", 0)))
+            for cb in self.respawn_callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(cb):
+                        self._spawn_background_task(cb())
+                    else:
+                        cb()
+                except Exception:
+                    pass
+            bus.fire("player_respawned", {
+                "hp": self._state.get("hp", 0), "source": "mod_event"})
+
         elif event == "boss_spawned":
             bus.fire("boss_spawned", {"name": msg.get("boss_name", msg.get("message", "未知Boss"))})
 
@@ -523,6 +541,8 @@ class TerrariaAgent:
                 self._state["max_life"] = int(msg.get("max_hp", self._state.get("max_life", 100)))
                 self._state["tile_x"] = int(msg.get("x", self._state.get("tile_x", 0)))
                 self._state["tile_y"] = int(msg.get("y", self._state.get("tile_y", 0)))
+                if "alive" in msg:
+                    self._state["alive"] = bool(msg.get("alive"))
                 if msg.get("alive") is False and not self._is_dead:
                     self._is_dead = True
             except Exception:
@@ -539,6 +559,12 @@ class TerrariaAgent:
                 self._state["tile_y"] = int(pl.get("tile_y", self._state.get("tile_y", 0)))
                 if "alive" in pl:
                     self._state["alive"] = bool(pl.get("alive"))
+                    if pl.get("alive") is False:
+                        self._is_dead = True
+                    elif self._is_dead and int(pl.get("hp", 0) or 0) > 0:
+                        # 兼容丢失 player_respawned 事件的连接：状态推送本身
+                        # 已证明角色恢复生命，解除自主行为的死亡闸门。
+                        self._is_dead = False
                 # 身体感/移动字段（PushGameState 补齐推送后，Python 无需每秒轮询 get_state）
                 for f in ("velocity_x", "velocity_y", "grounded", "selected_slot"):
                     if f in pl:
@@ -570,7 +596,16 @@ class TerrariaAgent:
                             n["tile_y"] = n.get("tileY", 0)
                     self._state["nearby_npcs"] = npcs
                 if "nearby_players" in msg:
-                    self._state["nearby_players"] = msg.get("nearby_players", [])
+                    players = msg.get("nearby_players", []) or []
+                    # 兼容旧版/第三方 Mod 的 camelCase 坐标，避免跟随和
+                    # 自主社交读到 0,0 后误判主人丢失。
+                    for player in players:
+                        if isinstance(player, dict):
+                            if "tileX" in player and "tile_x" not in player:
+                                player["tile_x"] = player.get("tileX", 0)
+                            if "tileY" in player and "tile_y" not in player:
+                                player["tile_y"] = player.get("tileY", 0)
+                    self._state["nearby_players"] = players
                 if "time_of_day" in msg:
                     self._state["time_of_day"] = msg.get("time_of_day", "")
             except Exception:
