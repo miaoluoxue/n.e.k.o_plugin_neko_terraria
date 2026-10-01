@@ -20,7 +20,7 @@ using Microsoft.Xna.Framework.Graphics;
 namespace NekoTerrariaLink
 {
     /// <summary>每帧注入控制状态：命令线程写状态，主线程 PreUpdateMovement 应用 control。</summary>
-    public class NekoControlPlayer : ModPlayer
+    public partial class NekoControlPlayer : ModPlayer
     {
         public int moveDir;      // -1 左 / 0 停 / 1 右
         public int jumpTicks;    // 剩余跳跃帧
@@ -40,6 +40,23 @@ namespace NekoTerrariaLink
             useSlot = digTargetX = digTargetY = -1;
             Player.controlLeft = Player.controlRight = Player.controlJump = false;
             Player.controlDown = Player.controlUseItem = Player.controlHook = false;
+            ResetLiquidEscape(suppress: true);
+        }
+
+        // Navigation state is changed by the game-thread command queue only.
+        internal void ResetNavigation(int generation)
+        {
+            navGen = generation;
+            navPath = null;
+            navIdx = 0;
+            moveDir = jumpTicks = _jumpFrames = 0;
+        }
+
+        internal void SetNavigationPath(List<NekoTerrariaLink.NavPoint> path)
+        {
+            navPath = path;
+            navIdx = 0;
+            _jumpFrames = 0;
         }
 
         private bool IsControlled => Player.whoAmI == Main.myPlayer
@@ -89,6 +106,7 @@ namespace NekoTerrariaLink
         {
             var p = Player;
             if (!IsControlled) return;
+            if (ApplyLiquidEscape()) return;
             // 与 LumiBridge 相同，在 ResetControls 之后、原生物品/移动逻辑之前注入。
             p.controlUseItem = useTicks > 0;
             p.controlHook = hookTicks > 0;
@@ -98,8 +116,14 @@ namespace NekoTerrariaLink
                 AimAtTarget();
                 useTicks--;
             }
-            if (hookTicks > 0) hookTicks--;
-            if (navPath != null && navIdx < navPath.Count)
+            if (hookTicks > 0)
+            {
+                // Hook direction must be refreshed while the control is held;
+                // otherwise it fires at the user's stale cursor position.
+                AimAtTarget();
+                hookTicks--;
+            }
+            if (!LiquidEscapeActive && navPath != null && navIdx < navPath.Count)
             {
                 int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
                 var g = navPath[navIdx];
@@ -148,7 +172,7 @@ namespace NekoTerrariaLink
         {
             var p = Player;
             if (!IsControlled) return;
-            if (navPath != null && navIdx < navPath.Count)
+            if (!LiquidEscapeActive && navPath != null && navIdx < navPath.Count)
             {
                 if (_diagFrame++ % 60 == 0)
                 {
@@ -175,20 +199,8 @@ namespace NekoTerrariaLink
             if (navPath == null || navIdx >= navPath.Count) return;
             int px = (int)(p.Center.X / 16), py = (int)(p.Bottom.Y / 16);
             var g = navPath[navIdx];
-            if (Math.Abs(px - g.X) <= 1 && Math.Abs(py - g.Y) <= 2
-                && (g.Jump == 0 || py <= g.Y))
-            {
-                navIdx++;
-                if (navIdx >= navPath.Count)
-                {
-                    navPath = null;
-                    p.velocity.X = 0f;
-                    p.controlJump = p.controlDown = false;
-                    NetMessage.SendData(MessageID.PlayerControls, -1, -1, null, p.whoAmI);
-                    return;
-                }
-                g = navPath[navIdx];
-            }
+            // Waypoint advancement is owned by PostUpdateRunSpeeds. Advancing
+            // here as well can skip a jump/drop waypoint in one frame.
             int dx = g.X - px;
             // 后备：control 已注入但 velocity 仍归零（钩子未生效）→ 直驱兜底
             if (dx != 0 && Math.Abs(p.velocity.X) < 0.1f)

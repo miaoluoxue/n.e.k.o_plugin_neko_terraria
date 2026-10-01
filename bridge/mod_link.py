@@ -423,6 +423,10 @@ class ModLink:
             "alive": p.get("alive", p.get("hp", 0) > 0),
             "velocity_x": p.get("velocityX", 0), "velocity_y": p.get("velocityY", 0),
             "grounded": p.get("grounded", True),
+            "in_water": bool(p.get("in_water", False)),
+            "in_lava": bool(p.get("in_lava", False)),
+            "in_honey": bool(p.get("in_honey", False)),
+            "breath": int(p.get("breath", 200) or 0),
             "nearby_npcs": [
                 {"name": n.get("name", ""), "slot": n.get("slot", 0),
                  "type": n.get("type", 0), "life": n.get("life", 0),

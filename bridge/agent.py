@@ -611,7 +611,8 @@ class TerrariaAgent:
                         # 已证明角色恢复生命，解除自主行为的死亡闸门。
                         self._is_dead = False
                 # 身体感/移动字段（PushGameState 补齐推送后，Python 无需每秒轮询 get_state）
-                for f in ("velocity_x", "velocity_y", "grounded", "selected_slot"):
+                for f in ("velocity_x", "velocity_y", "grounded", "selected_slot",
+                          "in_water", "in_lava", "in_honey", "breath"):
                     if f in pl:
                         self._state[f] = pl.get(f)
                 if "biome" in pl:

@@ -53,14 +53,16 @@ class Reasoner:
         self.world = world
 
     async def fix_for(self, item: str, amount: int, vi,
-                      depth: int = 0) -> Optional[Fix]:
+                      depth: int = 0, seen: Optional[set[str]] = None) -> Optional[Fix]:
         """给"缺 amount 个 item"找一条最省事的补救路。"""
-        if depth > 3 or not item:
+        seen = set(seen or ())
+        item_key = str(item or "").casefold().strip()
+        if depth > 3 or not item or item_key in seen:
             return None
 
         # 能力物品（镐/斧/钓竿/钩）要先落成具体物品名
         if item in ("镐", "斧", "钓竿", "钩爪"):
-            return await self._fix_capability(item, vi, depth)
+            return await self._fix_capability(item, vi, depth, seen | {item_key})
 
         # amount is the additional shortage, not the target inventory total.
         if amount <= 0:
@@ -92,7 +94,8 @@ class Reasoner:
             feasible = True
             reasons = []
             for name, count in missing:
-                sub = await self.fix_for(name, count, trial, depth + 1)
+                sub = await self.fix_for(name, count, trial, depth + 1,
+                                         seen | {item_key})
                 if sub is None or sub.cost >= COST_ASK or not sub.steps:
                     feasible = False
                     break
@@ -182,13 +185,32 @@ class Reasoner:
                                              or "hook" in name):
                         names.append(name)
             # mod 物品可能成百上千，逐个查箱子会把 mod 通信打爆，取前若干个
-            return base + names[:MAX_MOD_CANDIDATES]
+            return list(dict.fromkeys(base + names[:MAX_MOD_CANDIDATES]))
         except Exception:
             return base
 
-    async def _fix_capability(self, kind: str, vi, depth: int) -> Optional[Fix]:
+    def _tool_score(self, name: str, kind: str) -> tuple:
+        """Rank real tool candidates by their item capability, not name order."""
+        registry = getattr(self.agent, "registry", None)
+        iid = self.agent.resolve_item(name) if hasattr(self.agent, "resolve_item") else -1
+        info = registry.describe(str(iid)) if registry is not None and iid > 0 else {}
+        attr = {"镐": "pick", "斧": "axe", "钓竿": "fishing_pole"}.get(kind, "")
+        power = int(info.get(attr, 0) or 0)
+        power = max(power, int(info.get("pickaxe_power", 0) or 0),
+                    int(info.get("axe_power", 0) or 0), int(info.get("damage", 0) or 0))
+        # Known vanilla tiers remain useful when the registry does not expose
+        # power fields, while unknown mod tools stay eligible below them.
+        fallback_tier = {"铜": 1, "锡": 1, "木": 0, "仙人掌": 1,
+                         "铁": 2, "铅": 2, "银": 3, "钨": 3,
+                         "金": 4, "铂金": 5}.get(next(
+                             (k for k in ("铜", "锡", "木", "仙人掌", "铁", "铅", "银", "钨", "金", "铂金") if k in name), ""), 0)
+        return power, fallback_tier
+
+    async def _fix_capability(self, kind: str, vi, depth: int,
+                              seen: Optional[set[str]] = None) -> Optional[Fix]:
         """缺镐子/钩爪这类能力物品：挑一个最容易到手的具体物品。"""
-        cands = self._candidates(kind)
+        cands = sorted(self._candidates(kind),
+                       key=lambda n: self._tool_score(n, kind), reverse=True)
         best: Optional[Fix] = None
         for name in cands:
             # 身上有就直接用
@@ -206,7 +228,13 @@ class Reasoner:
                                    "amount": 1}])
         # 箱子里都没有，试试合成最便宜的那个（只在少量候选里找，别递归爆炸）
         for name in cands[:MAX_CRAFT_TRY]:
-            f = await self.fix_for(name, 1, vi, depth + 1)
+            # A recipe for an axe requiring an axe (or equivalent tool) is a
+            # circular plan; do not keep asking the reasoner to make itself.
+            name_key = str(name).casefold().strip()
+            if name_key in (seen or set()):
+                continue
+            f = await self.fix_for(name, 1, vi, depth + 1,
+                                   (seen or set()) | {str(kind).casefold()})
             if f and f.how in ("craft", "mine") and (best is None or f.cost < best.cost):
                 best = f
         if best:
@@ -218,4 +246,25 @@ class Reasoner:
             "钓竿": "主人我没有钓竿钓不了鱼喵，主人有也可以给我喵",
             "钩爪": "主人我没有钩爪爬不上去喵，主人有也可以给我喵",
         }.get(kind, f"我没有{kind}，主人给我一个吧")
+        # Prefer an actionable blocker from candidate assessment over a vague
+        # request. This distinguishes missing materials from missing station.
+        if self.world.book is not None:
+            try:
+                await self.world.book.refresh()
+                await self.world.book.refresh_availability()
+                for name in cands[:MAX_CRAFT_TRY]:
+                    recipe = self.world.book.find(name, inventory=vi, amount=1)
+                    if recipe is None:
+                        continue
+                    if not recipe.environment_ready:
+                        ready, lack = await self.world.station_ready(name, recipe)
+                        if not ready:
+                            ask_msg = f"做{name}需要合成环境：{lack}"
+                            break
+                    _, missing = recipe.requirements(1, vi)
+                    if missing:
+                        materials = "、".join(f"{n}×{count}" for n, count in missing[:3])
+                        ask_msg = f"做{name}还缺材料：{materials}；附近没有可取得来源"
+            except Exception:
+                pass
         return Fix(how="ask", desc=ask_msg, cost=COST_ASK)

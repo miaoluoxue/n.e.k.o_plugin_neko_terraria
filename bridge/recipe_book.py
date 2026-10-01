@@ -94,7 +94,12 @@ class Recipe:
             options = [ingredient, *(ingredient.get("alternatives", []) or [])]
             seen = set()
             for option in options:
-                iid = int(option.get("id", -1))
+                try:
+                    iid = int(option.get("id", -1))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if iid <= 0:
+                    continue
                 if iid in seen:
                     continue
                 seen.add(iid)
@@ -198,9 +203,21 @@ class RecipeBook:
                     if not registry.live:
                         raise ValueError("Item registry synchronization failed")
                 raw = await self.agent.mod.get_recipes("all")
-                if raw is None:
+                if not isinstance(raw, list):
                     raise ValueError("Recipe synchronization failed")
-                recipes = [Recipe(d) for d in raw]
+                # A mod pack can expose an obsolete/partial recipe while the
+                # rest of the registry is valid.  One malformed entry must
+                # not discard every recipe and make all crafting impossible.
+                recipes = []
+                for data in raw:
+                    if not isinstance(data, dict):
+                        continue
+                    try:
+                        recipes.append(Recipe(data))
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                if not recipes and raw:
+                    raise ValueError("No valid recipes in synchronization response")
             except Exception:
                 self.invalidate()
                 # Disk data is descriptive only: mod IDs and recipe indexes change between sessions.
@@ -235,8 +252,12 @@ class RecipeBook:
                 recipe.environment_ready = recipe.recipe_index in environment
             return True
         except Exception:
-            for recipe in self._recipes:
-                recipe.available = recipe.environment_ready = False
+            # A transient status request failure must not turn every known
+            # recipe into an apparent impossibility.  The full recipe payload
+            # carries the last authoritative flags; retain those flags and
+            # let the executor perform its own craft/inventory verification.
+            # Clearing them here caused a brief TCP hiccup to make the planner
+            # report "没有合成环境" for unrelated items.
             return False
 
     def _lookup(self, item) -> List[Recipe]:

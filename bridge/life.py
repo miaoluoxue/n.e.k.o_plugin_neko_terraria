@@ -52,8 +52,190 @@ class LifeEngine:
         self.last_failure = ""
         self.last_cast_count = 0
         self._last_tool_warning = ""
+        self._tool_prepare_depth = 0
+        self._tool_prepare_seen: set[int] = set()
 
     # ---------------- 工具选择 ----------------
+
+    async def _craft_basic_tool(self, kind: str) -> bool:
+        """没有工具时，按真实配方尝试制作一把基础工具。
+
+        这里只使用 Mod 返回的配方、材料和合成环境；不会用 give_item
+        凭空生成工具。制作成功后由调用方重新拉取背包并选择工具。
+        """
+        candidates = {
+            "pick": (
+                "Copper Pickaxe", "Iron Pickaxe", "Silver Pickaxe",
+                "Gold Pickaxe", "Platinum Pickaxe", "铜镐", "铁镐",
+                "银镐", "金镐", "铂金镐",
+            ),
+            "axe": (
+                "Copper Axe", "Iron Axe", "Silver Axe", "Gold Axe",
+                "Platinum Axe", "War Axe of the Night", "铜斧", "铁斧",
+                "银斧", "金斧", "铂金斧",
+            ),
+            "rod": (
+                "Wood Fishing Pole", "Reinforced Fishing Pole",
+                "木钓竿", "强化钓竿",
+            ),
+        }.get(kind, ())
+        if not candidates:
+            return False
+        book = getattr(self.agent, "recipe_book", None)
+        if book is None:
+            return False
+        try:
+            await book.refresh()
+            await book.refresh_availability()
+            from .world_model import WorldModel
+
+            inventory = await WorldModel(self.agent, book).snapshot()
+            # Prefer the strongest recipe output that is already craftable.  A
+            # fixed Copper->Iron order made a weak starter tool win even when
+            # the player had materials for a much better tool.
+            recipes = []
+            for recipe in getattr(book, "_recipes", ()):
+                if not self._recipe_matches_tool(recipe, kind, candidates):
+                    continue
+                if not recipe.environment_ready:
+                    continue
+                recipes.append(recipe)
+            recipes.sort(key=lambda r: self._recipe_tool_score(r, kind), reverse=True)
+            for recipe in recipes[:8]:
+                # A recipe may be real but not immediately craftable.  Make a
+                # bounded attempt to obtain its ingredients through an actual
+                # chest/mining/recipe path before giving up.
+                _, missing = recipe.requirements(1, inventory)
+                if missing:
+                    prepared = await self._prepare_tool_materials(
+                        recipe, inventory, seen=set())
+                    if not prepared:
+                        continue
+                    inventory = await WorldModel(self.agent, book).snapshot()
+                    _, missing = recipe.requirements(1, inventory)
+                    if missing:
+                        continue
+                before = await self.agent.mod.get_inventory()
+                crafted = await self.agent.mod.craft(
+                    item_id=recipe.item_id,
+                    amount=1,
+                    recipe_index=recipe.recipe_index,
+                )
+                after = await self.agent.mod.get_inventory()
+                gained = self._count_item_id(after, recipe.item_id) - self._count_item_id(before, recipe.item_id)
+                if crafted > 0 and gained > 0:
+                    self.agent._inv_full = after
+                    self.agent.log(f"工具准备：按真实配方制作了 {recipe.name}", "item")
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.agent.log(f"自动制作工具失败：{exc}", "warn")
+        return False
+
+    async def _prepare_tool_materials(self, recipe, inventory, seen: set[int]) -> bool:
+        """Obtain missing recipe materials without manufacturing the tool itself."""
+        from .reasoner import Reasoner
+        from .world_model import WorldModel
+
+        if self._tool_prepare_depth >= 2 or recipe.item_id in seen:
+            return False
+        seen = seen | {recipe.item_id}
+        _takes, missing = recipe.requirements(1, inventory)
+        if not missing:
+            return True
+        self._tool_prepare_depth += 1
+        try:
+            for name, amount in missing:
+                iid = self.agent.resolve_item(name)
+                if iid <= 0 or iid in seen:
+                    return False
+                # Wood is the classic axe->wood->axe cycle.  Punching trees is
+                # intentionally not treated as a confirmed wood source here.
+                if iid == 9:
+                    self.last_failure = f"制作工具还缺木材×{amount}（不能用待制作的斧头递归砍树）"
+                    return False
+                try:
+                    chest = await self.agent.nearest_chest_with(name)
+                    if chest is not None and await self.agent.take_from_chest(
+                            name, chest, amount):
+                        inventory = await WorldModel(self.agent, getattr(
+                            self.agent, "recipe_book", None)).snapshot()
+                        continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                # Prefer an actual mining result for recognized ore materials.
+                try:
+                    if Reasoner(self.agent, None)._is_mineable(name):
+                        _ore_iid, got = await self.agent.mining.mine_target(name, amount)
+                        if got >= amount:
+                            inventory = await WorldModel(self.agent, getattr(
+                                self.agent, "recipe_book", None)).snapshot()
+                            continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                book = getattr(self.agent, "recipe_book", None)
+                if book is None:
+                    return False
+                child = book.find(name, inventory=inventory, amount=amount)
+                if child is None or not child.environment_ready:
+                    return False
+                if not await self._prepare_tool_materials(child, inventory, seen):
+                    return False
+                before = await self.agent.mod.get_inventory()
+                crafted = await self.agent.mod.craft(
+                    item_id=child.item_id, amount=amount,
+                    recipe_index=child.recipe_index)
+                after = await self.agent.mod.get_inventory()
+                self.agent._inv_full = after
+                gained = self._count_item_id(after, child.item_id) - self._count_item_id(before, child.item_id)
+                if crafted <= 0 or gained < amount:
+                    return False
+                inventory = await WorldModel(self.agent, book).snapshot()
+            return True
+        finally:
+            self._tool_prepare_depth -= 1
+
+    def _recipe_matches_tool(self, recipe, kind: str, fallback_names) -> bool:
+        """Identify a tool from authoritative registry fields, then names."""
+        registry = getattr(self.agent, "registry", None)
+        info = registry.describe(str(recipe.item_id)) if registry is not None else {}
+        name = " ".join((str(recipe.name), str(recipe.full_name),
+                         str(info.get("name", "")), str(info.get("display_name", "")))).casefold()
+        tags = {str(x).casefold() for x in (info.get("tags", []) or [])}
+        use = str(info.get("use", "")).casefold()
+        if kind == "pick":
+            return ("pickaxe" in tags or "pick" in tags or "pickaxe" in name
+                    or any("镐" in str(n) for n in (recipe.name, recipe.full_name)))
+        if kind == "axe":
+            return (("axe" in tags or "axe" in name or "斧" in name)
+                    and "pickaxe" not in name and "pickaxe" not in tags)
+        if kind == "rod":
+            return ("fishing" in tags or "rod" in tags or "fishing" in name
+                    or "钓竿" in name or "鱼竿" in name)
+        return False
+
+    def _recipe_tool_score(self, recipe, kind: str) -> tuple:
+        registry = getattr(self.agent, "registry", None)
+        info = registry.describe(str(recipe.item_id)) if registry is not None else {}
+        attr = {"pick": "pick", "axe": "axe", "rod": "fishing_pole"}.get(kind, "")
+        value = max((int(info.get(k, 0) or 0) for k in
+                     (attr, f"{kind}_power", "pickaxe_power", "axe_power", "damage")),
+                    default=0)
+        # Prefer recipe output whose item ID is stable and whose recipe is
+        # available; recipe_index is only a deterministic tie breaker.
+        return (value, bool(recipe.available), -len(recipe.ingredients), -recipe.recipe_index)
+
+    @staticmethod
+    def _count_item_id(inv: Dict[str, Any], iid: int) -> int:
+        return sum(int(it.get("stack", 0) or 0)
+                   for kind in ("hotbar", "inventory", "equipped")
+                   for it in (inv or {}).get(kind, []) or []
+                   if int(it.get("id", -1) or -1) == int(iid))
 
     async def select_tool(self, kind: str) -> bool:
         """选中合适工具/武器。kind:
@@ -74,6 +256,7 @@ class LifeEngine:
         if kind in ("pick", "axe", "rod"):
             kws = {"pick": _PICK_KW, "axe": _AXE_KW,
                    "rod": _ROD_KW}.get(kind, ())
+            eligible = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
@@ -103,12 +286,47 @@ class LifeEngine:
                 if kind == "axe" and ("pickaxe" in name or "pickaxe" in full_name):
                     name_match = False
                 if has_attr or tag_match or (not attr_present and name_match):
-                    if await self.agent.mod.select_item(slot):
-                        self.last_failure = ""
-                        self._last_tool_warning = ""
-                        return True
-                    self.last_failure = "工具已找到，但切换工具未成功"
-                    return False
+                    power_key = {"pick": "pick", "axe": "axe",
+                                 "rod": "fishing_pole"}.get(kind, "")
+                    power = int(it.get(power_key, 0) or 0)
+                    # A missing capability field should still rank below an
+                    # item carrying an authoritative power value.
+                    eligible.append((power, int(it.get("damage", 0) or 0), it))
+            for _power, _damage, it in sorted(eligible, key=lambda x: (x[0], x[1]), reverse=True):
+                if await self.agent.mod.select_item(it["inv_slot"]):
+                    self.last_failure = ""
+                    self._last_tool_warning = ""
+                    return True
+            if eligible:
+                self.last_failure = "工具已找到，但切换工具未成功"
+                return False
+            # 指令准备阶段允许制作基础工具；制作后重新读取背包，
+            # 避免“明明有材料却一直报告没有斧头/镐子”。
+            if await self._craft_basic_tool(kind):
+                try:
+                    refreshed = await self.agent.mod.get_inventory()
+                    self.agent._inv_full = refreshed
+                    items = ((refreshed.get("hotbar", []) or [])
+                             + (refreshed.get("inventory", []) or []))
+                    for it in items:
+                        if not isinstance(it, dict) or it.get("inv_slot") is None:
+                            continue
+                        slot = it["inv_slot"]
+                        name = str(it.get("name", "") or "").lower()
+                        full_name = str(it.get("full_name", "") or "").lower()
+                        attr = {"pick": "pick", "axe": "axe", "rod": "fishing_pole"}[kind]
+                        if int(it.get(attr, 0) or 0) > 0 or any(
+                                k.lower() in name or k.lower() in full_name for k in kws):
+                            if kind == "axe" and ("pickaxe" in name or "pickaxe" in full_name):
+                                continue
+                            if await self.agent.mod.select_item(slot):
+                                self.last_failure = ""
+                                self._last_tool_warning = ""
+                                return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
             self.last_failure = "背包中没有" + {"pick": "镐子", "axe": "斧头", "rod": "钓竿"}[kind]
             return False
 

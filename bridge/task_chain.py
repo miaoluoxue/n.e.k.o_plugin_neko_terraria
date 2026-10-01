@@ -99,6 +99,7 @@ class TaskChain:
 
     async def run_one(self, goal: Goal) -> bool:
         """直接执行单个目标并返回结果（不经队列），供执行器逐步驱动。"""
+        previous_current = self._current
         self._current = goal
         goal.actual = 0
         goal.outcome = "pending"
@@ -130,7 +131,7 @@ class TaskChain:
             return False
         finally:
             if self._current is goal:
-                self._current = None
+                self._current = previous_current
 
     async def run_loop(self) -> None:
         while True:

@@ -84,6 +84,21 @@ class VirtualInventory:
         if "hook" in tags or "钩" in name or "hook" in name:
             self.has_hook = True
 
+    def add_snapshot_item(self, item: Dict[str, Any], n: int) -> None:
+        """Add a wire inventory row and retain authoritative capability flags."""
+        if not isinstance(item, dict) or n <= 0:
+            return
+        iid = int(item.get("id", 0) or 0)
+        name = str(item.get("name", "") or "")
+        self.add(f"id:{iid}" if iid > 0 else name, n)
+        # Capabilities are present in the inventory payload even when the
+        # registry has not finished syncing; do not reject a reachable tool
+        # merely because its localized name is absent.
+        self.has_pickaxe |= int(item.get("pick", 0) or 0) > 0
+        self.has_axe |= int(item.get("axe", 0) or 0) > 0
+        self.has_rod |= int(item.get("fishing_pole", 0) or 0) > 0
+        self.has_hook |= int(item.get("hook", 0) or 0) > 0
+
     def take(self, item: str, n: int) -> bool:
         if n < 0 or self.count(item) < n:
             return False
@@ -123,8 +138,11 @@ class SimResult:
         return [s for s in self.steps if not s.ok]
 
 
-# 挖矿类动作默认产出自身
-MINE_ACTIONS = ("mine", "gather")
+# ``mine`` is the only action that requires a pickaxe and can be simulated as
+# producing material.  ``gather`` means picking up already dropped items; it
+# must not be treated as mining (that used to make an ordinary pickup fail
+# with "没有镐子" and also fabricated inventory for later craft steps).
+MINE_ACTIONS = ("mine",)
 
 
 class WorldModel:
@@ -164,9 +182,9 @@ class WorldModel:
                         continue
                     if slot is not None:
                         seen.add(slot)
-                    if name:
-                        identity = str(it["id"]) if int(it.get("id", 0)) > 0 else name
-                        vi.add(identity, int(it.get("stack", 0) or 0))
+                    stack = int(it.get("stack", 0) or 0)
+                    if stack > 0 and (name or int(it.get("id", 0) or 0) > 0):
+                        vi.add_snapshot_item(it, stack)
         except Exception:
             pass
         return vi
@@ -225,6 +243,17 @@ class WorldModel:
                     vi.add(item, amt)
                     st.produces = item
 
+            elif action == "gather":
+                # Pickup availability is a property of the live world and is
+                # confirmed by TaskChain after collect_items.  Do not invent
+                # items during planning, otherwise a gather→craft chain could
+                # be declared feasible without any dropped item being present.
+                have = vi.count(item) if item else 0
+                if have >= amt:
+                    st.note = f"背包里已经有 {have} 个{item}，可直接使用"
+                else:
+                    st.note = "需要执行收集并按背包净增确认数量"
+
             elif action == "craft":
                 recipe = await self.recipe_for(item, vi, amt, s.get("recipe_index"))
                 if recipe is None:
@@ -262,9 +291,20 @@ class WorldModel:
                     st.need_item = item
                     st.need_amount = amt
                 else:
-                    vi.add(item, amt)
-                    st.produces = item
-                    st.note = f"在箱子({chest.get('x')},{chest.get('y')})"
+                    iid = self.agent.resolve_item(item)
+                    available = 0
+                    for row in chest.get("items", []) or []:
+                        if iid > 0 and int(row.get("id", 0) or 0) == iid:
+                            available += max(0, int(row.get("stack", 0) or 0))
+                    if iid > 0 and available < amt:
+                        st.ok = False
+                        st.gap = f"附近箱子里只有 {available} 个{item}，还缺 {amt - available} 个"
+                        st.need_item = item
+                        st.need_amount = amt - available
+                    else:
+                        vi.add(item, min(amt, available) if iid > 0 else amt)
+                        st.produces = item
+                        st.note = f"在箱子({chest.get('x')},{chest.get('y')})确认有{available}个"
 
             elif action == "chop":
                 # 砍树：得有斧头（能力物品）

@@ -319,6 +319,10 @@ namespace NekoTerrariaLink
                         ["velocity_x"] = p.velocity.X,
                         ["velocity_y"] = p.velocity.Y,
                         ["grounded"] = p.velocity.Y == 0f,
+                        ["in_water"] = p.wet && !p.lavaWet && !p.honeyWet,
+                        ["in_lava"] = p.lavaWet,
+                        ["in_honey"] = p.honeyWet,
+                        ["breath"] = p.breath,
                         ["selected_slot"] = p.selectedItem,
                         ["alive"] = p.statLife > 0,
                         // 身体感字段（原只在 get_state 回执返回）——补齐推送，
@@ -889,8 +893,8 @@ namespace NekoTerrariaLink
                 {
                     case "left": ctrl.moveDir = -1; break;
                     case "right": ctrl.moveDir = 1; break;
-                    case "jump": ctrl.jumpTicks = 8; break;
-                    case "up": ctrl.moveDir = 0; ctrl.jumpTicks = 8; break;
+                    case "jump": ctrl.jumpTicks = Math.Max(ctrl.jumpTicks, 12); break;
+                    case "up": ctrl.moveDir = 0; ctrl.jumpTicks = Math.Max(ctrl.jumpTicks, 20); break;
                     case "down": case "stop": ctrl.moveDir = 0; break;
                 }
             }
@@ -915,6 +919,25 @@ namespace NekoTerrariaLink
                 {
                     NetMessage.SendData(MessageID.SyncChestItem, -1, -1,
                         null, idx, slot, 0f, 0f, 0, 0, 0);
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>同步客户端直接修改的背包槽位。SyncPlayer(4) 不包含物品栏。</summary>
+        private static void SyncInventory(Player player, int changedSlot = -1)
+        {
+            if (player == null || Main.netMode != NetmodeID.MultiplayerClient) return;
+            int first = changedSlot >= 0 ? changedSlot : 0;
+            int end = changedSlot >= 0 ? changedSlot + 1 : player.inventory.Length;
+            if (end > player.inventory.Length) return;
+            for (int slot = first; slot < end; slot++)
+            {
+                var item = player.inventory[slot];
+                try
+                {
+                    NetMessage.SendData(MessageID.SyncEquipment, -1, -1, null,
+                        player.whoAmI, PlayerItemSlotID.Inventory0 + slot, item?.prefix ?? 0);
                 }
                 catch { }
             }
@@ -1250,11 +1273,7 @@ namespace NekoTerrariaLink
             player.inventory[chestSlot].stack--;
             if (player.inventory[chestSlot].stack <= 0)
                 player.inventory[chestSlot].SetDefaults(0);
-            if (Main.netMode == NetmodeID.MultiplayerClient)
-                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
-            for (int dx = 0; dx < 2; dx++)
-                for (int dy = -1; dy <= 0; dy++)
-                    SyncTile(x + dx, y + dy, 1, TileID.Containers, style);
+            SyncInventory(player, chestSlot);
             return true;
         }
 
@@ -1334,136 +1353,131 @@ namespace NekoTerrariaLink
 
         private void MonitorNavInner(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents, int generation)
         {
-            var player = Main.LocalPlayer;
-            if (player == null)
+            // World tiles, inventory and controls are inspected only on the game thread.
+            // Every queued tick expires with this navigation generation.
+            long deadline = Environment.TickCount64 + Math.Clamp(timeout, 1, 120) * 1000L;
+            int ticks = 0, stalledTicks = 0, recoveryAttempts = 0, placedBlocks = 0;
+            int lastX = int.MinValue, lastY = int.MinValue, lastIndex = -1;
+            int pendingX = -1, pendingY = -1, pendingTicks = 0;
+            bool started = false;
+            string result = null;
+            int px = 0, py = 0;
+            // Python/协议坐标使用角色中心行；寻路 feet 语义是身体最下方占用行。
+            int targetFeet = ty + 1;
+            while (Environment.TickCount64 < deadline && result == null)
             {
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "no_player" });
-                return;
-            }
-            var ctrl = player.GetModPlayer<NekoControlPlayer>();
-            if (ctrl == null)
-            {
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "no_control_player" });
-                return;
-            }
-            // feet 语义：脚底行与寻路一致；Python 目标为 center 行 → feet 行 +1
-            int sx = (int)(player.Center.X / 16), sy = (int)(player.Bottom.Y / 16);
-            int tyFeet = ty + 1;
+                if (generation != Volatile.Read(ref _navigationGeneration)) { result = "cancelled"; break; }
+                bool done = false;
+                Main.QueueMainThreadAction(() =>
+                {
+                    try
+                    {
+                        if (generation != Volatile.Read(ref _navigationGeneration)
+                            || Environment.TickCount64 >= deadline) return;
+                        var player = Main.LocalPlayer;
+                        if (player == null || !player.active || player.dead) { result = "no_player"; return; }
+                        var ctrl = player.GetModPlayer<NekoControlPlayer>();
+                        px = (int)(player.Center.X / 16f);
+                        py = FeetTileY(player);
+                        if (!started)
+                        {
+                            ctrl.ResetNavigation(generation);
+                            ctrl.ResumeLiquidEscape();
+                            started = true;
+                        }
+                        // Local drowning recovery owns controls until it reaches dry ground.
+                        if (ctrl.LiquidEscapeActive || player.wet)
+                        {
+                            stalledTicks = 0;
+                            pendingX = pendingY = -1;
+                            return;
+                        }
+                        if (Math.Abs(px - tx) <= 1 && Math.Abs(py - targetFeet) <= 1
+                            && IsStandable(px, py) && Math.Abs(player.velocity.Y) < 0.1f)
+                        { result = "arrived"; ctrl.ResetNavigation(generation); return; }
 
-            // ── BFS 必须在主线程执行（Main.tile 是主线程数据） ──
-            List<NavPoint> path = null;
-            bool bfsDone = false;
-            bool bfsError = false;
-            string bfsErr = "";
-            Main.QueueMainThreadAction(() =>
-            {
-                try
-                {
-                    if (generation != Volatile.Read(ref _navigationGeneration)) return;
-                    ctrl.navPath = null;
-                    ctrl.moveDir = 0;
-                    path = FindPathAStar(sx, sy, tx, tyFeet);
-                    if (generation != Volatile.Read(ref _navigationGeneration)) return;
-                    if (path != null && path.Count > 0)
-                    {
-                        ctrl.navPath = path;
-                        ctrl.navIdx = 0;
-                        ctrl.jumpTicks = 0;
-                        ctrl.navGen = generation;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    bfsError = true;
-                    bfsErr = ex.Message;
-                }
-                finally { Volatile.Write(ref bfsDone, true); }
-            });
-            for (int i = 0; i < 300 && !Volatile.Read(ref bfsDone); i++) Thread.Sleep(10);
-            if (generation != Volatile.Read(ref _navigationGeneration))
-            {
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "cancelled" });
-                return;
-            }
-            if (!Volatile.Read(ref bfsDone))
-            {
-                Interlocked.CompareExchange(ref _navigationGeneration, generation + 1, generation);
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "bfs_timeout" });
-                return;
-            }
-            if (bfsError)
-            {
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "bfs_exception:" + bfsErr });
-                return;
-            }
-            if (path == null)
-            {
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "no_path" });
-                return;
-            }
-            if (path.Count == 0)
-            {
-                // 已在目标点：BFS 返回空路径，直接算到达
-                if (streamEvents) SendNavEvent(s, "nav_arrived", sx, sy);
-                Send(s, new Dict { ["req_id"] = reqId, ["ok"] = true, ["x"] = sx, ["y"] = sy });
-                return;
-            }
-            if (streamEvents) SendNavEvent(s, "nav_started", sx, sy);
+                        bool advanced = Math.Abs(px - lastX) > 1 || Math.Abs(py - lastY) > 1
+                            || (ctrl.navPath != null && ctrl.navIdx > lastIndex);
+                        if (advanced)
+                        {
+                            stalledTicks = 0;
+                            lastX = px; lastY = py; lastIndex = ctrl.navIdx;
+                        }
+                        else stalledTicks++;
 
-            // ── 后台监控循环（只读 player.Center，可接受旧值） ──
-            int myGen = generation;
-            int steps = 0, maxSteps = timeout * 10;
-            int stuckCounter = 0, lastPx = 0, lastPy = 0;
-            while (steps < maxSteps)
-            {
-                // #8: 被新导航接管（代际变化）→ 立即退出本线程，不再发 nav_* 事件。
-                // 否则僵尸监控线程会在后续 20s 内继续推 nav_moving/stuck/arrived，
-                // 导致 Python 侧 navigate_async 跨导航互相误判到达/超时，且 TCP 事件风暴。
-                if (Volatile.Read(ref ctrl.navGen) != myGen || myGen != Volatile.Read(ref _navigationGeneration))
-                {
-                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "cancelled" });
-                    return;
-                }
-                int px = (int)(player.Center.X / 16), py = (int)(player.Bottom.Y / 16);
-                // 路径走完（ModPlayer 置空）且贴近目标 → 到达（须为本人路径，代际未变）
-                if (Volatile.Read(ref ctrl.navGen) == myGen && ctrl.navPath == null && Math.Abs(px - tx) <= 1 && Math.Abs(py - tyFeet) <= 2)
-                {
-                    if (streamEvents) SendNavEvent(s, "nav_arrived", px, py);
-                    Send(s, new Dict { ["req_id"] = reqId, ["ok"] = true, ["x"] = px, ["y"] = py });
-                    return;
-                }
-                if (streamEvents && steps % 10 == 0) SendNavEvent(s, "nav_moving", px, py);
-                // 脚下无支撑 → 垫土/钩锁过坑（steps>0 跳过首轮，避免 lastPx=0 误判）
-                if (steps > 0 && player.velocity.Y == 0 && Math.Abs(px - lastPx) + Math.Abs(py - lastPy) > 0)
-                {
-                    int dir = tx > px ? 1 : -1;
-                    if (!IsStandable(px + dir, py + 1))
-                    {
-                        if (!TryBridge(px, py, dir, myGen)) TryHook(dir, myGen);
+                        // Pillar placement waits until a real jump vacates the tile; never place in a player.
+                        if (pendingX >= 0)
+                        {
+                            if (++pendingTicks > 12) pendingX = pendingY = -1;
+                            else if (player.Bottom.Y <= pendingY * 16f
+                                && TryPlaceNavigationBlock(player, pendingX, pendingY, generation))
+                            {
+                                placedBlocks++;
+                                pendingX = pendingY = -1;
+                                stalledTicks = 0;
+                            }
+                        }
+                        bool grounded = Math.Abs(player.velocity.Y) < 0.1f && IsStandable(px, py);
+                        if (ticks % 15 == 0 && pendingX < 0 && grounded
+                            && (ctrl.navPath == null || stalledTicks >= 15))
+                        {
+                            var path = FindPathAStar(px, py, tx, targetFeet);
+                            if (path != null && path.Count > 0)
+                            {
+                                ctrl.SetNavigationPath(path);
+                                lastIndex = -1;
+                            }
+                        }
+                        // Ordinary movement never builds. First give the native jump/path time to work.
+                        if (stalledTicks >= 20 && grounded && pendingX < 0)
+                        {
+                            if (recoveryAttempts >= 4) { result = ctrl.navPath == null ? "no_path" : "stuck"; return; }
+                            recoveryAttempts++;
+                            stalledTicks = 0;
+                            int dir = Math.Sign(tx - px);
+                            if (TryHook(player, tx, targetFeet, generation)) return;
+                            if (placedBlocks < 4 && dir != 0 && Math.Abs(targetFeet - py) <= 2
+                                && TryBridge(px, py, dir, generation))
+                            { placedBlocks++; ctrl.SetNavigationPath(null); return; }
+                            // Only climb toward a verified ledge above a real pit, with enough building stock.
+                            if (placedBlocks < 4 && targetFeet < py - 2
+                                && TryStepUp(player, px, py, tx, targetFeet, generation))
+                            {
+                                // TryStepUp already places the adjacent stair on
+                                // the main thread; do not queue a second block in
+                                // the player's current body tile.
+                                ctrl.SetNavigationPath(null);
+                            }
+                        }
                     }
-                }
-                // 卡住：5s 基本未动（波动<=1格容忍撞墙抖动）→ stuck；中途垫土一次
-                int moved = Math.Abs(px - lastPx) + Math.Abs(py - lastPy);
-                if (moved <= 1)
+                    catch (Exception ex) { result = "nav_exception:" + ex.Message; }
+                    finally { Volatile.Write(ref done, true); }
+                });
+                for (int n = 0; n < 100 && !Volatile.Read(ref done); n++)
                 {
-                    stuckCounter++;
-                    if (stuckCounter > 50)
-                    {
-                        QueueClearNavigation(ctrl, myGen);
-                        if (streamEvents) SendNavEvent(s, "nav_stuck", px, py);
-                        Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "stuck", ["x"] = px, ["y"] = py });
-                        return;
-                    }
-                    if (stuckCounter == 25) TryStepUp(px, py, myGen);
+                    if (generation != Volatile.Read(ref _navigationGeneration)) break;
+                    Thread.Sleep(10);
                 }
-                else { stuckCounter = 0; lastPx = px; lastPy = py; }
-                Thread.Sleep(100);
-                steps++;
+                if (!Volatile.Read(ref done)) { result = "main_thread_timeout"; break; }
+                if (streamEvents && ticks % 10 == 0 && result == null)
+                    SendNavEvent(s, ticks == 0 ? "nav_started" : "nav_moving", px, py);
+                ticks++;
+                if (result == null) Thread.Sleep(100);
             }
-            QueueClearNavigation(ctrl, myGen);
-            int fx = (int)(player.Center.X / 16), fy = (int)(player.Center.Y / 16);
-            if (streamEvents) SendNavEvent(s, "nav_timeout", fx, fy);
-            Send(s, new Dict { ["req_id"] = reqId, ["ok"] = false, ["reason"] = "timeout", ["x"] = fx, ["y"] = fy });
+            result ??= "timeout";
+            // Invalidate pending queue entries before cleanup, including a timed-out first tick.
+            int cleanupGeneration = generation + 1;
+            bool ownsNavigation = Interlocked.CompareExchange(ref _navigationGeneration, cleanupGeneration, generation) == generation;
+            if (ownsNavigation)
+                Main.QueueMainThreadAction(() =>
+                {
+                    if (cleanupGeneration != Volatile.Read(ref _navigationGeneration)) return;
+                    Main.LocalPlayer?.GetModPlayer<NekoControlPlayer>()?.ResetNavigation(cleanupGeneration);
+                });
+            else result = "cancelled";
+            if (streamEvents && result != "cancelled")
+                SendNavEvent(s, result == "arrived" ? "nav_arrived" : result == "timeout" ? "nav_timeout" : "nav_stuck", px, py);
+            Send(s, new Dict { ["req_id"] = reqId, ["ok"] = result == "arrived", ["reason"] = result, ["x"] = px, ["y"] = py });
         }
 
         /// <summary>后台导航监控不能直接写 ModPlayer 的路径状态。
@@ -1540,24 +1554,26 @@ namespace NekoTerrariaLink
         private static MovementCaps GetMovementCaps(Player p)
         {
             int jumpTiles = MaxJumpHeight(p);
-            int wingTiles = p.wingTimeMax > 0 ? Math.Clamp(p.wingTimeMax / 8, 6, 24) : 0;
-            int maxRise = Math.Clamp(jumpTiles + wingTiles, 6, 30);
-            int maxGap = wingTiles > 0 ? 8 : 5;
+            // The executor performs native jumps, not sustained wing flight.
+            int maxRise = Math.Clamp(jumpTiles, 1, 20);
+            int maxGap = Math.Clamp((int)(p.maxRunSpeed * 18f / 16f), 2, 5);
             return new MovementCaps { MaxRise = maxRise, MaxGap = maxGap };
         }
 
         /// <summary>实际最大跳高（格）：动力段（jumpSpeed×jumpHeight 帧）+ 惯性滑行模拟（移植 Bridge）。</summary>
         private static int MaxJumpHeight(Player p)
         {
-            float jumpSpeed = Player.jumpSpeed;      // 配饰可修改
+            float jumpSpeed = Player.jumpSpeed;      // accessories are reflected in jumpHeight/speed by vanilla
             int jumpHeight = Player.jumpHeight;
-            float gravity = Player.defaultGravity;   // 0.4
+            float gravity = Player.defaultGravity;
             if (gravity <= 0f) return 6;
             float px = jumpSpeed * jumpHeight;       // 动力段
             float vel = jumpSpeed;
             while (vel > 0f) { vel -= gravity; if (vel > 0f) px += vel; }  // 滑行段
             return Math.Max(1, (int)(px / 16f));
         }
+
+        internal static int FeetTileY(Player player) => (int)Math.Floor((player.Bottom.Y - 1f) / 16f);
 
         /// <summary>该格可站立（feet 语义：脚下有实心或平台支撑）。</summary>
         internal static bool IsStandable(int x, int y)
@@ -1568,7 +1584,10 @@ namespace NekoTerrariaLink
         /// <summary>2x3 体宽检查：站立行 + 上方两行在该列无实心。</summary>
         private static bool BodyFits(int x, int y)
         {
-            return !IsSolid(x, y) && !IsSolid(x, y - 1) && !IsSolid(x, y - 2);
+            if (x < 1 || y < 3 || x >= Main.maxTilesX - 1 || y >= Main.maxTilesY - 1) return false;
+            var p = Main.LocalPlayer;
+            int width = p?.width ?? 20, height = p?.height ?? 42;
+            return !Collision.SolidCollision(new Vector2(x * 16f + 8f - width / 2f, (y + 1) * 16f - height), width, height);
         }
 
         /// <summary>垂直走廊：三列均无实心（平台不阻挡上升）。</summary>
@@ -1596,12 +1615,11 @@ namespace NekoTerrariaLink
         {
             if (x0 == x1 && y0 == y1) return new List<NavPoint>();
             int sx = x0, sy = y0, gx = x1, gy = y1;
-            if (!TrySnapToStand(ref sx, ref sy, 30) || !TrySnapToStand(ref gx, ref gy, 25))
+            if (!TrySnapToStand(ref sx, ref sy, 1) || !TrySnapToStand(ref gx, ref gy, 2))
                 return null;
             if (sx == gx && sy == gy) return new List<NavPoint>();
 
             long key0 = ((long)sx << 16) | (uint)(sy & 0xFFFF);
-            long goalKey = ((long)gx << 16) | (uint)(gy & 0xFFFF);
             var records = new Dictionary<long, (float g, long parent, NavAction kind, int jump, bool closed)>();
             var open = new PriorityQueue<long, float>();
             records[key0] = (0f, -1, NavAction.Move, 0, false);
@@ -1622,11 +1640,11 @@ namespace NekoTerrariaLink
                 expansions++;
 
                 int cx = (int)(curKey >> 16), cy = (int)(curKey & 0xFFFF);
-                if (Math.Abs(cx - gx) <= 1 && Math.Abs(cy - gy) <= 2)
+                if (cx == gx && cy == gy)
                 { endKey = curKey; break; }
 
                 neighbors.Clear();
-                GenerateNeighbors(cx, cy, caps, false, 10, neighbors);
+                GenerateNeighbors(cx, cy, caps, gy > cy + 1, 10, neighbors);
                 foreach (var (nx, ny, cost, kind, jump) in neighbors)
                 {
                     long nk = ((long)nx << 16) | (uint)(ny & 0xFFFF);
@@ -1648,6 +1666,7 @@ namespace NekoTerrariaLink
                 k = r.parent;
             }
             path.Reverse();
+            if (path.Count > 1) path.RemoveAt(0);
             return path;
         }
 
@@ -1672,7 +1691,7 @@ namespace NekoTerrariaLink
                 {
                     if (!IsStandable(nx, ny)) continue;
                     if (ny < y && !BodyFits(x, ny)) continue;
-                    result.Add((nx, ny, 1f + 0.4f * Math.Abs(ny - y), NavAction.Move, 0));
+                    result.Add((nx, ny, 1f + 0.4f * Math.Abs(ny - y), NavAction.Move, ny < y ? 1 : 0));
                     break;
                 }
             }
@@ -1681,7 +1700,7 @@ namespace NekoTerrariaLink
             {
                 int nx = x + dir;
                 if (!BodyFits(nx, y) || IsStandable(nx, y)) continue;
-                for (int ny = y + 1; ny <= y + 45; ny++)
+                for (int ny = y + 1; ny <= y + Math.Min(10, maxDropTiles); ny++)
                 {
                     if (!BodyFits(nx, ny)) break;
                     if (IsStandable(nx, ny))
@@ -1707,18 +1726,26 @@ namespace NekoTerrariaLink
             }
             // 跳跃（垂直走廊清晰 + 水平偏移，Jump 高度编码）
             bool corridorClear = true;
-            for (int rise = 1; rise <= caps.MaxRise && corridorClear; rise++)
+            for (int rise = 0; rise <= caps.MaxRise && corridorClear; rise++)
             {
                 int ny = y - rise;
                 corridorClear = RowPassable(x, ny - 2);
                 if (!corridorClear) break;
-                for (int dx = -2; dx <= 2; dx++)
+                for (int dx = -caps.MaxGap; dx <= caps.MaxGap; dx++)
                 {
                     int nx = x + dx;
-                    if (nx == x && rise == 1) continue;
+                    if (dx == 0 && rise == 0) continue;
+                    if (rise == 0 && Math.Abs(dx) <= 1) continue;
                     if (!IsStandable(nx, ny)) continue;
-                    if (dx != 0 && !BodyFits(x + Math.Sign(dx), ny)) continue;
-                    result.Add((nx, ny, 2f + 0.8f * rise + 0.4f * Math.Abs(dx), NavAction.Move, rise));
+                    int jump = Math.Max(rise, Math.Abs(dx) > 1 ? 2 : 1);
+                    if (jump > caps.MaxRise) continue;
+                    bool clear = true;
+                    for (int lift = 1; lift <= jump && clear; lift++) clear = BodyFits(x, y - lift);
+                    for (int step = 1; step <= Math.Abs(dx) && clear; step++)
+                        clear = BodyFits(x + Math.Sign(dx) * step, y - jump);
+                    for (int row = y - jump; row <= ny && clear; row++) clear = BodyFits(nx, row);
+                    if (!clear) continue;
+                    result.Add((nx, ny, 2f + 0.8f * rise + 0.4f * Math.Abs(dx), NavAction.Move, jump));
                 }
             }
         }
@@ -1752,52 +1779,78 @@ namespace NekoTerrariaLink
         private bool TryBridge(int px, int py, int dir, int generation)
         {
             int bx = px + dir, by = py + 1;
-            if (IsStandable(bx, by)) return false;
-            bool placed = false;
-            Main.QueueMainThreadAction(() =>
-            {
-                if (generation != Volatile.Read(ref _navigationGeneration)) return;
-                placed = WorldGen.PlaceTile(bx, by, 0, false, false, -1, 0);
-                if (placed) SyncTile(bx, by, 1, 0);   // 联机广播铺路
-            });
-            for (int i = 0; i < 10 && !placed; i++) Thread.Sleep(20);
-            return placed;
+            if (IsStandable(bx, py) || IsSolid(bx, py) || IsPlatform(bx, py) || IsSolid(bx, by) || IsPlatform(bx, by)) return false;
+            var player = Main.LocalPlayer;
+            if (player == null || generation != Volatile.Read(ref _navigationGeneration) || !FindPlaceableBlock(player, out int slot, out int tileType)) return false;
+            var current = player.inventory[slot];
+            if (current == null || current.stack <= 0 || current.createTile != tileType) return false;
+            bool placed = WorldGen.PlaceTile(bx, by, tileType, false, false, -1, 0);
+            var tile = Main.tile[bx, by];
+            if (!placed || tile == null || !tile.HasTile || tile.TileType != tileType) return false;
+            current.stack--;
+            if (current.stack <= 0) current.SetDefaults(0);
+            SyncInventory(player, slot); SyncTile(bx, by, 1, tileType);
+            return true;
         }
 
-        private bool TryStepUp(int px, int py, int generation)
+        private bool TryPlaceNavigationBlock(Player player, int x, int y, int generation)
         {
-            bool placed = false;
-            int ty = py + 1;   // 实际垫土的目标 y
-            Main.QueueMainThreadAction(() =>
-            {
-                if (generation != Volatile.Read(ref _navigationGeneration)) return;
-                if (!IsStandable(px, py + 1))
-                {
-                    placed = WorldGen.PlaceTile(px, py + 1, 0, false, false, -1, 0);
-                    ty = py + 1;
-                }
-                else
-                {
-                    placed = WorldGen.PlaceTile(px, py - 1, 0, false, false, -1, 0);
-                    ty = py - 1;
-                }
-                if (placed) SyncTile(px, ty, 1, 0);   // 联机广播垫土
-            });
-            for (int i = 0; i < 10 && !placed; i++) Thread.Sleep(20);
-            return placed;
+            if (player == null || generation != Volatile.Read(ref _navigationGeneration) || x < 1 || y < 1 || x >= Main.maxTilesX - 1 || y >= Main.maxTilesY - 1 || IsSolid(x, y) || IsPlatform(x, y) || !FindPlaceableBlock(player, out int slot, out int tileType)) return false;
+            var current = player.inventory[slot];
+            if (current == null || current.stack <= 0 || current.createTile != tileType) return false;
+            bool placed = WorldGen.PlaceTile(x, y, tileType, false, false, -1, 0);
+            var tile = Main.tile[x, y];
+            if (!placed || tile == null || !tile.HasTile || tile.TileType != tileType) return false;
+            current.stack--; if (current.stack <= 0) current.SetDefaults(0);
+            SyncInventory(player, slot); SyncTile(x, y, 1, tileType);
+            return true;
         }
 
-        private bool TryHook(int dir, int generation)
+        /// <summary>选择背包中可安全用于脱困的普通实心方块。
+        /// 不使用固定 tile 0：tile 0 不是玩家实际持有的方块，也不会扣库存。</summary>
+        private static bool FindPlaceableBlock(Player player, out int slot, out int tileType)
         {
-            if (generation != Volatile.Read(ref _navigationGeneration)) return false;
-            Main.QueueMainThreadAction(() =>
+            slot = -1;
+            tileType = -1;
+            if (player == null || player.inventory == null) return false;
+            for (int i = 0; i < player.inventory.Length; i++)
             {
-                if (generation != Volatile.Read(ref _navigationGeneration)) return;
-                var player = Main.LocalPlayer;
-                if (player == null || !HasHook(player)) return;
-                var ctrl = player.GetModPlayer<NekoControlPlayer>();
-                if (ctrl != null) ctrl.hookTicks = 24;
-            });
+                var item = player.inventory[i];
+                if (item == null || item.type <= 0 || item.stack <= 0 || item.createTile <= 0) continue;
+                int type = item.createTile;
+                if (type >= Main.tileSolid.Length || !Main.tileSolid[type] || Main.tileSolidTop[type]) continue;
+                // 家具/箱子等 frame-important 物品不能作为稳定脱困方块，
+                // 避免在坑里意外放置箱子、工作台或其他多格物体。
+                if (type < Main.tileFrameImportant.Length && Main.tileFrameImportant[type]) continue;
+                slot = i;
+                tileType = type;
+                return true;
+            }
+            return false;
+        }
+
+        private bool TryStepUp(Player player, int px, int py, int tx, int targetY, int generation)
+        {
+            int dir = Math.Sign(tx - px);
+            if (dir == 0) return false;
+            int bx = px + dir, ty = py;
+            if (player == null || generation != Volatile.Read(ref _navigationGeneration) || !FindPlaceableBlock(player, out int slot, out int tileType) || IsSolid(bx, ty) || IsPlatform(bx, ty)) return false;
+            var current = player.inventory[slot];
+            if (current == null || current.stack <= 0 || current.createTile != tileType) return false;
+            bool placed = WorldGen.PlaceTile(bx, ty, tileType, false, false, -1, 0);
+            var tile = Main.tile[bx, ty];
+            if (!placed || tile == null || !tile.HasTile || tile.TileType != tileType) return false;
+            current.stack--; if (current.stack <= 0) current.SetDefaults(0);
+            SyncInventory(player, slot); SyncTile(bx, ty, 1, tileType);
+            return true;
+        }
+
+        private bool TryHook(Player player, int tx, int targetY, int generation)
+        {
+            if (player == null || generation != Volatile.Read(ref _navigationGeneration) || !HasHook(player)) return false;
+            var ctrl = player.GetModPlayer<NekoControlPlayer>();
+            if (ctrl == null) return false;
+            ctrl.digTargetX = tx; ctrl.digTargetY = targetY; ctrl.hookTicks = 24;
             return true;
         }
 
@@ -1920,6 +1973,7 @@ namespace NekoTerrariaLink
             var item = new Item();
             item.SetDefaults(id);
             if (item.type <= 0 || item.IsAir) return false;
+            item.stack = stack;
             int capacity = 0;
             for (int i = 0; i < player.inventory.Length; i++)
             {
@@ -1937,17 +1991,21 @@ namespace NekoTerrariaLink
             var before = new Item[player.inventory.Length];
             for (int i = 0; i < player.inventory.Length; i++)
                 before[i] = player.inventory[i]?.Clone() ?? new Item();
-            var remainder = player.GetItem(
-                player.whoAmI, item,
-                GetItemSettings.InventoryEntityToPlayerInventorySettings);
-            bool accepted = remainder == null || remainder.IsAir || remainder.stack <= 0;
+            bool accepted = false;
+            try
+            {
+                var remainder = player.GetItem(
+                    player.whoAmI, item,
+                    GetItemSettings.InventoryEntityToPlayerInventorySettings);
+                accepted = remainder == null || remainder.IsAir || remainder.stack <= 0;
+            }
+            catch { }
             if (!accepted)
             {
                 for (int i = 0; i < player.inventory.Length; i++)
                     player.inventory[i] = before[i];
-                if (Main.netMode == NetmodeID.MultiplayerClient)
-                    NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
             }
+            SyncInventory(player);
             return accepted;
         }
 
@@ -2034,7 +2092,7 @@ namespace NekoTerrariaLink
             if (player.inventory[slot].stack <= 0)
                 player.inventory[slot].SetDefaults(0);
             if (Main.netMode == NetmodeID.MultiplayerClient)
-                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                SyncInventory(player);
             return true;
         }
 
@@ -2269,7 +2327,7 @@ namespace NekoTerrariaLink
                     {
                         if (src.stack <= 0) src.SetDefaults(0);
                         if (Main.netMode == NetmodeID.MultiplayerClient)
-                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                            SyncInventory(player);
                         return true;
                     }
                 }
@@ -2284,7 +2342,7 @@ namespace NekoTerrariaLink
                     chest.item[i] = beforeChest[i];
                 if (Main.netMode == NetmodeID.MultiplayerClient)
                 {
-                    NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                    SyncInventory(player);
                     for (int i = 0; i < chest.item.Length; i++) SyncChest(idx, i);
                 }
                 return false;
@@ -2338,7 +2396,7 @@ namespace NekoTerrariaLink
                         chest.item[i] = beforeChest[i];
                     if (Main.netMode == NetmodeID.MultiplayerClient)
                     {
-                        NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                        SyncInventory(player);
                         for (int i = 0; i < chest.item.Length; i++) SyncChest(idx, i);
                     }
                 }
@@ -2364,7 +2422,7 @@ namespace NekoTerrariaLink
                     if (remaining == 0)
                     {
                         if (Main.netMode == NetmodeID.MultiplayerClient)
-                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                            SyncInventory(player);
                         return true;
                     }
                 }
@@ -3028,6 +3086,9 @@ namespace NekoTerrariaLink
                     ["tileX"] = (int)(p.Center.X / 16), ["tileY"] = (int)(p.Center.Y / 16),
                     ["velocityX"] = p.velocity.X, ["velocityY"] = p.velocity.Y,
                     ["grounded"] = p.velocity.Y == 0, ["selectedItem"] = p.selectedItem,
+                    ["in_water"] = p.wet && !p.lavaWet && !p.honeyWet,
+                    ["in_lava"] = p.lavaWet, ["in_honey"] = p.honeyWet,
+                    ["breath"] = p.breath,
                     ["alive"] = p.statLife > 0, ["active"] = p.active,
                     ["biome"] = BiomeName(p), ["buffs"] = buffs,
                     ["movement_state"] = MovementState(p),

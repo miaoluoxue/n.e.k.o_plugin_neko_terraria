@@ -263,13 +263,16 @@ class GameEventEmitter:
     def _check_danger_events(self, cur: Dict, prev: Dict, now: float) -> None:
         cur_hp = cur.get("hp", 100)
         max_hp = cur.get("max_life", 100) or 100
-        # #11: mod get_state 不返回 in_water/in_lava/breath/on_ground/fall_speed——
-        # 用真实键推导：grounded / velocity_y / movement_state / buffs。
-        # 浸水：movement_state 含 swim / 或 buff 含"潮湿/溺水"（原版无，退化为 false）
-        is_in_water = "swim" in str(cur.get("movement_state", "") or "").lower()
-        is_in_lava = any("lava" in str(b).lower() or "岩浆" in str(b)
-                         for b in (cur.get("buffs", []) or []))
-        breath = 200  # mod 不上报呼吸值，溺水检测退化（保留变量避免下游判断崩）
+        # Mod 直接推送液体与呼吸状态；兼容旧 Mod 时再退化到 movement/buff 推导。
+        movement = str(cur.get("movement_state", "") or "").lower()
+        is_in_water = bool(cur.get("in_water", False)) or "swim" in movement
+        is_in_lava = bool(cur.get("in_lava", False)) or any(
+            "lava" in str(b).lower() or "岩浆" in str(b)
+            for b in (cur.get("buffs", []) or []))
+        try:
+            breath = int(cur.get("breath", 200) or 0)
+        except (TypeError, ValueError):
+            breath = 200
         on_ground = bool(cur.get("grounded", True))
         # 坠落：非地面且向下速度大（velocity_y>0 向下，像素/秒，>10*16≈160 算坠落）
         vel_y = float(cur.get("velocity_y", 0) or 0)
