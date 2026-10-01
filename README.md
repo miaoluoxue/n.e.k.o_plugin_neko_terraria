@@ -71,6 +71,8 @@ N.E.K.O 插件 ── 前端 UI（2s 轮询 get_dashboard_state）
 
 ## 🚀 快速开始
 
+发布内容、源码使用方式与验证范围见[发布说明](docs/release-notes.md)。
+
 **前置条件**
 
 | 组件 | 说明 |
