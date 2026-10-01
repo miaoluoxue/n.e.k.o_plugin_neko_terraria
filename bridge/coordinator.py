@@ -456,6 +456,7 @@ class TaskCoordinator:
             "explore": ("explore", "探索"),
             "combat":  ("combat", "战斗"),
             "give":    ("give",   "给物"),
+            "resupply": ("resupply", "整理背包"),
         }
         mapped = kind_map.get(kind)
         if mapped is None:

@@ -177,6 +177,24 @@ class TaskChain:
         if goal.goal_type == "explore":
             return await self._explore(goal)
 
+        # resupply：回基地存箱，动作和结果都由 BaseManager 实际核验。
+        if goal.goal_type == "resupply":
+            base = getattr(self.agent, "base", None)
+            if base is None:
+                goal.report_fail = "基地存储系统不可用，未执行回家整理"
+                return False
+            ok = await base.handle_inventory_full(
+                goal.reason or "主人要求回基地整理背包", return_to_owner=True)
+            report = getattr(base, "last_full_result", {})
+            if report.get("stored", 0) and report.get("returned_to_owner"):
+                goal.evidence = "已确认物品存入基地箱并返回主人附近"
+            elif report.get("stored", 0):
+                goal.evidence = "已确认物品存入基地箱，但未确认返回主人附近"
+            else:
+                goal.evidence = "未确认存箱成功，不能报告整理完成"
+            goal.report_fail = goal.evidence
+            return bool(ok and report.get("stored", 0))
+
         # give：给玩家物品
         if goal.goal_type == "give":
             iid = self.agent.resolve_item(goal.target) if self.agent else -1
@@ -252,6 +270,15 @@ class TaskChain:
                     if goal.actual < goal.amount:
                         goal.report_fail = f"只砍到 {goal.actual} 个木材（要 {goal.amount} 个）"
                         return False
+                    base = getattr(self.agent, "base", None)
+                    if base is not None and base.inventory_nearly_full():
+                        # 砍树结果已经核验后再整理，避免把木材存箱导致本步骤
+                        # 的实际产量统计被清零。
+                        if not await base.handle_inventory_full("砍树后背包空间不足"):
+                            goal.report_fail = (
+                                f"已确认砍到 {goal.actual} 个{goal.target}，"
+                                "但背包整理或返回主人未完成")
+                            return False
                     return True
                 return False
             except Exception:

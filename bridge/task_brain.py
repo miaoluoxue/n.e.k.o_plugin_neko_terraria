@@ -236,6 +236,11 @@ class TaskBrain:
                                     deliver_to_player=True, reason=goal_text,
                                     report_fail=f"没能把 {item} 给你"))
                 p.outline.append(f"给主人{item}x{amt}")
+            elif action == "resupply":
+                p.goals.append(Goal(goal_type="resupply", target=item or "基地", amount=1,
+                                    reason=goal_text or "回基地整理背包",
+                                    report_fail="回基地整理背包失败，未确认物品已存入箱子"))
+                p.outline.append("回基地整理背包")
             elif action == "follow":
                 p.goals.append(Goal(goal_type="follow", target="", reason=goal_text))
                 p.outline.append("启动长期跟随（不代表已到达）")

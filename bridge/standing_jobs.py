@@ -262,6 +262,10 @@ class StandingJobs:
                 await self._notify_step("mine",
                     f"挖到{got}个{ore}，共{task.progress}个",
                     ore=ore, got=int(got), total=task.progress)
+                if mining.last_resupply_ok is False:
+                    task.status = LT_BLOCKED
+                    task.beat("背包整理或返回主人未完成，暂停采矿等待主人处理")
+                    return
             else:
                 empty_streak += 1
                 task.beat(f"这附近没{ore}了")
@@ -313,6 +317,15 @@ class StandingJobs:
                 await self._notify_step("chop",
                     f"砍到{got}个{wood}，共{task.progress}个",
                     ore=wood, got=int(got), total=task.progress)
+                base = getattr(self.agent, "base", None)
+                if base is not None and base.inventory_nearly_full():
+                    handled = await base.handle_inventory_full("长期砍树后背包空间不足")
+                    if lt.should_stop(task.kind):
+                        return
+                    if not handled:
+                        task.status = LT_BLOCKED
+                        task.beat("背包整理或返回主人未完成，暂停砍树等待主人处理")
+                        return
             else:
                 empty_streak += 1
                 reason = life.last_failure or f"砍树后没有确认到新增{wood}"

@@ -12,6 +12,7 @@ class MiningEngine:
         self.mod = mod
         self.agent = agent
         self._cancel = asyncio.Event()
+        self.last_resupply_ok: Optional[bool] = None
 
     def _stopped(self) -> bool:
         if self._cancel.is_set():
@@ -36,6 +37,7 @@ class MiningEngine:
         """
         if self.agent is None:
             return -1, 0
+        self.last_resupply_ok = None
         iid = item_id(target_item, getattr(self.agent, "registry", None))
         if iid <= 0:
             return iid, 0
@@ -75,11 +77,32 @@ class MiningEngine:
                     await self._notify_mining(target_item, got)
                 except Exception:
                     pass
+                # 采集后的真实背包可能已经没有空位。回基地存箱是采集流程
+                # 的一部分，不能等到下一轮空闲心跳才处理，否则会继续挖掘失败。
+                handled = await self._maybe_resupply()
+                if handled is False:
+                    break
             else:
                 no_gain += 1
                 if no_gain >= 3:
                     break  # 连续挖不到：换下一个矿或直接返回
         return iid, mined
+
+    async def _maybe_resupply(self) -> Optional[bool]:
+        base = getattr(self.agent, "base", None)
+        if base is None:
+            return None
+        try:
+            if base.inventory_nearly_full():
+                self.last_resupply_ok = await base.handle_inventory_full(
+                    "挖矿后背包空间不足")
+                return self.last_resupply_ok
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.agent.log(f"挖矿后整理背包失败: {exc}", "warn")
+        return False
 
     async def _find_target(self, state: Optional[Dict[str, Any]],
                            iid: int, target_item: str = "") -> Optional[Dict[str, Any]]:

@@ -2006,6 +2006,7 @@ namespace NekoTerrariaLink
                 ["req_id"] = reqId, ["type"] = "inventory",
                 ["hotbar"] = hotbar, ["equipped"] = equipped, ["inventory"] = inv,
                 ["selected_slot"] = player.selectedItem,
+                ["slot_count"] = player.inventory.Length,
             });
         }
 

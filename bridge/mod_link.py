@@ -89,15 +89,42 @@ class ModLink:
         return None
 
     async def get_inventory(self) -> Dict[str, Any]:
-        # 返回三大类：hotbar(手持栏) / equipped(装备栏) / inventory(主背包)
+        # 返回三大类：hotbar(手持栏) / equipped(装备栏) / inventory(主背包)。
+        # 兼容旧版 LumiBridge 的 {items: [...]} 回执；旧版只返回一张
+        # 50 格背包表，不能因为没有拆分字段而把背包误判为空。
         resp = await self.conn.request_mod({"cmd": "get_inventory"})
         if not resp or resp.get("error") or resp.get("type") != "inventory":
             raise ConnectionError("背包状态暂时不可用，不能据此判断缺少工具或物品")
+        items = resp.get("items")
+        if isinstance(items, list) and not any(
+                key in resp for key in ("hotbar", "inventory", "equipped")):
+            hotbar, inventory = [], []
+            for raw in items:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                slot = item.get("inv_slot", item.get("slot"))
+                if slot is None:
+                    continue
+                try:
+                    slot = int(slot)
+                except (TypeError, ValueError):
+                    continue
+                item["inv_slot"] = slot
+                (hotbar if 0 <= slot < 10 else inventory).append(item)
+            return {
+                "hotbar": hotbar,
+                "equipped": [],
+                "inventory": inventory,
+                "selected_slot": int(resp.get("selected_slot", 0) or 0),
+                "slot_count": int(resp.get("slot_count", 50) or 50),
+            }
         return {
             "hotbar": resp.get("hotbar", []),
             "equipped": resp.get("equipped", []),
             "inventory": resp.get("inventory", []),
             "selected_slot": resp.get("selected_slot", 0),
+            "slot_count": int(resp.get("slot_count", 50) or 50),
         }
 
     async def enum_chests(self) -> List[Dict[str, Any]]:

@@ -89,8 +89,7 @@ class UndergroundExplorer:
             base = getattr(self.agent, "base", None)
             if base and base.inventory_nearly_full():
                 self.agent.log("背包满了，回家存一下~", "base")
-                await base.go_home()
-                await base.store_surplus()
+                await base.handle_inventory_full("地下探索后背包空间不足")
                 break
 
             # 本 chunk 已探索 → 换个方向

@@ -171,6 +171,15 @@ def parse(text: str) -> Intent:
                       reason=f"去{target}探索",
                       steps=[{"action": "explore", "item": target, "amount": 1}])
 
+    # 5.5) 回家整理：明确的生活指令不能被当成闲聊或普通移动。
+    # 真实存储由 BaseManager 核验回家、箱子和背包结果。
+    if any(w in low for w in ("背包满", "回家放箱", "回家存箱", "回家存东西",
+                              "回去放东西", "回去存", "回去整理", "存箱",
+                              "整理背包", "回基地")):
+        return Intent(mode="finite", kind="resupply", target="基地", amount=1, raw=t,
+                      reason="回基地整理背包",
+                      steps=[{"action": "resupply", "item": "基地", "amount": 1}])
+
     # 6) 钓鱼：有限行为（钓几条 / 去钓鱼 / 甩一竿）
     #    裸"钓"也算（"钓10条鱼"），但排除"钓竿/钓具"等名词语境
     FISH_WORDS = ("钓鱼", "钓点", "钓些", "钓几", "甩一竿", "去钓")

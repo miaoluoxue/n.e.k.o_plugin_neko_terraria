@@ -298,6 +298,11 @@ class WorldModel:
                 else:
                     vi.take(item, amt)
 
+            elif action == "resupply":
+                # 整理背包不改变可用物品，只改变位置；真实存箱结果由
+                # BaseManager 在执行阶段核验。
+                st.note = "回基地整理背包（执行时核验箱子回执）"
+
             elif action in ("climb", "goto"):
                 tx, ty = int(s.get("x", 0) or 0), int(s.get("y", 0) or 0)
                 try:
@@ -322,7 +327,7 @@ class WorldModel:
         table = {"mine": "挖", "gather": "挖", "craft": "合成",
                  "fetch": "取", "give": "给主人", "climb": "爬到",
                  "goto": "走到", "follow": "回到主人身边",
-                 "chop": "砍", "fish": "钓"}
+                 "chop": "砍", "fish": "钓", "resupply": "回基地整理背包"}
         head = table.get(action, action)
         if action in ("climb", "goto", "follow"):
             return head
