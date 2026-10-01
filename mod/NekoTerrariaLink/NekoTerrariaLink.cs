@@ -2020,14 +2020,21 @@ namespace NekoTerrariaLink
             if (item == null || item.type <= 0 || item.stack < stack) return false;
             var drop = item.Clone();
             drop.stack = stack;
-            // 只有实际生成掉落物后才扣源槽；否则会出现“丢弃失败但物品被扣除”。
-            player.TryDroppingSingleItem(Src, drop);
-            // tModLoader consumes the clone (TurnToAir) only after a world item
-            // is successfully created. Keep the source stack when it fails.
-            if (!drop.IsAir) return false;
+            // TryDroppingSingleItem 没有成功返回值，且即使物品槽已满也会把
+            // clone 清空。直接创建并检查真实世界掉落槽，确认成功后才扣源槽。
+            int itemIndex = Item.NewItem(
+                Src, (int)player.position.X, (int)player.position.Y,
+                player.width, player.height, drop);
+            if (itemIndex < 0 || itemIndex >= Main.maxItems
+                    || Main.item[itemIndex] == null || !Main.item[itemIndex].active)
+                return false;
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                NetMessage.SendData(MessageID.SyncItem, -1, -1, null, itemIndex);
             player.inventory[slot].stack -= stack;
             if (player.inventory[slot].stack <= 0)
                 player.inventory[slot].SetDefaults(0);
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
             return true;
         }
 
@@ -2269,6 +2276,26 @@ namespace NekoTerrariaLink
                 var chest = Main.chest[idx];
                 if (chest == null || chest.item.Where(it => it != null && it.type == id).Sum(it => it.stack) < stack)
                     return false;
+                // 先确认背包能完整接收，避免 GetItem 部分接收后再回滚箱子。
+                var capacityProbe = new Item();
+                capacityProbe.SetDefaults(id);
+                int capacity = 0;
+                for (int i = 0; i < player.inventory.Length; i++)
+                {
+                    var existing = player.inventory[i];
+                    if (existing == null || existing.type == 0)
+                        capacity += capacityProbe.maxStack;
+                    else if (existing.type == id && existing.stack < existing.maxStack)
+                        capacity += existing.maxStack - existing.stack;
+                    if (capacity >= stack) break;
+                }
+                if (capacity < stack) return false;
+
+                // GetItem 可能因为模组堆叠规则返回剩余物；保存玩家快照，
+                // 只有全部物品进入背包后才提交箱子扣减。
+                var before = new Item[player.inventory.Length];
+                for (int i = 0; i < player.inventory.Length; i++)
+                    before[i] = player.inventory[i]?.Clone() ?? new Item();
                 int remaining = stack;
                 for (int k = 0; k < chest.item.Length; k++)
                 {
@@ -2276,15 +2303,30 @@ namespace NekoTerrariaLink
                     if (it == null || it.type != id || it.stack <= 0) continue;
                     int take = Math.Min(remaining, it.stack);
                     var got = it.Clone(); got.stack = take;
-                    int dropIndex = player.QuickSpawnItem(Src, got, take);
-                    if (dropIndex < 0 || dropIndex >= Main.maxItems || !Main.item[dropIndex].active)
+                    var remainder = player.GetItem(
+                        player.whoAmI, got,
+                        GetItemSettings.InventoryEntityToPlayerInventorySettings);
+                    if (remainder != null && !remainder.IsAir && remainder.stack > 0)
+                    {
+                        for (int i = 0; i < player.inventory.Length; i++)
+                            player.inventory[i] = before[i];
+                        if (Main.netMode == NetmodeID.MultiplayerClient)
+                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
                         return false;
+                    }
                     it.stack -= take;
                     remaining -= take;
                     if (it.stack <= 0) it.SetDefaults(0);
                     SyncChest(idx, k);
-                    if (remaining == 0) return true;
+                    if (remaining == 0)
+                    {
+                        if (Main.netMode == NetmodeID.MultiplayerClient)
+                            NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+                        return true;
+                    }
                 }
+                for (int i = 0; i < player.inventory.Length; i++)
+                    player.inventory[i] = before[i];
                 return false;
             }
             finally { player.chest = -1; }
