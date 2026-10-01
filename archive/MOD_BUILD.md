@@ -36,7 +36,7 @@
 | **游戏内** | tModLoader 主菜单 → 模组 → 开发 → 构建 NekoTerrariaLink |
 | **命令行** | `dotnet tModLoader.dll -build ModSources/NekoTerrariaLink` |
 
-> ⚠️ 插件 v3.0 推送式架构依赖新版 Mod 命令/事件，**每次改 C# 后必须重新编译**。
+> ⚠️ 插件依赖 Mod 提供的命令和事件，**每次改 C# 后必须重新编译**。
 
 ---
 
