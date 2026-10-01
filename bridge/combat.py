@@ -155,7 +155,18 @@ class CombatEngine:
                 # The Mod exports living NPCs only. Damage followed by
                 # disappearance is ambiguous because the NPC may have walked
                 # beyond the state radius; require its authoritative kill event.
-                confirmed = self._consume_kill_confirmation(target)
+                # The state push and npc_killed event travel through separate
+                # callbacks, so the event can arrive a few frames after the
+                # disappearance snapshot. Give the event loop a short window
+                # to deliver it instead of reporting a false failed fight.
+                confirmed = False
+                for _ in range(5):
+                    confirmed = self._consume_kill_confirmation(target)
+                    if confirmed:
+                        break
+                    if check_task is not None and check_task():
+                        return False
+                    await asyncio.sleep(0.1)
                 if confirmed:
                     try:
                         await self.mod.collect_items(radius=400)
