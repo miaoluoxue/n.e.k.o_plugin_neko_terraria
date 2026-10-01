@@ -224,8 +224,22 @@ class TerrariaAgent:
     def _spawn_background_task(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._background_task_done)
         return task
+
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        """回收后台任务并记录未处理异常，避免行为循环静默死亡。"""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception as exc:
+            self.log(f"读取后台任务结果失败: {exc}", "warn")
+            return
+        if error is not None:
+            self.log(f"后台任务异常: {type(error).__name__}: {error}", "error")
+            self.logger.error("后台任务异常", exc_info=error)
 
     async def _ensure_mod_connected(self) -> bool:
         """确保已连接到 AI Mod 的 TCP 端口，未连接则尝试重连。"""
@@ -802,8 +816,10 @@ class TerrariaAgent:
         self.suppress_autonomy()
         self.coordinator.cancel_pending_commands()
         await self.cancel_autonomous_actions()
-        fg = await self.executor.cancel_current(why)
+        # 先摘除长期任务，再取消前台；否则 executor 的 finally 可能先
+        # release_yield，让长期 worker 在主人喊停和 stop_all 之间抢跑一轮。
         names = await self.longterm.stop_all(why)
+        fg = await self.executor.cancel_current(why)
         self.inquiry.cancel_all()
         await self.mod.stop_actions()
         return {"ok": True, "foreground_cancelled": fg, "longterm_stopped": names}
@@ -824,9 +840,27 @@ class TerrariaAgent:
             self._suppressed_actions.discard(self._action_kind(kind))
 
     def autonomy_allowed(self, kind: str = "") -> bool:
-        return (self._running and self.conn.is_mod_connected()
-                and not self._is_dead and time.monotonic() >= self._autonomy_paused_until
-                and self._action_kind(kind) not in self._suppressed_actions)
+        if (not self._running or not self.conn.is_mod_connected()
+                or self._is_dead
+                or time.monotonic() < self._autonomy_paused_until
+                or self._action_kind(kind) in self._suppressed_actions):
+            return False
+        # 所有自主入口共用这道闸门：前台任务、长期任务和另一个自主动作
+        # 已经占用输入时，不再让 idle/处境层并行改选中物品或发导航。
+        if self._in_combat:
+            return False
+        ex = getattr(self, "executor", None)
+        if ex and ex.busy():
+            return False
+        brain = getattr(self.plugin, "_autonomous_brain", None)
+        if brain and getattr(brain, "_busy", False):
+            return False
+        lt = getattr(self, "longterm", None)
+        # 守卫是长期采集/跟随遇敌时唯一允许的高优先级自主动作；
+        # 其他自主行为必须等待长期任务让出控制权。
+        if lt and lt.busy_kinds() and kind not in ("guard", "combat"):
+            return False
+        return True
 
     async def cancel_autonomous_actions(self, kind: str = "") -> None:
         idle = getattr(self, "_idle_task", None)

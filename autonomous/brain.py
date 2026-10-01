@@ -832,9 +832,14 @@ class AutonomousBrain:
         except Exception:
             pass
 
-        if self.interaction:
+        # 只有真正开始过、且不是主人明确停止/接管的任务才进入恢复栈。
+        # busy 拒绝的指令从未执行；显式停止也不应在空闲时被重新询问。
+        busy_refused = reason.startswith("busy:")
+        owner_stop = any(k in reason for k in ("主人", "喊停", "接管", "cancelled", "cancel"))
+        if self.interaction and not busy_refused and not owner_stop:
             self.interaction.remember_interrupted_task(name)
-            desc = f"「{name}」被中断了（{reason}）"
+        desc = f"「{name}」被中断了（{reason}）"
+        if self.interaction:
             await self.interaction.inject_event("task_interrupted", intensity=0.6, description=desc, data=data)
 
     async def _on_executor_step(self, data: Dict) -> None:

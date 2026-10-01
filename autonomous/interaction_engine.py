@@ -1024,9 +1024,17 @@ class InteractionEngine:
     def remember_interrupted_task(self, task_name: str,
                                    snapshot: Optional[dict] = None) -> None:
         """记录被中断的任务，用于后续恢复询问。"""
+        now = time.time()
+        # executor 的取消通知和 brain 的中断通知可能在同一轮到达，
+        # 同名任务只保留一条，避免恢复询问重复弹出。
+        if self._interrupted_stack:
+            last = self._interrupted_stack[-1]
+            if (last.get("task_name") == task_name
+                    and now - last.get("interrupted_at", 0.0) < 10.0):
+                return
         self._interrupted_stack.append({
             "task_name": task_name,
-            "interrupted_at": time.time(),
+            "interrupted_at": now,
             "snapshot": snapshot or {},
         })
         # 只保留最近 5 条：恢复询问按 LIFO 弹最新一条，老的中断没必要一直占内存

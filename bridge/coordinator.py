@@ -72,6 +72,14 @@ class TaskCoordinator:
         # 停止是控制指令，不能被待决询问吞掉，也不能等 LLM 才停。
         from .intent import parse
         immediate = parse(text)
+        if source == SRC_OWNER:
+            # 主人已经开始新的对话/指令时，旧任务的恢复提示已经过期；
+            # 否则几秒后交互引擎还会询问是否继续一个主人刚刚替换掉的任务。
+            interaction = getattr(
+                getattr(self.agent, "plugin", None), "_autonomous_brain", None)
+            interaction = getattr(interaction, "interaction", None)
+            if interaction:
+                interaction.clear_memory()
         if source == SRC_OWNER and immediate.mode == "stop":
             self.cancel_pending_commands()
             inquiry = getattr(self.agent, "inquiry", None)
@@ -302,12 +310,12 @@ class TaskCoordinator:
                 t = self.lt.get("chop")
             stopped = []
             cur = self.executor.current()
-            if cur and self._stop_matches(stop_kind, it, cur):
-                if await self.agent.interrupt_current("主人喊停"):
-                    stopped.append(cur["name"])
             if t is not None:
                 if await self.lt.stop(t.kind, "主人喊停"):
                     stopped.append(t.name)
+            if cur and self._stop_matches(stop_kind, it, cur):
+                if await self.agent.interrupt_current("主人喊停"):
+                    stopped.append(cur["name"])
             await self.agent.mod.stop_actions()
             return {"ok": True, "status": "stopped",
                     "output": "已停止：" + "、".join(stopped) if stopped else "当前没有对应的运行任务。"}
