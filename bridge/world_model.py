@@ -244,6 +244,21 @@ class WorldModel:
                     st.produces = item
 
             elif action == "gather":
+                # 木材需要砍树才能稳定获得；把它按 chop 评估，避免规划阶段
+                # 把“收集木材”误判为只需捡附近掉落物，执行时才发现没有斧头。
+                from .item_npc_dict import item_id
+                if item_id(item, getattr(self.agent, "registry", None)) == 9:
+                    if not vi.has_axe:
+                        st.ok = False
+                        st.gap = "没有斧头，收集木材需要先砍树"
+                        st.need_item = "斧"
+                        st.need_amount = 1
+                    else:
+                        st.produces = item or "木材"
+                        vi.add(st.produces, amt)
+                        st.note = "会找树、砍倒并拾取木材"
+                    res.steps.append(st)
+                    continue
                 # Pickup availability is a property of the live world and is
                 # confirmed by TaskChain after collect_items.  Do not invent
                 # items during planning, otherwise a gather→craft chain could

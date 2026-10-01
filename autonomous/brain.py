@@ -442,7 +442,10 @@ class AutonomousBrain:
                 else:
                     await self.agent.send_chat("血量低，先躲一下")
         elif drive == "gather":
-            await self._auto_task("自主储备材料", [{"action": "gather", "item": "wood", "amount": 15}])
+            # “收集木材”需要先找到并砍树；仅调用 gather 只会捡脚边掉落物，
+            # 经常得到 0 个却消耗一次自主行动。把木材储备映射到真实砍树
+            # 执行器，仍由任务链按背包增量核验结果。
+            await self._auto_task("自主储备材料", [{"action": "chop", "item": "wood", "amount": 15}])
         elif drive == "explore" and self.state.boredom > 0.55:
             # v3.0 巡逻兜底（按巡逻兜底）：主人 30 格内陪伴优先不巡逻
             near_owner = False
@@ -565,7 +568,7 @@ class AutonomousBrain:
         if self.occupied() or not self._autonomy_allowed("chop"):
             return
         if self.state.boredom > 0.9:
-            await self._auto_task("无聊储备", [{"action": "gather", "item": "wood", "amount": 20}])
+            await self._auto_task("无聊储备", [{"action": "chop", "item": "wood", "amount": 20}])
 
     # ── 复活后自动寻路找主人（按生存循环惯例 死亡复活重置目标） ──
 

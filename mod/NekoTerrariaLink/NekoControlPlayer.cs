@@ -40,7 +40,10 @@ namespace NekoTerrariaLink
             useSlot = digTargetX = digTargetY = -1;
             Player.controlLeft = Player.controlRight = Player.controlJump = false;
             Player.controlDown = Player.controlUseItem = Player.controlHook = false;
-            ResetLiquidEscape(suppress: true);
+            // Releasing a task must not disable drowning protection.  The
+            // liquid controller is a safety behavior and will relinquish
+            // control automatically once the player reaches dry ground.
+            ResetLiquidEscape(suppress: false);
         }
 
         // Navigation state is changed by the game-thread command queue only.

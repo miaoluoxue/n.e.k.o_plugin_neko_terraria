@@ -201,11 +201,19 @@ class TaskBrain:
                                     report_fail="钓鱼没成功，主人"))
                 p.outline.append(f"钓鱼x{amt}")
             elif action == "gather":
-                # 纯收集掉落物：goal_type 用 "gather"（task_chain 的 gather 分支）
-                p.goals.append(Goal(goal_type="gather", target=item, amount=amt,
-                                    reason=goal_text,
-                                    report_fail=f"收集 {item} 没成功，主人"))
-                p.outline.append(f"收集{item}x{amt}")
+                # 木材不是稳定的地面掉落物；“收集木材”应进入真实砍树
+                # 闭环（找树、选斧、挥砍、拾取并按背包净增核验）。
+                # 其他物品仍保持 gather 的纯拾取语义。
+                if item in ("木材", "木", "木头", "树", "wood", "wooden"):
+                    p.goals.append(Goal(goal_type="chop", target="木材", amount=amt,
+                                        reason=goal_text,
+                                        report_fail="收集木材没成功，主人"))
+                    p.outline.append(f"砍木材x{amt}")
+                else:
+                    p.goals.append(Goal(goal_type="gather", target=item, amount=amt,
+                                        reason=goal_text,
+                                        report_fail=f"收集 {item} 没成功，主人"))
+                    p.outline.append(f"收集{item}x{amt}")
             elif action == "craft":
                 # 合成：goal_type 用 "craft" + craft_first，走 task_chain 合成流程（mod.craft）
                 p.goals.append(Goal(goal_type="craft", target=item, amount=amt,

@@ -206,9 +206,11 @@ class ModLink:
                 return int(slot) if slot is not None else -1
         return -1
 
-    async def navigate_to(self, x: int, y: int, timeout: int = 15) -> bool:
+    async def navigate_to(self, x: int, y: int, timeout: int = 15,
+                          allow_build: bool = False) -> bool:
         # 普通导航和流式导航共用可取消的请求管理，爬升也能被 stop_actions 停止。
-        return await self.navigate_async(x, y, timeout=timeout)
+        return await self.navigate_async(x, y, timeout=timeout,
+                                         allow_build=allow_build)
 
     # ── v3.0: 流式导航──
     # C# 侧 BFS 寻路 + 逐点执行，通过 nav_* 事件流回传状态
@@ -238,12 +240,13 @@ class ModLink:
         return task
 
     async def navigate_async(self, x: int, y: int, timeout: int = 20,
-                             on_tick=None) -> bool:
+                             on_tick=None, allow_build: bool = False) -> bool:
         """等待对应 req_id 的最终导航结果，同时每半秒执行环境感知回调。"""
         import asyncio
 
         request = self._track_navigation(asyncio.create_task(self.conn.request_mod(
-            {"cmd": "navigate_stream", "x": x, "y": y, "timeout": timeout},
+            {"cmd": "navigate_stream", "x": x, "y": y,
+             "timeout": timeout, "allow_build": bool(allow_build)},
             timeout=timeout + 5)))
         try:
             while True:
@@ -298,7 +301,8 @@ class ModLink:
         async def _fire():
             try:
                 resp = await self.conn.request_mod(
-                    {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
+                    {"cmd": "navigate_stream", "x": x, "y": y,
+                     "timeout": 20, "allow_build": False},
                     timeout=25.0)
                 return bool(resp and resp.get("ok"))
             except Exception:

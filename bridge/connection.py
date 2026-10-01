@@ -1,6 +1,7 @@
 """tModLoader Mod 接口单通道管理（9877 JSON-over-TCP）。游戏窗口由 launcher.py 启动，登录/心跳由游戏原生处理"""
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Callable, Dict, Optional
@@ -252,9 +253,22 @@ class Connection:
 
     def _dispatch_event(self, msg: dict) -> None:
         """将事件消息派发给所有注册的回调。"""
+        loop = asyncio.get_running_loop()
         for cb in self._event_callbacks:
             try:
-                cb(msg)
+                # Never execute user/plugin event handlers inline in the TCP
+                # reader.  A callback may refresh state, invoke the event bus,
+                # or trigger an LLM task; doing that on the reader stalls all
+                # pending command responses and makes navigation/stop appear
+                # blocked while a large event is being processed.
+                def _invoke(callback=cb):
+                    try:
+                        result = callback(msg)
+                        if inspect.isawaitable(result):
+                            asyncio.create_task(result)
+                    except Exception:
+                        pass
+                loop.call_soon(_invoke)
             except Exception:
                 pass  # 回调异常不阻塞主流程
 

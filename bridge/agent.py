@@ -873,13 +873,17 @@ class TerrariaAgent:
             return False
         # 所有自主入口共用这道闸门：前台任务、长期任务和另一个自主动作
         # 已经占用输入时，不再让 idle/处境层并行改选中物品或发导航。
+        #
+        # AutonomousBrain calls this check from inside its own action task.
+        # Do not inspect brain._busy here: _run_action() sets that flag before
+        # entering _act_on_drive/_guard_check, so checking it would reject the
+        # action that just passed the gate and make every autonomous action a
+        # no-op. The brain owns its single-action mutex; this gate only blocks
+        # competing foreground/long-term work.
         if self._in_combat:
             return False
         ex = getattr(self, "executor", None)
         if ex and ex.busy():
-            return False
-        brain = getattr(self.plugin, "_autonomous_brain", None)
-        if brain and getattr(brain, "_busy", False):
             return False
         lt = getattr(self, "longterm", None)
         # 守卫是长期采集/跟随遇敌时唯一允许的高优先级自主动作；
@@ -1010,7 +1014,8 @@ class TerrariaAgent:
         # 并且可能把物品凭空留在世界中。
         return await self.items.use_item_by_name(name)
 
-    async def navigate_to(self, x: int, y: int, timeout: int = 25) -> bool:
+    async def navigate_to(self, x: int, y: int, timeout: int = 25,
+                          allow_build: bool = False) -> bool:
         """自动寻路走到坐标（v3.0: 流式导航——C# BFS 寻路 + 状态流，可中断）。
 
         导航途中遇敌 → 停下打怪 → 打完继续走（参考轮子插件）。
@@ -1019,16 +1024,24 @@ class TerrariaAgent:
         st = self._state
         cur_y = st.get("tile_y", 0)
         height_diff = cur_y - y
-        if height_diff > 3 and not self.capability.can_climb(height_diff):
-            self.log(f"落差{height_diff}格单次上不去，尝试分段爬升", "nav")
-            return await self.climb_to(x, y)
+        if height_diff > 3 and self.capability.can_climb(height_diff):
+            # A large vertical gap needs the segmented climb planner.  The
+            # planner can choose a hook/rope route or place a small number of
+            # real blocks when necessary; sending it through ordinary stream
+            # navigation would silently disable pit recovery.
+            self.log(f"落差{height_diff}格，尝试分段爬升", "nav")
+            return await self.climb_to(x, y, allow_build=allow_build)
+        if height_diff > 3 and not allow_build:
+            self.log(f"落差{height_diff}格且没有可确认的攀爬手段，停止普通导航", "nav")
+            return False
 
-        ok = await self._nav_with_fight(x, y, timeout)
+        ok = await self._nav_with_fight(x, y, timeout,
+                                        allow_build=allow_build)
         self.log(f"走到 ({x},{y}) " + ("成功" if ok else "失败/超时"), "nav")
         return ok
 
     async def _nav_with_fight(self, x: int, y: int, timeout: int,
-                              _tries: int = 0) -> bool:
+                              _tries: int = 0, allow_build: bool = False) -> bool:
         """带战斗守卫的导航：遇敌停下打，打完重新导航续走（最多 3 轮）。"""
         if _tries > 3:
             return False
@@ -1052,15 +1065,18 @@ class TerrariaAgent:
             await self.combat.fight_nearest(st, timeout=6)
             return True  # 打断本次导航，由外层重发导航续走
 
-        ok = await self.mod.navigate_async(x, y, timeout, on_tick=_guard)
+        ok = await self.mod.navigate_async(x, y, timeout, on_tick=_guard,
+                                            allow_build=allow_build)
         if ok:
             return True
         # 只有真遇敌打断才续走；导航本身失败（卡住/超时）不重复白等
         if fought["yes"]:
-            return await self._nav_with_fight(x, y, timeout, _tries + 1)
+            return await self._nav_with_fight(
+                x, y, timeout, _tries + 1, allow_build=allow_build)
         return False
 
-    async def climb_to(self, x: int, y: int, _round: int = 1) -> bool:
+    async def climb_to(self, x: int, y: int, _round: int = 1,
+                       allow_build: bool = True) -> bool:
         """复杂垂直移动（深坑回地面）：先规划分段，再逐段执行"""
         if _round > 5:
             self.log("爬升重规划超过5轮，放弃", "warn")
@@ -1077,11 +1093,15 @@ class TerrariaAgent:
             await self.send_chat(f"主人，我先爬{len(plan.legs)}段试试，不过{plan.blocked_reason}，可能到不了顶~")
 
         for i, leg in enumerate(plan.legs):
+            if leg.method == "dirt" and not allow_build:
+                self.log("目标需要搭方块才能爬升；普通跟随不自动改造地形", "nav")
+                return False
             if self.executor.should_stop():
                 self.log("爬升被打断", "warn")
                 return False
             self.log(f"第{i + 1}/{len(plan.legs)}段：{leg.method} → ({leg.tx},{leg.ty})", "nav")
-            ok = await self._nav_with_fight(leg.tx, leg.ty, timeout=12)
+            ok = await self._nav_with_fight(leg.tx, leg.ty, timeout=12,
+                                            allow_build=allow_build)
             if not ok:
                 await self.send_chat(f"主人，我卡在第{i + 1}段了（{leg.method}到 {leg.tx},{leg.ty}），上不去啦~")
                 self.log(f"第{i + 1}段失败，中止爬升", "warn")
@@ -1098,7 +1118,7 @@ class TerrariaAgent:
             self.log("本轮没有上升，停止重规划", "warn")
             await self.send_chat("主人，我卡在这上不去了，等你想想办法~")
             return False
-        return await self.climb_to(x, y, _round + 1)
+        return await self.climb_to(x, y, _round + 1, allow_build=allow_build)
 
     # --- 物品/箱子：实现在 InventoryOps，这里保留原有调用签名 ---
     async def get_inventory(self) -> Dict[str, Any]:

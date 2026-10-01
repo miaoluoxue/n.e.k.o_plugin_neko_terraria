@@ -1309,6 +1309,8 @@ namespace NekoTerrariaLink
                     }
                 }
             }
+            if (stacked > 0)
+                SyncInventory(p);
             return stacked > 0;
         }
 
@@ -1324,7 +1326,8 @@ namespace NekoTerrariaLink
 
         private void NavigateSync(NetworkStream s, int tx, int ty, int timeout, long reqId, int generation)
         {
-            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: false, generation);
+            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: false, generation,
+                       allowBuild: false);
         }
 
         /// <summary>导航监控（带兜底）：后台线程监控 + 主线程 BFS。
@@ -1336,11 +1339,13 @@ namespace NekoTerrariaLink
         /// 2. 后台循环只监控（读 player.Center 可接受旧值，不会崩）
         /// 3. 全程 try/catch：任何异常都回错误响应（reason=nav_exception），不再静默
         /// </summary>
-        private void MonitorNav(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents, int generation)
+        private void MonitorNav(NetworkStream s, int tx, int ty, int timeout, long reqId,
+                                bool streamEvents, int generation, bool allowBuild)
         {
             try
             {
-                MonitorNavInner(s, tx, ty, timeout, reqId, streamEvents, generation);
+                MonitorNavInner(s, tx, ty, timeout, reqId, streamEvents, generation,
+                                allowBuild);
             }
             catch (Exception ex)
             {
@@ -1351,7 +1356,9 @@ namespace NekoTerrariaLink
             }
         }
 
-        private void MonitorNavInner(NetworkStream s, int tx, int ty, int timeout, long reqId, bool streamEvents, int generation)
+        private void MonitorNavInner(NetworkStream s, int tx, int ty, int timeout,
+                                     long reqId, bool streamEvents, int generation,
+                                     bool allowBuild)
         {
             // World tiles, inventory and controls are inspected only on the game thread.
             // Every queued tick expires with this navigation generation.
@@ -1436,11 +1443,11 @@ namespace NekoTerrariaLink
                             stalledTicks = 0;
                             int dir = Math.Sign(tx - px);
                             if (TryHook(player, tx, targetFeet, generation)) return;
-                            if (placedBlocks < 4 && dir != 0 && Math.Abs(targetFeet - py) <= 2
+                            if (allowBuild && placedBlocks < 4 && dir != 0 && Math.Abs(targetFeet - py) <= 2
                                 && TryBridge(px, py, dir, generation))
                             { placedBlocks++; ctrl.SetNavigationPath(null); return; }
                             // Only climb toward a verified ledge above a real pit, with enough building stock.
-                            if (placedBlocks < 4 && targetFeet < py - 2
+                            if (allowBuild && placedBlocks < 4 && targetFeet < py - 2
                                 && TryStepUp(player, px, py, tx, targetFeet, generation))
                             {
                                 // TryStepUp already places the adjacent stair on
@@ -1509,12 +1516,16 @@ namespace NekoTerrariaLink
             int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
             int timeout = (int)(cmd.GetNum("timeout") > 0 ? cmd.GetNum("timeout") : 20);
             int generation = Interlocked.Increment(ref _navigationGeneration);
-            Task.Run(() => NavigateStreamSync(s, tx, ty, timeout, reqId, generation));
+            bool allowBuild = cmd.GetNum("allow_build") != 0;
+            Task.Run(() => NavigateStreamSync(s, tx, ty, timeout, reqId, generation,
+                                              allowBuild));
         }
 
-        private void NavigateStreamSync(NetworkStream s, int tx, int ty, int timeout, long reqId, int generation)
+        private void NavigateStreamSync(NetworkStream s, int tx, int ty, int timeout,
+                                        long reqId, int generation, bool allowBuild)
         {
-            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: true, generation);
+            MonitorNav(s, tx, ty, timeout, reqId, streamEvents: true, generation,
+                       allowBuild);
         }
 
         /// <summary>推导航状态事件（走现有事件通道，Python 侧 bus.fire 分发）。</summary>
@@ -1816,7 +1827,10 @@ namespace NekoTerrariaLink
             for (int i = 0; i < player.inventory.Length; i++)
             {
                 var item = player.inventory[i];
-                if (item == null || item.type <= 0 || item.stack <= 0 || item.createTile <= 0) continue;
+                // TileID.Dirt is 0, so a strict >0 check silently discarded
+                // the most common recovery block. Air/non-placeable items use
+                // -1; zero is valid when the item is an actual block.
+                if (item == null || item.type <= 0 || item.stack <= 0 || item.createTile < 0) continue;
                 int type = item.createTile;
                 if (type >= Main.tileSolid.Length || !Main.tileSolid[type] || Main.tileSolidTop[type]) continue;
                 // 家具/箱子等 frame-important 物品不能作为稳定脱困方块，
@@ -1835,6 +1849,12 @@ namespace NekoTerrariaLink
             if (dir == 0) return false;
             int bx = px + dir, ty = py;
             if (player == null || generation != Volatile.Read(ref _navigationGeneration) || !FindPlaceableBlock(player, out int slot, out int tileType) || IsSolid(bx, ty) || IsPlatform(bx, ty)) return false;
+            // A step block is a local recovery aid, not a bridge to an
+            // arbitrary floating platform.  Only place it when the destination
+            // column has real support below it.  This prevents follow mode
+            // from building a row of blocks underneath a high sky platform
+            // merely because the target is several tiles above the player.
+            if (!IsSolid(bx, py + 1) && !IsPlatform(bx, py + 1)) return false;
             var current = player.inventory[slot];
             if (current == null || current.stack <= 0 || current.createTile != tileType) return false;
             bool placed = WorldGen.PlaceTile(bx, ty, tileType, false, false, -1, 0);
@@ -1950,6 +1970,13 @@ namespace NekoTerrariaLink
                 var old = player.armor[equip].Clone();
                 player.armor[equip] = item.Clone();
                 player.inventory[inv] = old;
+                if (Main.netMode == NetmodeID.MultiplayerClient)
+                {
+                    SyncInventory(player, inv);
+                    NetMessage.SendData(MessageID.SyncEquipment, -1, -1, null,
+                        player.whoAmI, PlayerItemSlotID.Armor0 + equip,
+                        player.armor[equip]?.prefix ?? 0);
+                }
                 return true;
             }
             catch { return false; }
@@ -2722,11 +2749,24 @@ namespace NekoTerrariaLink
                 {
                     var it = player.inventory[i];
                     if (it.type == 0) continue;
-                    if (it.type == ItemID.DirtBlock) dirtCount += it.stack;
+                    // Navigation calls this field dirt_count for wire compatibility,
+                    // but any safe solid placeable block is valid for a recovery
+                    // step. Counting only DirtBlock made stone/wood builders look
+                    // unable to escape a pit.
+                    if (it.createTile > 0 && it.createTile < Main.tileSolid.Length
+                        && Main.tileSolid[it.createTile]
+                        && (it.createTile >= Main.tileSolidTop.Length
+                            || !Main.tileSolidTop[it.createTile])
+                        && (it.createTile >= Main.tileFrameImportant.Length
+                            || !Main.tileFrameImportant[it.createTile]))
+                        dirtCount += it.stack;
                     if (it.pick > 0) { hasPick = 1; pickPower = Math.Max(pickPower, it.pick); }
                     if (it.axe > 0) hasAxe = 1;
                     if (it.fishingPole > 0 || it.Name.Contains("钓竿") || it.Name.Contains("鱼竿")) hasRod = 1;
-                    if (it.createTile == 65 || it.createTile == 415) rope += it.stack;
+                    // Rope is an item, not a tile type. The old createTile
+                    // values matched unrelated placeables and caused false
+                    // climb capability reports.
+                    if (it.type == ItemID.Rope) rope += it.stack;
                 }
             }
             Send(s, new Dict {
