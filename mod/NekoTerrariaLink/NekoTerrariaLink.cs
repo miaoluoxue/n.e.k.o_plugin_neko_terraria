@@ -35,6 +35,9 @@ namespace NekoTerrariaLink
         private readonly object _lock = new object();
         private readonly Queue<(string, NetworkStream)> _cmdQueue = new();
         private readonly object _cmdLock = new object();
+        // 物品注册表只依赖当前 Mod 内容；重复 enum_items 不应每次都在
+        // 主线程为全部物品 SetDefaults，避免大请求反复卡住游戏。
+        private List<Dict> _itemRegistryCache;
 
         // 当前活跃的 Python 客户端流（事件推送目标）；ListenLoop accept/断开时更新
         private volatile NetworkStream _activeStream = null;
@@ -2352,6 +2355,13 @@ namespace NekoTerrariaLink
             {
                 try
                 {
+                    if (!ReferenceEquals(_activeStream, s)) return;
+                    if (_itemRegistryCache != null)
+                    {
+                        Send(s, new Dict { ["req_id"] = reqId, ["type"] = "item_registry",
+                            ["mods"] = _itemRegistryCache });
+                        return;
+                    }
                     var byMod = new Dictionary<string, List<Dict>>();
                     for (int i = 1; i < ItemLoader.ItemCount; i++)
                     {
@@ -2378,6 +2388,7 @@ namespace NekoTerrariaLink
                     var mods = new List<Dict>();
                     foreach (var kv in byMod)
                         mods.Add(new Dict { ["mod"] = kv.Key, ["count"] = kv.Value.Count, ["items"] = kv.Value });
+                    _itemRegistryCache = mods;
                     Send(s, new Dict { ["req_id"] = reqId, ["type"] = "item_registry", ["mods"] = mods });
                 }
                 catch (Exception ex)
