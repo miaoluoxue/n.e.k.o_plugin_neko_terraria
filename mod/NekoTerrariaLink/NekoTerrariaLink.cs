@@ -839,18 +839,20 @@ namespace NekoTerrariaLink
                     case "get_recipes": RunInBackground(() => SendRecipes(stream, reqId, cmd.GetValue("cat")), "get_recipes"); break;
                     case "get_state": SendState(stream, reqId, cmd.GetValue("player_name")); break;
                     case "enum_items": RunInBackground(() => SendItemRegistry(stream, reqId), "enum_items"); break;
-                    case "get_capabilities": SendCapabilities(stream, reqId); break;
+                    case "get_capabilities": Main.QueueMainThreadAction(() => SendCapabilities(stream, reqId)); break;
                     case "scan_ledges": Main.QueueMainThreadAction(() => SendLedges(stream, reqId, cmd)); break;
                     case "find_ore": Main.QueueMainThreadAction(() => SendOrePositions(stream, reqId, cmd)); break;
-                    case "get_server_info": SendServerInfo(stream, reqId); break;
-                    case "join_server": SendAck(stream, reqId, JoinServer(cmd)); break;
+                    case "get_server_info": Main.QueueMainThreadAction(() => SendServerInfo(stream, reqId)); break;
+                    // JoinServer touches Main/netplay state; keep it on the
+                    // Terraria main thread instead of the TCP listener thread.
+                    case "join_server": RunOnMain(stream, reqId, () => JoinServer(cmd), expires: false); break;
                     case "select_character": RunOnMain(stream, reqId, () => SelectCharacter(cmd)); break;
                     case "damage_npc": RunOnMain(stream, reqId, () => DamageNpc(cmd)); break;
                     case "warp": RunOnMain(stream, reqId, () => Warp(cmd)); break;
-                    case "get_network_info": SendNetworkInfo(stream, reqId); break;
-                    case "join_status": SendJoinStatus(stream, reqId); break;
+                    case "get_network_info": Main.QueueMainThreadAction(() => SendNetworkInfo(stream, reqId)); break;
+                    case "join_status": Main.QueueMainThreadAction(() => SendJoinStatus(stream, reqId)); break;
                     case "screenshot": SendScreenshot(stream, reqId); break;
-                    case "get_spawn": SendSpawn(stream, reqId); break;
+                    case "get_spawn": Main.QueueMainThreadAction(() => SendSpawn(stream, reqId)); break;
                     case "use_mirror": RunOnMain(stream, reqId, () => UseMirror(cmd)); break;
                     case "place_chest": RunOnMain(stream, reqId, () => PlaceChest(cmd)); break;
                     case "quick_stack": RunOnMain(stream, reqId, () => QuickStack(cmd)); break;
@@ -920,16 +922,16 @@ namespace NekoTerrariaLink
 
         /// <summary>
         /// 同步方块变化到服务器（mod 只在 AI 客户端，本地 WorldGen 不会让
-        /// 服务器/其他玩家看到——必须广播 TileChange。action: 0=放置, 1=破坏）
+        /// 服务器/其他玩家看到——必须广播 TileChange。action: 0=破坏, 1=放置）
         /// </summary>
-        private static void SyncTile(int x, int y, int action)
+        private static void SyncTile(int x, int y, int action, int tileType = 0, int style = 0)
         {
             if (Main.netMode == NetmodeID.MultiplayerClient)
             {
                 try
                 {
                     NetMessage.SendData(MessageID.TileManipulation, -1, -1,
-                        null, action, x, y, 0f, 0, 0, 0);
+                        null, action, x, y, tileType, style, 0, 0);
                 }
                 catch { }
             }
@@ -957,10 +959,10 @@ namespace NekoTerrariaLink
             if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY) return false;
             var before = Main.tile[x, y];
             if (before == null || !before.HasTile) return false;
-            WorldGen.KillTile(x, y, false, false, true);
+            WorldGen.KillTile(x, y, false, false, false);
             var after = Main.tile[x, y];
             bool changed = after == null || !after.HasTile;
-            if (changed) SyncTile(x, y, 1);   // 破坏 → 服务器广播
+            if (changed) SyncTile(x, y, 0);   // 破坏 → 服务器广播
             return changed;
         }
 
@@ -969,9 +971,13 @@ namespace NekoTerrariaLink
             int x = (int)cmd.GetNum("x"), y = (int)cmd.GetNum("y");
             int tile = (int)cmd.GetNum("tile");
             if (!InReach(x, y, 8)) return false;   // 太远：人物没走过去就不许放
-            bool ok = WorldGen.PlaceTile(x, y, tile, false, false, -1, 0);
-            if (ok) SyncTile(x, y, 0);   // 放置 → 服务器广播
-            return ok;
+            if (x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY || tile < 0)
+                return false;
+            bool attempted = WorldGen.PlaceTile(x, y, tile, false, false, -1, 0);
+            var placed = Main.tile[x, y];
+            bool confirmed = attempted && placed != null && placed.HasTile && placed.TileType == tile;
+            if (confirmed) SyncTile(x, y, 1, tile);   // 放置 → 服务器广播
+            return confirmed;
         }
 
         private bool Hook(Dict cmd)
@@ -1189,23 +1195,13 @@ namespace NekoTerrariaLink
         {
             var p = Main.LocalPlayer;
             if (p == null) return false;
-            // 在背包里找魔镜(50)/冰雪镜(3199)，没有就生成一个
+            // 只使用玩家背包里真实拥有的魔镜/冰雪镜；没有物品时返回失败，
+            // 不能在“回家”动作里凭空生成道具。
             int mirrorId = -1;
             for (int i = 0; i < p.inventory.Length; i++)
             {
                 int t = p.inventory[i].type;
                 if (t == 50 || t == 3199) { mirrorId = i; break; }
-            }
-            if (mirrorId < 0)
-            {
-                var m = new Item();
-                m.SetDefaults(50);
-                p.QuickSpawnItem(Src, m, 1);
-                // 再找一次
-                for (int i = 0; i < p.inventory.Length; i++)
-                {
-                    if (p.inventory[i].type == 50) { mirrorId = i; break; }
-                }
             }
             if (mirrorId < 0) return false;
             p.selectedItem = mirrorId;
@@ -1222,9 +1218,44 @@ namespace NekoTerrariaLink
             int x = (int)cmd.GetNum("x");
             int y = (int)cmd.GetNum("y");
             int style = (int)(cmd.GetNum("style") > 0 ? cmd.GetNum("style") : 0);
-            bool ok = WorldGen.PlaceTile(x, y, TileID.Containers, false, false, -1, style);
-            if (ok) SyncTile(x, y, 0);
-            return ok;
+            if (!InReach(x, y, 8) || x < 0 || y < 0 || x >= Main.maxTilesX || y >= Main.maxTilesY)
+                return false;
+            var player = Main.LocalPlayer;
+            if (player == null) return false;
+            int chestSlot = -1;
+            for (int i = 0; i < player.inventory.Length; i++)
+            {
+                var it = player.inventory[i];
+                if (it != null && it.type > 0 && it.stack > 0 && it.createTile == TileID.Containers)
+                {
+                    chestSlot = i;
+                    break;
+                }
+            }
+            if (chestSlot < 0) return false;
+            // PlaceChest uses (x,y) as the bottom-left tile. Occupied cells
+            // are (x..x+1, y-1..y); y+1 is the support row and may contain a
+            // solid tile.
+            if (x + 1 >= Main.maxTilesX || y - 1 < 0 || y + 1 >= Main.maxTilesY) return false;
+            for (int dx = 0; dx < 2; dx++)
+                for (int dy = -1; dy <= 0; dy++)
+                    if (Main.tile[x + dx, y + dy] != null && Main.tile[x + dx, y + dy].HasTile)
+                        return false;
+
+            // PlaceChest performs the 2x2 container and support checks and
+            // returns the actual chest index. It also avoids creating a loose
+            // container tile without a corresponding Chest object.
+            int chestIndex = WorldGen.PlaceChest(x, y, TileID.Containers, false, style);
+            if (chestIndex < 0 || Main.chest[chestIndex] == null) return false;
+            player.inventory[chestSlot].stack--;
+            if (player.inventory[chestSlot].stack <= 0)
+                player.inventory[chestSlot].SetDefaults(0);
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
+            for (int dx = 0; dx < 2; dx++)
+                for (int dy = -1; dy <= 0; dy++)
+                    SyncTile(x + dx, y + dy, 1, TileID.Containers, style);
+            return true;
         }
 
         /// <summary>把背包物品快速堆叠进当前打开/最近的箱子。返回堆叠的物品种数。</summary>
@@ -1727,7 +1758,7 @@ namespace NekoTerrariaLink
             {
                 if (generation != Volatile.Read(ref _navigationGeneration)) return;
                 placed = WorldGen.PlaceTile(bx, by, 0, false, false, -1, 0);
-                if (placed) SyncTile(bx, by, 0);   // 联机广播铺路
+                if (placed) SyncTile(bx, by, 1, 0);   // 联机广播铺路
             });
             for (int i = 0; i < 10 && !placed; i++) Thread.Sleep(20);
             return placed;
@@ -1750,7 +1781,7 @@ namespace NekoTerrariaLink
                     placed = WorldGen.PlaceTile(px, py - 1, 0, false, false, -1, 0);
                     ty = py - 1;
                 }
-                if (placed) SyncTile(px, ty, 0);   // 联机广播垫土
+                if (placed) SyncTile(px, ty, 1, 0);   // 联机广播垫土
             });
             for (int i = 0; i < 10 && !placed; i++) Thread.Sleep(20);
             return placed;
@@ -1889,9 +1920,6 @@ namespace NekoTerrariaLink
             var item = new Item();
             item.SetDefaults(id);
             if (item.type <= 0 || item.IsAir) return false;
-            // give_item 的契约是物品进入背包。QuickSpawnItem 在背包满时
-            // 可能把物品丢到世界，不能把这种结果回报成成功；先计算完整
-            // 容量，再一次性写入已有堆叠和空槽，避免部分生成。
             int capacity = 0;
             for (int i = 0; i < player.inventory.Length; i++)
             {
@@ -1903,31 +1931,24 @@ namespace NekoTerrariaLink
                 if (capacity >= stack) break;
             }
             if (capacity < stack) return false;
-
-            int remaining = stack;
-            for (int i = 0; i < player.inventory.Length && remaining > 0; i++)
+            // 使用原生 GetItem 写入背包，保留联机同步与堆叠规则。保存快照
+            // 是为了在 modded 堆叠规则导致部分接收时完整回滚，避免“报告失败
+            // 但背包已经增加了一部分物品”。
+            var before = new Item[player.inventory.Length];
+            for (int i = 0; i < player.inventory.Length; i++)
+                before[i] = player.inventory[i]?.Clone() ?? new Item();
+            var remainder = player.GetItem(
+                player.whoAmI, item,
+                GetItemSettings.InventoryEntityToPlayerInventorySettings);
+            bool accepted = remainder == null || remainder.IsAir || remainder.stack <= 0;
+            if (!accepted)
             {
-                var existing = player.inventory[i];
-                if (existing == null || existing.type == 0) continue;
-                if (existing.type != id || existing.stack >= existing.maxStack) continue;
-                int add = Math.Min(remaining, existing.maxStack - existing.stack);
-                existing.stack += add;
-                remaining -= add;
+                for (int i = 0; i < player.inventory.Length; i++)
+                    player.inventory[i] = before[i];
+                if (Main.netMode == NetmodeID.MultiplayerClient)
+                    NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
             }
-            for (int i = 0; i < player.inventory.Length && remaining > 0; i++)
-            {
-                var existing = player.inventory[i];
-                if (existing != null && existing.type != 0) continue;
-                int add = Math.Min(remaining, item.maxStack);
-                var placed = item.Clone();
-                placed.stack = add;
-                player.inventory[i] = placed;
-                remaining -= add;
-            }
-            if (remaining != 0) return false;
-            if (Main.netMode == NetmodeID.MultiplayerClient)
-                NetMessage.SendData(MessageID.SyncPlayer, -1, -1, null, player.whoAmI);
-            return true;
+            return accepted;
         }
 
         private void SendInventory(NetworkStream s, long reqId)
@@ -1999,8 +2020,10 @@ namespace NekoTerrariaLink
             var drop = item.Clone();
             drop.stack = stack;
             // 只有实际生成掉落物后才扣源槽；否则会出现“丢弃失败但物品被扣除”。
-            bool dropped = player.TryDroppingSingleItem(Src, drop);
-            if (!dropped) return false;
+            player.TryDroppingSingleItem(Src, drop);
+            // tModLoader consumes the clone (TurnToAir) only after a world item
+            // is successfully created. Keep the source stack when it fails.
+            if (!drop.IsAir) return false;
             player.inventory[slot].stack -= stack;
             if (player.inventory[slot].stack <= 0)
                 player.inventory[slot].SetDefaults(0);
@@ -2659,6 +2682,7 @@ namespace NekoTerrariaLink
             if (p == null) return false;
             int tx = (int)cmd.GetNum("x"), ty = (int)cmd.GetNum("y");
             if (!InReach(tx, ty, 10)) return false;   // 太远：人物没走过去不许砍（防远程假完成）
+            if (tx < 0 || tx >= Main.maxTilesX) return false;
             int count = 0;
             for (int dy = -25; dy <= 2; dy++)
             {
@@ -2671,9 +2695,17 @@ namespace NekoTerrariaLink
                     || t.TileType == TileID.PalmTree  // 棕榈
                     || t.TileType == TileID.Cactus))
                 {
-                    WorldGen.KillTile(tx, y, false, false, true);
-                    SyncTile(tx, y, 1);
-                    count++;
+                    WorldGen.KillTile(tx, y, false, false, false);
+                    var after = Main.tile[tx, y];
+                    bool removed = after == null || !after.HasTile
+                                   || (after.TileType != TileID.Trees
+                                       && after.TileType != TileID.PalmTree
+                                       && after.TileType != TileID.Cactus);
+                    if (removed)
+                    {
+                        SyncTile(tx, y, 0);
+                        count++;
+                    }
                 }
             }
             return count > 0;
