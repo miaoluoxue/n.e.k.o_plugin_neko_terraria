@@ -101,6 +101,7 @@ class CombatEngine:
         key = self._enemy_key(target)
         start = last_change = time.monotonic()
         last_hp = int(target.get("life", 0) or 0)
+        saw_damage = False
         last_move = 0.0
         moving = False
         while time.monotonic() - start < timeout:
@@ -126,7 +127,11 @@ class CombatEngine:
                     cur = e
                     break
             if cur is None:
-                return False  # 离开感知范围/状态丢失不能作为击杀证据
+                # The mod exports living NPCs only, so a killed NPC normally
+                # disappears instead of producing a life==0 frame.  Treat
+                # disappearance as a kill only after we observed real damage;
+                # an unhurt target leaving the radius is still inconclusive.
+                return saw_damage
             if int(cur.get("life", 0) or 0) <= 0:
                 # 战斗胜利，收集掉落物（打完不抢任务，掉落让主线收）
                 try:
@@ -160,6 +165,7 @@ class CombatEngine:
             # 服务器的伤害结果可能在两次循环之间到达，必须跨轮比较血量。
             if hp < last_hp:
                 last_change = time.monotonic()
+                saw_damage = True
             last_hp = hp
             if time.monotonic() - last_change > self.no_dmg_timeout:
                 self._blacklist_enemy(cur)

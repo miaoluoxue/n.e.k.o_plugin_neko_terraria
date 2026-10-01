@@ -168,7 +168,18 @@ async def idle_drudge(agent, st: Dict[str, Any]) -> None:
 
     if ctx.get("_following"):
         try:
-            await agent.mod.navigate_stream_fire(ox, oy)
+            nav_result = await agent.mod.navigate_stream_fire(ox, oy)
+            if nav_result is False:
+                failures = int(ctx.get("_follow_nav_failures", 0)) + 1
+                ctx["_follow_nav_failures"] = failures
+                if failures >= 5:
+                    ctx["_following"] = False
+                    ctx["_follow_nav_failures"] = 0
+                    await agent.mod.stop_actions()
+                    agent.log("自主跟随连续导航失败，暂停追赶等待位置变化", "warn")
+                    return
+            elif nav_result is True:
+                ctx["_follow_nav_failures"] = 0
         except Exception:
             pass
         return  # 本秒在追，不干别的

@@ -150,6 +150,7 @@ class StandingJobs:
         logger.info(f"📏 跟随参数({mode}): trigger={trigger}, stop_at={stop_at}")
 
         loop_count = 0
+        nav_failures = 0
         while not lt.should_stop(task.kind):
             loop_count += 1
             logger.info(f"🔄 follow_loop 第 {loop_count} 次循环")
@@ -202,7 +203,16 @@ class StandingJobs:
                 # v0.8 实时跟随（代际接管）：fire-and-forget 流式导航，
                 # 每轮（0.6s）更新目标——主人走动 AI 立刻追，不再阻塞等 15 秒。
                 # C# 侧路径代际（navGen）保证新导航接管时旧任务不误清路径。
-                await self.agent.mod.navigate_stream_fire(ox, oy)
+                nav_result = await self.agent.mod.navigate_stream_fire(ox, oy)
+                if nav_result is False:
+                    nav_failures += 1
+                    if nav_failures >= 5:
+                        task.status = LT_BLOCKED
+                        task.beat("连续导航失败，主人可能在不可达区域")
+                        await self.agent.mod.stop_actions()
+                        return
+                elif nav_result is True:
+                    nav_failures = 0
                 # 追了一步 → 通知交互引擎
                 await self._notify_step("follow", f"追主人中，距离{int(dist)}格", dist=dist)
             except asyncio.CancelledError:

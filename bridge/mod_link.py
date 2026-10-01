@@ -239,27 +239,43 @@ class ModLink:
                 request.cancel()
             await asyncio.gather(request, return_exceptions=True)
 
-    async def navigate_stream_fire(self, x: int, y: int) -> None:
-        """替换上次后台导航；保存任务供停止操作取消，避免残留请求继续接管。"""
+    async def navigate_stream_fire(self, x: int, y: int) -> Optional[bool]:
+        """替换上次后台导航，并暴露上一轮同目标的结果。
+
+        跟随/自主巡逻使用 fire-and-forget，过去导航失败会被完全吞掉，
+        行为循环便会无限重发同一条无效路线。只有“上一轮也是同一目标”
+        时才返回它的结果；目标变化导致的取消返回 ``None``，避免误判。
+        """
         import asyncio
 
         previous = getattr(self, "_nav_fire_task", None)
+        previous_target = getattr(self, "_nav_fire_target", None)
+        previous_result = None
+        if previous is not None and previous.done() and previous_target == (x, y):
+            try:
+                previous_result = previous.result()
+            except asyncio.CancelledError:
+                previous_result = None
+            except Exception:
+                previous_result = False
         if previous is not None and not previous.done():
             if getattr(self, "_nav_fire_target", None) == (x, y):
-                return
+                return None
             previous.cancel()
             await asyncio.gather(previous, return_exceptions=True)
 
         async def _fire():
             try:
-                await self.conn.request_mod(
+                resp = await self.conn.request_mod(
                     {"cmd": "navigate_stream", "x": x, "y": y, "timeout": 20},
                     timeout=25.0)
+                return bool(resp and resp.get("ok"))
             except Exception:
-                pass
+                return False
 
         self._nav_fire_target = (x, y)
         self._nav_fire_task = self._track_navigation(asyncio.create_task(_fire()))
+        return previous_result
 
     def _on_nav_event(self, msg: dict) -> None:
         """agent 转发 nav_* 事件到此（connection → agent._handle_mod_event → 这里）。"""

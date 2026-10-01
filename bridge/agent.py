@@ -870,8 +870,18 @@ class TerrariaAgent:
                             break
                 if slot_id is None:
                     continue
+                before_hp = int(self._state.get("hp", 0) or 0)
                 await self.mod.select_item(slot_id)
-                await self.mod.use_item_slot(slot_id)
+                if not await self.mod.use_item_slot(slot_id):
+                    continue
+                # The command ACK only means the item was used.  Refresh the
+                # state and require an actual HP increase before reporting a
+                # successful autonomous heal.
+                await asyncio.sleep(0.25)
+                await self.refresh_state()
+                after_hp = int(self._state.get("hp", 0) or 0)
+                if after_hp <= before_hp:
+                    continue
                 self.log("喝了加血物品", "item")
                 return True
             except Exception:
