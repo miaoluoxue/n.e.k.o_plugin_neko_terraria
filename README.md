@@ -71,7 +71,7 @@ N.E.K.O 插件 ── 前端 UI（2s 轮询 get_dashboard_state）
 
 ## 🚀 快速开始
 
-发布内容、源码使用方式与验证范围见[发布说明](docs/release-notes.md)。
+安装包与本次修复清单见 [GitHub Releases](https://github.com/miaoluoxue/n.e.k.o_plugin_neko_terraria/releases)。
 
 **前置条件**
 
@@ -79,12 +79,12 @@ N.E.K.O 插件 ── 前端 UI（2s 轮询 get_dashboard_state）
 |------|------|
 | N.E.K.O | AI 伴侣平台 |
 | tModLoader | 你的游戏 + AI 各一份 |
-| **NekoTerrariaLink** mod | 需构建并启用 |
+| **NekoTerrariaLink** mod | 已随插件包内置，无需单独安装 |
 | 泰拉瑞亚角色 | 为 AI 创建角色（如 `Neko`） |
 
-**1. 构建 Mod**
-复制 `mod/NekoTerrariaLink/` 到 `ModSources/NekoTerrariaLink/` → tModLoader 主菜单 → 模组 → 开发 → 构建 → 确认列表出现「NEKO猫娘AI」。
-> 🔧 详见 [archive/MOD_BUILD.md](archive/MOD_BUILD.md)
+**1. 安装插件**
+N.E.K.O → 插件管理 → 导入 `neko_terraria-*.neko-plugin`。C# Mod 已包含在包内，无需单独构建或安装。
+> 🔧 只有自行修改 C# 源码时才需要重新编译，步骤见 [archive/MOD_BUILD.md](archive/MOD_BUILD.md)
 
 **2. 配置插件**
 N.E.K.O → 插件管理 → 启用「泰拉瑞亚猫娘」→ 控制面板 → 连接设置：填 tModLoader 路径（留空自动查找）、AI 角色名、服务器 IP/端口/密码 → 保存。
@@ -248,9 +248,9 @@ async def llm_my_action(self, ...):
 
 | 症状 | 解决 |
 |------|------|
-| **AI 人物一动不动/走不动** | 重新编译 mod（新控制走 ModPlayer） |
+| **AI 人物一动不动/走不动** | 确认插件包为最新版本；自行改过 C# 源码时需重新编译 Mod |
 | **一直"正在连接"** | 确认你已 Host & Play；检查 9877 端口 |
-| **命令响应慢（几十秒）** | 检查 Mod 是否已重新构建，并确认 9877 端口没有被其他程序占用 |
+| **命令响应慢（几十秒）** | 确认插件包为最新版本，并确认 9877 端口没有被其他程序占用 |
 | **被打猫娘没反应** | 检查 Mod 事件连接和插件日志，确认插件与 Mod 来自同一份代码 |
 
 ---
