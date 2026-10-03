@@ -134,7 +134,7 @@ class Reasoner:
         mod 矿石叫 "Aerialite Ore" 这种英文名，只判断中文"矿"结尾会漏掉，
         导致猫娘明明能挖却说搞不到。
         """
-        from .item_npc_dict import item_id, ORE_ITEM_TO_TILE
+        from .item_npc_dict import ORE_ITEM_TO_TILE, item_id
         registry = getattr(self.agent, "registry", None)
         iid = item_id(item, registry)
         if iid <= 0:

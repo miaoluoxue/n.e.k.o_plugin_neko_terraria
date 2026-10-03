@@ -208,13 +208,17 @@ class LifeEngine:
             self._tool_prepare_depth -= 1
 
     def _recipe_matches_tool(self, recipe, kind: str, fallback_names) -> bool:
-        """Identify a tool from authoritative registry fields, then names."""
+        """Identify a tool from authoritative registry fields, then names.
+
+        工具类型的权威判据是 registry 的 tags（mod 端把 pick>0/axe>0/fishingPole>0
+        分别打成 "pickaxe"/"axe"/"fishing"）；`use` 字段只区分大类
+        （tool/weapon/armor/accessory/ore/misc），不区分镐/斧/竿，因此这里不用它。
+        """
         registry = getattr(self.agent, "registry", None)
         info = registry.describe(str(recipe.item_id)) if registry is not None else {}
         name = " ".join((str(recipe.name), str(recipe.full_name),
                          str(info.get("name", "")), str(info.get("display_name", "")))).casefold()
         tags = {str(x).casefold() for x in (info.get("tags", []) or [])}
-        use = str(info.get("use", "")).casefold()
         if kind == "pick":
             return ("pickaxe" in tags or "pick" in tags or "pickaxe" in name
                     or any("镐" in str(n) for n in (recipe.name, recipe.full_name)))

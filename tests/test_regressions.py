@@ -33,31 +33,45 @@ _best_stat = _bridge("upgrade")._best_stat
 
 def test_registry_normalizes_names_aliases_and_preserves_cache(tmp_path: Path):
     registry = ModItemRegistry(str(tmp_path))
-    registry.sync_from_enum(
-        [{
-            "mod": "Example",
-            "items": [{
-                "id": 9001,
-                "name": "Iron Ore",
-                "aliases": ["iron_ore", "铁矿别名"],
-                "use": "ore",
-                "tags": ["mine"],
-            }],
-        }]
-    )
+    entry = {
+        "mod": "Example",
+        "items": [{
+            "id": 9001,
+            "name": "Iron Ore",
+            "aliases": ["iron_ore", "铁矿别名"],
+            "use": "ore",
+            "tags": ["mine"],
+        }],
+    }
+    registry.sync_from_enum([entry])
 
+    assert registry.live is True
     assert registry.resolve(" iron_ore ") == 9001
     assert registry.resolve("IRON ORE") == 9001
     assert registry.resolve("铁矿别名") == 9001
     assert registry.find_by_use("ore") == [9001]
     assert registry.find_by_tag("mine") == [9001]
 
+    # 空枚举 = mod 未加载/未连接：撤销会话内权威性（磁盘缓存仅供显示，
+    # 绝不能当权威身份用——否则会按过期数据认错物品）。
     assert registry.sync_from_enum([]) == {"added": [], "updated": [], "removed": []}
+    assert registry.live is False
+    assert registry.resolve("Iron Ore") == -1
+    assert registry.find_by_use("ore") == []
+    assert registry.find_by_tag("mine") == []
+    # 缓存文件本身保留（供显示/下次加载），重新同步即恢复权威。
+    assert (tmp_path / "data" / "mod_items" / "Example.json").exists()
+    registry.sync_from_enum([entry])
+    assert registry.live is True
     assert registry.resolve("Iron Ore") == 9001
 
 
 def test_item_id_uses_registry_then_original_id_fallback():
-    registry = SimpleNamespace(resolve=lambda name: 9010 if "mod sword" in name else -1)
+    # live=False：注册表尚未同步（会话内非权威）——仍先问注册表，
+    # 未命中再回退原版 ID 表；不得因缓存缺失而拒绝解析。
+    registry = SimpleNamespace(
+        resolve=lambda name: 9010 if "mod sword" in str(name).casefold() else -1,
+        live=False)
 
     assert item_id("Mod Sword", registry) == 9010
     assert item_id("IRON ORE", registry) == 11
@@ -118,8 +132,17 @@ def test_agent_stop_cancels_real_task_loop():
         agent = agent_type.__new__(agent_type)
         agent._running = True
         agent._background_tasks = set()
-        agent.executor = SimpleNamespace(cancel_current=AsyncMock())
-        agent.longterm = SimpleNamespace(stop_all=AsyncMock())
+        # stop() 会撤销物品/配方注册表权威性并检查启动任务（未启动 → None）；
+        # stop_everything() 还要经过 coordinator/inquiry/mod/plugin 这几个协作方。
+        agent.registry = SimpleNamespace(invalidate=Mock())
+        agent.recipe_book = SimpleNamespace(invalidate=Mock())
+        agent._start_task = None
+        agent.executor = SimpleNamespace(cancel_current=AsyncMock(), busy=lambda: False)
+        agent.longterm = SimpleNamespace(stop_all=AsyncMock(), busy_kinds=lambda: [])
+        agent.coordinator = SimpleNamespace(cancel_pending_commands=Mock())
+        agent.inquiry = SimpleNamespace(cancel_all=Mock())
+        agent.mod = SimpleNamespace(stop_actions=AsyncMock(return_value=True))
+        agent.plugin = SimpleNamespace(_autonomous_brain=None)
         agent.launcher = SimpleNamespace(close=Mock())
         agent.conn = SimpleNamespace(close=Mock())
         chain = _bridge("task_chain").TaskChain(None, None, None)
@@ -184,14 +207,25 @@ def test_unknown_mining_target_never_starts_digging(tmp_path):
 
 
 @pytest.mark.parametrize("delivered", [True, False])
-def test_give_goal_reports_only_successful_delivery(delivered):
+def test_give_goal_never_reports_unconfirmed_delivery(delivered):
+    """丢出物品 ≠ 主人收到：未确认拾取前，绝不报交付完成（假完成红线）。
+
+    give_to_player 返回 True 也只代表"丢出动作成功"，不构成主人已拾取的证据；
+    因此无论交付动作成功与否，整步都必须判未完成，且不得声称已交付。
+    """
     module = _bridge("task_chain")
     equip = SimpleNamespace(give_to_player=AsyncMock(return_value=delivered))
     agent = SimpleNamespace(resolve_item=lambda _: 11, log=Mock())
-    chain = module.TaskChain(None, None, equip, agent)
+    mod = SimpleNamespace(get_inventory=AsyncMock(
+        return_value={"hotbar": [], "inventory": []}))
+    chain = module.TaskChain(None, mod, equip, agent)
     goal = module.Goal("give", "铁矿", amount=3)
-    assert asyncio.run(chain._execute(goal)) is delivered
-    assert goal.actual == (3 if delivered else 0)
+
+    assert asyncio.run(chain._execute(goal)) is False
+    assert goal.actual == 0  # 未确认收到 → 不得计数
+    assert goal.outcome == "unconfirmed"
+    assert "未确认" in goal.report_fail
+    assert ("已丢出" in goal.evidence) is delivered
 
 
 def test_mining_goal_fails_when_delivery_fails():
@@ -199,11 +233,16 @@ def test_mining_goal_fails_when_delivery_fails():
     mining = SimpleNamespace(mine_target=AsyncMock(return_value=(11, 3)))
     equip = SimpleNamespace(give_to_player=AsyncMock(return_value=False))
     agent = SimpleNamespace(resolve_item=lambda _: 11, log=Mock())
-    chain = module.TaskChain(mining, None, equip, agent)
+    mod = SimpleNamespace(get_inventory=AsyncMock(
+        return_value={"hotbar": [], "inventory": []}))
+    chain = module.TaskChain(mining, mod, equip, agent)
     goal = module.Goal("mine", "铁矿", amount=3, deliver_to_player=True)
+
+    # 挖够 3 个但交付未确认 → 整步不算完成，也不得报"已交给主人"
     assert not asyncio.run(chain._execute(goal))
-    assert goal.actual == 3
-    assert "转交失败" in goal.report_fail
+    assert goal.actual == 0
+    assert goal.outcome == "unconfirmed"
+    assert "未确认" in goal.report_fail
 
 
 @pytest.mark.parametrize("crafted", [0, 2])

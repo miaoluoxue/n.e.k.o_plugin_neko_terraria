@@ -126,7 +126,6 @@ class CombatEngine:
         key = self._enemy_key(target)
         start = last_change = time.monotonic()
         last_hp = int(target.get("life", 0) or 0)
-        saw_damage = False
         last_move = 0.0
         moving = False
         while time.monotonic() - start < timeout:
@@ -206,7 +205,6 @@ class CombatEngine:
             # 服务器的伤害结果可能在两次循环之间到达，必须跨轮比较血量。
             if hp < last_hp:
                 last_change = time.monotonic()
-                saw_damage = True
             last_hp = hp
             if time.monotonic() - last_change > self.no_dmg_timeout:
                 self._blacklist_enemy(cur)
