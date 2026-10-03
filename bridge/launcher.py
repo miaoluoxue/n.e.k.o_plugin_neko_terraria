@@ -4,43 +4,55 @@ import asyncio
 import ctypes
 import os
 import subprocess
-from ctypes import wintypes
 from pathlib import Path
 from typing import Optional, Set
 
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4   # 显示/恢复但不激活（不抢焦点，避免键盘同时控制 AI 角色）
 
-# Win32 窗口 API（显式 argtypes，避免 64 位句柄截断导致 SetWindowPos 等静默失败）
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.ShowWindow.restype = ctypes.c_bool
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsWindowVisible.restype = ctypes.c_bool
-user32.IsIconic.argtypes = [wintypes.HWND]
-user32.IsIconic.restype = ctypes.c_bool
-user32.IsWindow.argtypes = [wintypes.HWND]
-user32.IsWindow.restype = ctypes.c_bool
-user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowLongW.restype = ctypes.c_long
-user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
-user32.SetWindowLongW.restype = ctypes.c_long
-user32.SetWindowPos.argtypes = [
-    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-user32.SetWindowPos.restype = ctypes.c_bool
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-user32.GetWindowRect.restype = ctypes.c_bool
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
-user32.EnumWindows.restype = ctypes.c_bool
+# Win32 窗口 API（显式 argtypes，避免 64 位句柄截断导致 SetWindowPos 等静默失败）。
+#
+# ⚠️ 仅 Windows 可用：Linux/macOS 既没有 ctypes.wintypes 也没有 ctypes.WinDLL。
+# 这里必须可降级（user32=None），否则模块级 ImportError 会让整个 bridge.agent
+# 在非 Windows 上无法导入——CI 在 Linux 上跑测试就是这么挂的。生产环境是
+# Windows，装载路径与行为完全不变；非 Windows 下窗口控制退化为空操作
+# （launch() 本来就找不到 tModLoader.dll，会提前返回 False）。
+try:
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = ctypes.c_bool
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = ctypes.c_bool
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = ctypes.c_bool
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = ctypes.c_bool
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    user32.SetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    user32.SetWindowPos.restype = ctypes.c_bool
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = ctypes.c_bool
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumWindows.restype = ctypes.c_bool
+except (ImportError, AttributeError, OSError):
+    wintypes = None      # type: ignore[assignment]
+    user32 = None        # type: ignore[assignment]
 
 #  Win32 窗口工具
 
 def _enum_visible_hwnds() -> Set[int]:
+    if user32 is None:      # 非 Windows：无 Win32 窗口 API
+        return set()
     hwnds = set()
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
@@ -54,6 +66,8 @@ def _enum_visible_hwnds() -> Set[int]:
 
 
 def _find_window_by_pid(target_pid: int) -> Optional[int]:
+    if user32 is None:      # 非 Windows：无 Win32 窗口 API
+        return None
     found = [None]
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
@@ -108,7 +122,10 @@ class GameLauncher:
     @staticmethod
     def _steam_paths_from_registry() -> list:
         """从注册表读 Steam 实际安装路径（HKLM/HKCU 两个位置，兼容 x86/x64）。"""
-        import winreg
+        try:
+            import winreg
+        except ImportError:      # 非 Windows：没有注册表，交给常见目录兜底
+            return []
         out = []
         for hive, subkey in (
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
@@ -212,7 +229,8 @@ class GameLauncher:
         try:
             self.process = subprocess.Popen(
                 args, cwd=cwd,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                # CREATE_NEW_CONSOLE 仅 Windows 存在；非 Windows 上没有该常量
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception as e:
@@ -234,6 +252,8 @@ class GameLauncher:
 
     def _set_topmost(self):
         """桌宠式置顶：WS_EX_TOPMOST 扩展样式（永续）+ SetWindowPos（立即生效）。"""
+        if user32 is None:      # 非 Windows：无 Win32 窗口 API
+            return
         try:
             if self.hwnd:
                 GWL_EXSTYLE = -20
@@ -249,6 +269,8 @@ class GameLauncher:
     async def _keep_window_visible_loop(self):
         """窗口保活：每秒检查——置顶缺失即重申（移动/缩放后 SDL 可能清样式）、
         防最小化/隐藏。每轮重新查找窗口句柄（AI 客户端重启后句柄会变）。"""
+        if user32 is None:      # 非 Windows：无 Win32 窗口 API
+            return
         while self.process and self.process.poll() is None:
             try:
                 pid = self.process.pid
@@ -273,6 +295,8 @@ class GameLauncher:
         print(f"[GameLauncher] {msg}")
 
     async def _hide_window_async(self):
+        if user32 is None:      # 非 Windows：无 Win32 窗口 API
+            return
         pid = self.process.pid
         for _ in range(10):
             hwnd = _find_window_by_pid(pid)
@@ -284,6 +308,8 @@ class GameLauncher:
 
     async def _show_window_async(self):
         """有头客户端：窗口可见 + 桌宠式置顶，但不抢焦点（主玩家键盘不受影响）。"""
+        if user32 is None:      # 非 Windows：无 Win32 窗口 API
+            return
         pid = self.process.pid
         for _ in range(10):
             hwnd = _find_window_by_pid(pid)
@@ -295,7 +321,7 @@ class GameLauncher:
             await asyncio.sleep(2)
 
     def show_window(self):
-        if self.hwnd:
+        if user32 is not None and self.hwnd:    # 非 Windows：无 Win32 窗口 API
             user32.ShowWindow(self.hwnd, 9)
 
     def close(self):
