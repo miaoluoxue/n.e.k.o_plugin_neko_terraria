@@ -9,7 +9,12 @@ on:
   workflow_dispatch:
 
 permissions:
+  # 共享工作流的 attest job 跑 actions/attest-build-provenance，需要
+  # id-token + attestations 写权限；调用方不授予 → 整个 reusable 流程
+  # 直接 startup_failure（2026-10 上游加 attest job 后踩到）。
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
