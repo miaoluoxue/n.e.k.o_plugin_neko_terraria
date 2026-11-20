@@ -4,6 +4,23 @@
 协议读取世界、执行任务并由宿主猫娘陪聊。当前清单只声明面板
 `state:read`、`action:call`。
 
+> 红线结论：不写 N.E.K.O 本体记忆库、对话数据库或角色记忆卡。本插件产生的
+> 猫娘可见台词和隐藏上下文只通过官方 `push_message` 注入。
+
+## 高风险权限使用矩阵（发布前必读）
+
+本表按当前代码事实描述，**不把“需要用户确认”写成“默认关闭”**。
+
+| 高风险能力 | 使用插件 | 为什么必须 | 当前默认状态 | 用户确认与限制 | 回滚 |
+|---|---|---|---|---|---|
+| 宿主记忆/对话写入 | 无 | AI 世界记忆可独立存储 | 未使用 | 只写插件 `data_path()` 内 SQLite，不写宿主记忆库 | 无需回滚 |
+| 猫娘回复/隐藏上下文 | `neko_arcade`、`neko_fishpower`、`neko_pawpilot`、`neko_pbz`、`neko_terraria` | 回复必须由宿主当前人设生成 | 按功能需要调用 | 只走官方 `push_message`；不写角色记忆卡 | 停用插件或关闭对应推送 |
+| 代理 DLL / UE4SS | 仅 `neko_pbz` | PBZ 游戏侧状态和字幕需要 UE4SS 加载自有 Mod | `neko_terraria` 未使用 | 泰拉使用 tModLoader Mod 协议，不安装代理 DLL | 不适用 |
+| 键鼠输入注入 | 仅 `neko_pawpilot` | 用户明确同意后接力驾驶 | `neko_terraria` 未使用 | 泰拉通过游戏侧 Mod 执行 AI 动作，不注入键鼠 | 不适用 |
+| 启动游戏进程 | 仅 `neko_terraria` | 拉起独立的 AI tModLoader 客户端 | **手动开启**：插件启动不拉起，只有用户点击“连接游戏”才调用 `subprocess.Popen` | 只管理自己创建的进程；不终止外部客户端 | 点击停止/断开，或停用插件；不结束其他玩家进程 |
+| 屏幕截图 | `neko_pbz`、`neko_fishpower`、`neko_pawpilot`、`neko_terraria` | 游戏视觉侦察或 HUD OCR | **视觉不是默认关闭**：`vision_analysis_enabled` 默认 `true`，启动后运行视觉管线 | 截取主人游戏窗口，优先主人画面，失败回退 AI 视角；不上传第三方 | 在配置中关闭 `vision_analysis_enabled`，或停用插件 |
+| 私有照片/文件读写 | `neko_arcade`、`neko_pawpilot` 保存照片；六个插件均有各自的数据目录 | AI 记忆、Mod、照片和日志必须持久化 | 插件运行时按功能写入 | 截图默认不落盘；记忆写插件私有 SQLite，Mod 只写 tModLoader Mod 目录，不扫描私人相册 | 删除插件数据、记忆库或本插件 Mod；不影响游戏存档 |
+
 ## 声明=实际
 
 ## 宿主能力
