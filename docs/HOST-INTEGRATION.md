@@ -51,3 +51,31 @@ Steam 注册表读取、游戏 Mod 协议和可选 HTTPS LLM。
 - 删除 tModLoader Mod 目录中的本插件 Mod；
 - 删除插件数据目录可清除 AI 记忆，不影响游戏存档。
 
+## 完整权限清单
+
+权限 ID 是本次审查标签，用于以后映射云玩家权限模板。
+
+| 审计 ID | 权限 | 实际 API/资源 | 降级 |
+|---|---|---|---|
+| `HOST_LIFECYCLE` | 启停 | `@lifecycle startup/shutdown` | 关闭 AI 客户端和 SQLite |
+| `HOST_ENTRY_UI` | 面板入口 | `@plugin_entry`、`@ui.action` | 面板关闭后已有进程可停止 |
+| `HOST_LLM_TOOL` | 陪玩工具 | `@llm_tool` 目标/任务/跟随/挖矿等 | 只能用面板操作 |
+| `HOST_PUSH_RESPOND` | 猫娘回复 | `push_message(ai_behavior="respond")` | 本地文本/静默 |
+| `HOST_PUSH_READ` | 隐藏任务上下文 | `push_message(ai_behavior="read")` | 不注入上下文，任务仍可运行 |
+| `HOST_DATA_PATH` | 插件数据 | `data_path()`、配置、日志、记忆 | 服务降级 |
+| `HOST_PERSONA_READ` | 宿主角色人设 | `config/characters*.json` | 默认 AI 队友人设 |
+| `REGISTRY_READ` | Steam/tModLoader 路径 | HKCU/HKLM Steam 注册表 | 要求手动填 `game_path` |
+| `PROCESS_START` | 启动游戏客户端 | `subprocess.Popen(tModLoader)` | 不启动时只能连接已运行客户端 |
+| `PROCESS_CONTROL` | 管理自己启动的进程 | 进程句柄与终止 | 不终止外部进程 |
+| `FS_GAME_MOD` | 游戏 Mod 文件 | tModLoader Mod 目录、本插件 Mod | 缺 Mod 时无法连接世界 |
+| `GAME_MOD_PROTOCOL` | AI 队友操作 | 游戏侧 Mod 协议/连接 | 连接失败时禁用自主行为 |
+| `SCREEN_CAPTURE` | 主人游戏画面 | Pillow `ImageGrab` 游戏窗口 | 不截图时只使用 Mod 状态 |
+| `HOST_VISION_MODEL` | 图像语义 | 截图交宿主视觉模型 | 视觉关闭时不影响任务状态机 |
+| `SQLITE_PRIVATE` | AI 长期记忆 | 插件 `data_path()` 内 `neko_memory.db` | 损坏时可清空重建 |
+| `NET_HTTPS_LLM` | 独立/辅助 LLM | `httpx`，用户配置 | 回退宿主或模板 |
+
+不使用：宿主记忆库写入、宿主对话数据库写入、代理 DLL、游戏内存 Hook、键鼠注入。
+
+红线审计：猫娘发言只通过 `push_message`；AI 记忆只写插件私有 SQLite。最高风险
+权限是启动/控制游戏进程、写入 tModLoader Mod 目录、读取 Steam 注册表和截取游戏窗口。
+
